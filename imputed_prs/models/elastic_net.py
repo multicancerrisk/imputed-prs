@@ -7,6 +7,7 @@ from sklearn.linear_model import ElasticNet
 from sklearn.model_selection import KFold
 
 from imputed_prs.core.types import SingleVariantModelResult
+from imputed_prs.models.metrics import compute_cv_r2
 
 
 def _fit_intercept_only_model(
@@ -60,31 +61,6 @@ def _fit_intercept_only_model(
         l1_ratio=l1_ratio,
         alpha=alpha,
     )
-
-
-def _compute_cv_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """Compute R-squared from cross-validation predictions.
-
-    Args:
-        y_true: True target values (no NaN).
-        y_pred: Predicted values (no NaN).
-
-    Returns:
-        R-squared value. Returns 0.0 if SS_tot is zero (constant target).
-    """
-    if len(y_true) == 0:
-        return 0.0
-
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-
-    if ss_tot < 1e-10:
-        # Target has zero variance
-        return 0.0
-
-    r2 = 1.0 - (ss_res / ss_tot)
-    # Clip to [0, 1] - negative R² can occur with poor models
-    return float(max(0.0, min(1.0, r2)))
 
 
 def fit_single_variant_model(
@@ -214,7 +190,7 @@ def fit_single_variant_model(
 
     # Compute CV R² from valid predictions
     valid_cv_preds = cv_predictions[valid_mask]
-    cv_r2 = _compute_cv_r2(y_valid, valid_cv_preds)
+    cv_r2 = compute_cv_r2(y_valid, valid_cv_preds)
 
     # Check if all coefficients were shrunk to zero
     is_intercept_only = np.allclose(final_model.coef_, 0, atol=1e-10)

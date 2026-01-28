@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 
 from imputed_prs.models.elastic_net import (
-    _compute_cv_r2,
     _fit_intercept_only_model,
     fit_single_variant_model,
 )
@@ -302,48 +301,6 @@ class TestInputValidation:
         )
 
         assert result.cv_predictions.dtype == np.float64
-
-
-class TestComputeCvR2:
-    """Tests for _compute_cv_r2 helper function."""
-
-    def test_perfect_prediction(self):
-        """Test R² = 1 for perfect predictions."""
-        y_true = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        y_pred = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-
-        r2 = _compute_cv_r2(y_true, y_pred)
-        assert r2 == 1.0
-
-    def test_mean_prediction(self):
-        """Test R² = 0 for mean prediction."""
-        y_true = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-        y_pred = np.full(5, np.mean(y_true))
-
-        r2 = _compute_cv_r2(y_true, y_pred)
-        assert abs(r2) < 1e-10
-
-    def test_zero_variance_target(self):
-        """Test R² = 0 for constant target."""
-        y_true = np.array([3.0, 3.0, 3.0, 3.0, 3.0])
-        y_pred = np.array([2.9, 3.1, 3.0, 3.0, 3.0])
-
-        r2 = _compute_cv_r2(y_true, y_pred)
-        assert r2 == 0.0
-
-    def test_empty_arrays(self):
-        """Test R² = 0 for empty arrays."""
-        r2 = _compute_cv_r2(np.array([]), np.array([]))
-        assert r2 == 0.0
-
-    def test_negative_r2_clipped_to_zero(self):
-        """Test that negative R² is clipped to 0."""
-        y_true = np.array([1.0, 2.0, 3.0])
-        # Predictions that are worse than mean
-        y_pred = np.array([10.0, 20.0, 30.0])
-
-        r2 = _compute_cv_r2(y_true, y_pred)
-        assert r2 == 0.0
 
 
 class TestFitInterceptOnlyModel:
