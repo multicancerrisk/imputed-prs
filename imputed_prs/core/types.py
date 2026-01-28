@@ -220,3 +220,54 @@ class GenotypeData:
     def n_variants(self) -> int:
         """Return the number of variants."""
         return self.dosage_matrix.shape[1]
+
+
+@dataclass
+class SingleVariantModelResult:
+    """Result from fitting a single variant imputation model.
+
+    Attributes:
+        coefficients: Regression coefficients for predictor variants.
+            Shape: (n_predictors,). Empty array for intercept-only models.
+        intercept: Model intercept (mean of target for intercept-only models).
+        cv_predictions: Out-of-fold cross-validation predictions.
+            Shape: (n_samples,). Contains NaN for samples excluded due to
+            missing values.
+        cv_mse: Mean squared error from cross-validation.
+        cv_r2: R-squared from cross-validation (0.0 for intercept-only).
+        is_intercept_only: True if no predictors were used (fallback to mean).
+        n_predictors: Number of predictor variants used.
+        n_samples: Total number of samples (including those with NaN).
+        l1_ratio: ElasticNet L1 ratio parameter used.
+        alpha: ElasticNet regularization strength used.
+    """
+
+    coefficients: np.ndarray
+    intercept: float
+    cv_predictions: np.ndarray
+    cv_mse: float
+    cv_r2: float
+    is_intercept_only: bool
+    n_predictors: int
+    n_samples: int
+    l1_ratio: float
+    alpha: float
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary, handling numpy arrays.
+
+        Returns:
+            Dictionary representation with numpy arrays converted to lists.
+        """
+        return {
+            "coefficients": self.coefficients.tolist(),
+            "intercept": self.intercept,
+            "cv_predictions": self.cv_predictions.tolist(),
+            "cv_mse": self.cv_mse,
+            "cv_r2": self.cv_r2,
+            "is_intercept_only": self.is_intercept_only,
+            "n_predictors": self.n_predictors,
+            "n_samples": self.n_samples,
+            "l1_ratio": self.l1_ratio,
+            "alpha": self.alpha,
+        }
