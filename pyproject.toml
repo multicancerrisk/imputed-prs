@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "imputed-prs"
+version = "0.1.0"
+description = "Calculate Polygenic Risk Scores via linear imputation of missing variants"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.21.0",
+    "pandas>=1.3.0",
+    "scikit-learn>=1.0.0",
+    "scipy>=1.7.0",
+    "pyarrow>=8.0.0",
+    "h5py>=3.0.0",
+    "requests>=2.25.0",
+    "snps>=2.0.0",
+    "joblib>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
+]
+optuna = [
+    "optuna>=3.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["imputed_prs*"]
