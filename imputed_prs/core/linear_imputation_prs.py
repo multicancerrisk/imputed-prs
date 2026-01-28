@@ -33,6 +33,8 @@ from imputed_prs.io.platform_loader import (
     load_platform_variants_from_list,
 )
 from imputed_prs.io.prs_loader import load_prs_from_dataframe, load_prs_from_file
+from imputed_prs.io.user_genotypes import load_user_genotypes
+from imputed_prs.models.predictor import PRSPredictor
 from imputed_prs.models.trainer import ImputationModelTrainer
 from imputed_prs.models.tuning import global_hyperparameter_search
 
@@ -569,8 +571,37 @@ class LinearImputationPRS:
             raise ModelNotFittedError(
                 "Model has not been fitted. Call fit() before predict()."
             )
-        # TODO: Implement in Phase 7.3
-        raise NotImplementedError("predict() will be implemented in Phase 7.3")
+
+        # Get expected variants for filtering
+        expected_variants = self._get_expected_variants()
+
+        # Handle dict input directly, otherwise use loader
+        if isinstance(user_genotypes, dict):
+            user_dosages = user_genotypes
+        else:
+            user_dosages = load_user_genotypes(user_genotypes, expected_variants)
+
+        # Create PRSPredictor and compute prediction
+        predictor = PRSPredictor(
+            observed_variants=self._observed_variants,
+            imputed_models=self._imputed_models,
+            calibration_params=self._calibration_params,
+        )
+        return predictor.predict(user_dosages, apply_calibration=apply_calibration)
+
+    def _get_expected_variants(self) -> Set[str]:
+        """Get set of all variant IDs needed for prediction.
+
+        Returns:
+            Set of variant IDs including observed variants and predictor variants
+            from imputation models.
+        """
+        expected = set()
+        for var in self._observed_variants or []:
+            expected.add(var.variant_id)
+        for model in self._imputed_models or []:
+            expected.update(model.predictor_variant_ids)
+        return expected
 
     def export(
         self,

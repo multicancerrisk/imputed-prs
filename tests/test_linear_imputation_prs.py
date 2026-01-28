@@ -9,7 +9,12 @@ import pytest
 
 from imputed_prs import LinearImputationPRS
 from imputed_prs.core.exceptions import ModelNotFittedError, ValidationError
-from imputed_prs.core.types import CalibrationParams, VariantInfo, ImputedVariantModel
+from imputed_prs.core.types import (
+    CalibrationParams,
+    ImputedVariantModel,
+    PredictionResult,
+    VariantInfo,
+)
 
 
 class TestLinearImputationPRSConstructor:
@@ -791,3 +796,340 @@ class TestLinearImputationPRSFitWithFilePath:
         assert model.is_fitted is True
         assert len(model.observed_variants) == 3
         assert len(model.imputed_models) == 2
+
+
+# =============================================================================
+# Fixtures for predict() method tests
+# =============================================================================
+
+
+@pytest.fixture
+def fitted_model(synthetic_vcf_file, synthetic_prs_df, platform_variants_partial):
+    """Create a fitted LinearImputationPRS model for prediction tests."""
+    cyvcf2 = pytest.importorskip("cyvcf2")
+
+    model = LinearImputationPRS(
+        window_size=500_000,
+        cv_folds=3,
+        tuning_scope="none",
+        verbose=0,
+        random_state=42,
+    )
+
+    model.fit(
+        reference_genotypes=synthetic_vcf_file,
+        prs_definition=synthetic_prs_df,
+        platform_variants=platform_variants_partial,
+    )
+
+    return model
+
+
+@pytest.fixture
+def fitted_model_all_observed(synthetic_vcf_file, synthetic_prs_df, platform_variants_all):
+    """Create a fitted model where all variants are observed (no imputation)."""
+    cyvcf2 = pytest.importorskip("cyvcf2")
+
+    model = LinearImputationPRS(
+        window_size=500_000,
+        cv_folds=3,
+        tuning_scope="none",
+        verbose=0,
+        random_state=42,
+    )
+
+    model.fit(
+        reference_genotypes=synthetic_vcf_file,
+        prs_definition=synthetic_prs_df,
+        platform_variants=platform_variants_all,
+    )
+
+    return model
+
+
+@pytest.fixture
+def user_dosages_dict():
+    """Create a sample user dosages dictionary."""
+    return {
+        "rs1": 1.0,  # heterozygous
+        "rs2": 0.0,  # homozygous ref
+        "rs3": 2.0,  # homozygous alt
+        "rs4": 1.0,  # heterozygous
+        "rs5": 0.0,  # homozygous ref
+    }
+
+
+@pytest.fixture
+def user_genotypes_df():
+    """Create a sample user genotypes DataFrame."""
+    return pd.DataFrame({
+        "rsid": ["rs1", "rs2", "rs3", "rs4", "rs5"],
+        "genotype": ["AG", "CC", "AA", "TC", "AA"],
+    })
+
+
+# =============================================================================
+# Tests for predict() method
+# =============================================================================
+
+
+class TestLinearImputationPRSPredict:
+    """Test predict() method."""
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_raises_model_not_fitted_error(self):
+        """Test predict() raises ModelNotFittedError if called before fit()."""
+        model = LinearImputationPRS()
+
+        with pytest.raises(ModelNotFittedError, match="Model has not been fitted"):
+            model.predict({"rs1": 1.0})
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_with_dict_input(self, fitted_model, user_dosages_dict):
+        """Test predict() with Dict[str, float] input works correctly."""
+        result = fitted_model.predict(user_dosages_dict)
+
+        assert isinstance(result, PredictionResult)
+        assert result.prs is not None
+        assert isinstance(result.prs, float)
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_with_dataframe_input(self, fitted_model, user_genotypes_df):
+        """Test predict() with DataFrame input loads genotypes correctly."""
+        result = fitted_model.predict(user_genotypes_df)
+
+        assert isinstance(result, PredictionResult)
+        assert result.prs is not None
+        assert isinstance(result.prs, float)
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_returns_prediction_result_with_valid_values(
+        self, fitted_model, user_dosages_dict
+    ):
+        """Test predict() returns PredictionResult with valid values."""
+        result = fitted_model.predict(user_dosages_dict)
+
+        # Check that all required fields are populated
+        assert hasattr(result, "prs")
+        assert hasattr(result, "se")
+        assert hasattr(result, "ci_lower")
+        assert hasattr(result, "ci_upper")
+        assert hasattr(result, "prs_observed_component")
+        assert hasattr(result, "prs_imputed_component")
+        assert hasattr(result, "n_variants_used")
+        assert hasattr(result, "n_variants_imputed")
+        assert hasattr(result, "n_variants_intercept_only")
+        assert hasattr(result, "n_user_variants_missing")
+        assert hasattr(result, "n_truncated")
+
+        # Verify numeric types
+        assert isinstance(result.prs, float)
+        assert isinstance(result.se, float)
+        assert isinstance(result.ci_lower, float)
+        assert isinstance(result.ci_upper, float)
+        assert isinstance(result.n_variants_used, int)
+        assert isinstance(result.n_variants_imputed, int)
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_confidence_intervals_are_valid(self, fitted_model, user_dosages_dict):
+        """Test predict() confidence intervals are valid (ci_lower < prs < ci_upper)."""
+        result = fitted_model.predict(user_dosages_dict)
+
+        # CI should bracket the point estimate (or be equal if SE is 0)
+        assert result.ci_lower <= result.prs
+        assert result.prs <= result.ci_upper
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_component_counts_are_accurate(self, fitted_model, user_dosages_dict):
+        """Test predict() component counts are accurate."""
+        result = fitted_model.predict(user_dosages_dict)
+
+        # Total variants used should be sum of observed (that user has) + imputed
+        # n_variants_imputed should match the number of imputed models
+        assert result.n_variants_imputed == len(fitted_model.imputed_models)
+
+        # n_variants_used should be reasonable
+        assert result.n_variants_used >= 0
+        assert result.n_variants_used <= (
+            len(fitted_model.observed_variants) + len(fitted_model.imputed_models)
+        )
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_with_apply_calibration_false(self, fitted_model, user_dosages_dict):
+        """Test predict() with apply_calibration=False returns raw values."""
+        result = fitted_model.predict(user_dosages_dict, apply_calibration=False)
+
+        assert isinstance(result, PredictionResult)
+        assert result.prs is not None
+
+        # When calibration is not applied, scaled values should be None
+        # (unless calibration params are None anyway)
+        if fitted_model.calibration_params is None:
+            assert result.prs_scaled is None
+        # If calibration was requested but not applied, scaled values should be None
+        assert result.prs_scaled is None
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_with_apply_calibration_true(self, fitted_model, user_dosages_dict):
+        """Test predict() with apply_calibration=True applies scaling when available."""
+        result = fitted_model.predict(user_dosages_dict, apply_calibration=True)
+
+        assert isinstance(result, PredictionResult)
+
+        # If calibration params exist, scaled values should be populated
+        if fitted_model.calibration_params is not None:
+            assert result.prs_scaled is not None
+            assert result.se_scaled is not None
+            assert result.ci_lower_scaled is not None
+            assert result.ci_upper_scaled is not None
+        else:
+            # No calibration params means scaled values are None
+            assert result.prs_scaled is None
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_handles_missing_user_variants_gracefully(self, fitted_model):
+        """Test predict() handles missing user variants gracefully."""
+        # Only provide some variants
+        partial_dosages = {
+            "rs1": 1.0,
+            "rs2": 0.0,
+            # Missing: rs3, rs4, rs5
+        }
+
+        result = fitted_model.predict(partial_dosages)
+
+        assert isinstance(result, PredictionResult)
+        assert result.prs is not None
+        # Should report missing variants
+        assert result.n_user_variants_missing >= 0
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_handles_empty_dosages(self, fitted_model):
+        """Test predict() handles empty dosages dictionary."""
+        result = fitted_model.predict({})
+
+        assert isinstance(result, PredictionResult)
+        # With no user data, imputation falls back to intercept-only
+        assert result.n_user_variants_missing > 0
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_with_all_observed_model(
+        self, fitted_model_all_observed, user_dosages_dict
+    ):
+        """Test predict() with model where all variants are observed."""
+        result = fitted_model_all_observed.predict(user_dosages_dict)
+
+        assert isinstance(result, PredictionResult)
+        assert result.n_variants_imputed == 0
+        assert result.prs_imputed_component == 0.0
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_prs_components_sum_to_total(self, fitted_model, user_dosages_dict):
+        """Test predict() observed + imputed components sum to total PRS."""
+        result = fitted_model.predict(user_dosages_dict)
+
+        # The raw PRS should be sum of observed and imputed components
+        expected_prs = result.prs_observed_component + result.prs_imputed_component
+        assert abs(result.prs - expected_prs) < 1e-10
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_standard_error_non_negative(self, fitted_model, user_dosages_dict):
+        """Test predict() standard error is non-negative."""
+        result = fitted_model.predict(user_dosages_dict)
+
+        assert result.se >= 0.0
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_predict_consistent_results(self, fitted_model, user_dosages_dict):
+        """Test predict() returns consistent results for same input."""
+        result1 = fitted_model.predict(user_dosages_dict)
+        result2 = fitted_model.predict(user_dosages_dict)
+
+        assert result1.prs == result2.prs
+        assert result1.se == result2.se
+        assert result1.ci_lower == result2.ci_lower
+        assert result1.ci_upper == result2.ci_upper
+
+
+# =============================================================================
+# Tests for _get_expected_variants() helper method
+# =============================================================================
+
+
+class TestLinearImputationPRSGetExpectedVariants:
+    """Test _get_expected_variants() helper method."""
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_get_expected_variants_includes_observed(self, fitted_model):
+        """Test _get_expected_variants includes observed variant IDs."""
+        expected = fitted_model._get_expected_variants()
+
+        for var in fitted_model.observed_variants:
+            assert var.variant_id in expected
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_get_expected_variants_includes_predictor_variants(self, fitted_model):
+        """Test _get_expected_variants includes predictor variant IDs from models."""
+        expected = fitted_model._get_expected_variants()
+
+        for model in fitted_model.imputed_models:
+            for pred_id in model.predictor_variant_ids:
+                assert pred_id in expected
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_get_expected_variants_returns_set(self, fitted_model):
+        """Test _get_expected_variants returns a set."""
+        expected = fitted_model._get_expected_variants()
+
+        assert isinstance(expected, set)
