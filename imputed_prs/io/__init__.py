@@ -30,6 +30,7 @@ from imputed_prs.io.user_genotypes import (
     genotype_to_dosage,
     detect_genome_build,
 )
+from imputed_prs.io.exporters.json_export import export_to_json
 
 __all__ = [
     # PRS loader
@@ -57,4 +58,6 @@ __all__ = [
     "load_user_genotypes",
     "genotype_to_dosage",
     "detect_genome_build",
+    # Exporters
+    "export_to_json",
 ]
