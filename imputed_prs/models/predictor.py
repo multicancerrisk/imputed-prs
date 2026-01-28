@@ -9,7 +9,12 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from imputed_prs.core.types import ImputedVariantModel, VariantInfo
+from imputed_prs.core.types import (
+    CalibrationParams,
+    ImputedVariantModel,
+    PredictionResult,
+    VariantInfo,
+)
 from imputed_prs.models.bounding import clip_and_adjust_variance
 
 
@@ -116,3 +121,115 @@ def compute_imputed_prs(
         n_imputed += 1
 
     return total_prs, total_variance, n_imputed, n_truncated
+
+
+class PRSPredictor:
+    """Full PRS prediction combining observed and imputed components.
+
+    This class orchestrates the complete PRS calculation pipeline:
+    1. Compute contribution from directly observed variants
+    2. Compute contribution from imputed (missing) variants
+    3. Calculate uncertainty (standard error, confidence intervals)
+    4. Optionally apply calibration scaling
+
+    Attributes:
+        observed_variants: List of VariantInfo for variants on the platform.
+        imputed_models: List of ImputedVariantModel for missing variants.
+        calibration_params: Optional calibration parameters for scaling.
+    """
+
+    def __init__(
+        self,
+        observed_variants: List[VariantInfo],
+        imputed_models: List[ImputedVariantModel],
+        calibration_params: Optional[CalibrationParams] = None,
+    ):
+        """Initialize the predictor.
+
+        Args:
+            observed_variants: Variants present on the genotyping platform.
+            imputed_models: Trained imputation models for missing variants.
+            calibration_params: Optional parameters for calibration scaling.
+        """
+        self.observed_variants = observed_variants
+        self.imputed_models = imputed_models
+        self.calibration_params = calibration_params
+
+        # Pre-compute counts
+        self._n_observed_variants = len(observed_variants)
+        self._n_imputed_variants = len(imputed_models)
+        self._n_intercept_only = sum(
+            1 for m in imputed_models if m.is_intercept_only
+        )
+
+    def predict(
+        self,
+        user_genotypes: Dict[str, Optional[float]],
+        apply_calibration: bool = True,
+    ) -> PredictionResult:
+        """Compute full PRS with uncertainty quantification.
+
+        Args:
+            user_genotypes: Dictionary mapping variant_id to dosage value
+                (0.0, 1.0, 2.0) or None for missing variants.
+            apply_calibration: Whether to apply calibration scaling
+                (requires calibration_params to be set).
+
+        Returns:
+            PredictionResult with PRS value, confidence intervals,
+            component breakdown, and optionally scaled values.
+        """
+        # Step 1: Compute observed component
+        prs_observed, n_observed_used = compute_observed_prs(
+            user_genotypes, self.observed_variants
+        )
+
+        # Step 2: Compute imputed component
+        prs_imputed, total_variance, n_imputed, n_truncated = compute_imputed_prs(
+            user_genotypes, self.imputed_models
+        )
+
+        # Step 3: Combine components
+        prs_raw = prs_observed + prs_imputed
+
+        # Step 4: Compute standard error and confidence intervals
+        se = np.sqrt(total_variance) if total_variance > 0 else 0.0
+        ci_lower = prs_raw - 1.96 * se
+        ci_upper = prs_raw + 1.96 * se
+
+        # Step 5: Count variants
+        n_variants_used = n_observed_used + n_imputed
+        n_user_variants_missing = (
+            self._n_observed_variants + self._n_imputed_variants
+        ) - n_variants_used
+
+        # Step 6: Apply calibration if requested and available
+        prs_scaled = None
+        se_scaled = None
+        ci_lower_scaled = None
+        ci_upper_scaled = None
+
+        if apply_calibration and self.calibration_params is not None:
+            params = self.calibration_params
+            prs_scaled = params.scaling_factor * prs_raw + params.calibration_intercept
+            se_scaled = abs(params.scaling_factor) * se
+            ci_lower_scaled = prs_scaled - 1.96 * se_scaled
+            ci_upper_scaled = prs_scaled + 1.96 * se_scaled
+
+        return PredictionResult(
+            prs=prs_raw,
+            se=se,
+            ci_lower=ci_lower,
+            ci_upper=ci_upper,
+            prs_observed_component=prs_observed,
+            prs_imputed_component=prs_imputed,
+            n_variants_used=n_variants_used,
+            n_variants_imputed=n_imputed,
+            n_variants_intercept_only=self._n_intercept_only,
+            n_user_variants_missing=n_user_variants_missing,
+            n_truncated=n_truncated,
+            prs_scaled=prs_scaled,
+            se_scaled=se_scaled,
+            ci_lower_scaled=ci_lower_scaled,
+            ci_upper_scaled=ci_upper_scaled,
+        )

@@ -9,7 +9,7 @@ from imputed_prs.models.bounding import (
 )
 from imputed_prs.models.elastic_net import fit_single_variant_model
 from imputed_prs.models.metrics import compute_cv_r2
-from imputed_prs.models.predictor import compute_imputed_prs, compute_observed_prs
+from imputed_prs.models.predictor import PRSPredictor, compute_imputed_prs, compute_observed_prs
 from imputed_prs.models.trainer import ImputationModelTrainer
 from imputed_prs.models.tuning import global_hyperparameter_search
 
@@ -23,6 +23,7 @@ __all__ = [
     "global_hyperparameter_search",
     "GridSearchResult",
     "ImputationModelTrainer",
+    "PRSPredictor",
     "SingleVariantModelResult",
     "TrainingResult",
     "truncated_normal_mean",
