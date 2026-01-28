@@ -1,7 +1,7 @@
 """Core data types for the imputed-prs library."""
 
 from dataclasses import dataclass, field, asdict
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -271,3 +271,25 @@ class SingleVariantModelResult:
             "l1_ratio": self.l1_ratio,
             "alpha": self.alpha,
         }
+
+
+@dataclass
+class GridSearchResult:
+    """Result from global hyperparameter search.
+
+    Attributes:
+        best_l1_ratio: Optimal L1 ratio from grid search.
+        best_alpha: Optimal regularization strength from grid search.
+        best_mean_cv_mse: Mean CV MSE at optimal parameters.
+        grid_results: Full grid search results. List of dicts with keys:
+            l1_ratio, alpha, mean_cv_mse, std_cv_mse, n_variants_evaluated.
+        n_variants_sampled: Number of variants used in search.
+        n_variants_failed: Number of variants where fitting failed.
+    """
+
+    best_l1_ratio: float
+    best_alpha: float
+    best_mean_cv_mse: float
+    grid_results: List[Dict[str, Any]]
+    n_variants_sampled: int
+    n_variants_failed: int
