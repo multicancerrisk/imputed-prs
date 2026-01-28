@@ -7,7 +7,7 @@ Calculate Polygenic Risk Scores via linear imputation of missing variants.
 
 ## Overview
 
-Many Polygenic Risk Scores (PRS) include thousands of genetic variants, but consumer genotyping arrays (like 23andMe or AncestryDNA) only measure a subset. **imputed-prs** solves this by training linear imputation models that predict missing variant dosages from nearby measured variants, enabling accurate PRS calculation from any genotyping platform.
+The library enables the calculation of a specified Polygenic Risk Score (PRS) on data from a fixed target genotyping platform, by performing linear imputation of missing variants at prediction time. Instead of requiring the computationally expensive haplotype-based imputation (e.g., IMPUTE5, Minimac), we train lightweight linear imputation models using a reference panel. These models predict the missing PRS variants from observed, genotyped variants using regularized regression, leveraging linkage disequilibrium (LD).
 
 Key innovations:
 - **Linear imputation**: Uses ElasticNet regression to impute missing variants from nearby platform variants
