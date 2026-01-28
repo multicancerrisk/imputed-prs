@@ -1,8 +1,9 @@
-"""Core module containing data types and exceptions."""
+"""Core module containing data types, exceptions, and harmonization functions."""
 
 from imputed_prs.core.types import (
     CalibrationParams,
     EvaluationMetrics,
+    GenotypeData,
     ImputedVariantModel,
     PlatformInfo,
     PredictionResult,
@@ -16,11 +17,22 @@ from imputed_prs.core.exceptions import (
     ModelNotFittedError,
     ValidationError,
 )
+from imputed_prs.core.harmonizer import (
+    align_effect_alleles,
+    filter_to_local_window,
+    partition_variants,
+    validate_genome_build,
+    AlleleAlignmentResult,
+    BuildValidationResult,
+    PartitionResult,
+    WindowFilterResult,
+)
 
 __all__ = [
     # Types
     "CalibrationParams",
     "EvaluationMetrics",
+    "GenotypeData",
     "ImputedVariantModel",
     "PlatformInfo",
     "PredictionResult",
@@ -32,4 +44,14 @@ __all__ = [
     "MissingVariantsError",
     "ModelNotFittedError",
     "ValidationError",
+    # Harmonization functions
+    "align_effect_alleles",
+    "filter_to_local_window",
+    "partition_variants",
+    "validate_genome_build",
+    # Harmonization result types
+    "AlleleAlignmentResult",
+    "BuildValidationResult",
+    "PartitionResult",
+    "WindowFilterResult",
 ]
