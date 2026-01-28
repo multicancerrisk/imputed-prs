@@ -4,6 +4,7 @@ from dataclasses import dataclass, field, asdict
 from typing import List, Optional
 
 import numpy as np
+import pandas as pd
 
 
 @dataclass
@@ -188,3 +189,34 @@ class EvaluationMetrics:
     spearman_rho: float
     calibration_slope: float
     calibration_intercept: float
+
+
+@dataclass
+class GenotypeData:
+    """Container for loaded reference genotype data.
+
+    Attributes:
+        dosage_matrix: Genotype dosage matrix (n_samples x n_variants).
+            Values are 0-2 representing allele counts, with NaN for missing.
+        variant_info: DataFrame with variant metadata. Contains columns:
+            variant_id, chromosome, position, ref_allele, alt_allele.
+        sample_ids: List of sample identifiers.
+        genome_build: Reference genome build (e.g., "GRCh37", "GRCh38").
+        source_file: Path to the source file.
+    """
+
+    dosage_matrix: np.ndarray  # (n_samples x n_variants), values 0-2
+    variant_info: pd.DataFrame  # variant_id, chromosome, position, ref_allele, alt_allele
+    sample_ids: List[str]
+    genome_build: Optional[str] = None
+    source_file: Optional[str] = None
+
+    @property
+    def n_samples(self) -> int:
+        """Return the number of samples."""
+        return self.dosage_matrix.shape[0]
+
+    @property
+    def n_variants(self) -> int:
+        """Return the number of variants."""
+        return self.dosage_matrix.shape[1]

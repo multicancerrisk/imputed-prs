@@ -20,6 +20,11 @@ from imputed_prs.io.platform_loader import (
     list_available_platforms,
     get_platform_info,
 )
+from imputed_prs.io.genotype_loader import (
+    load_genotypes,
+    load_genotypes_vcf,
+    load_genotypes_plink,
+)
 
 __all__ = [
     # PRS loader
@@ -39,4 +44,8 @@ __all__ = [
     "load_platform_from_name",
     "list_available_platforms",
     "get_platform_info",
+    # Genotype loader
+    "load_genotypes",
+    "load_genotypes_vcf",
+    "load_genotypes_plink",
 ]
