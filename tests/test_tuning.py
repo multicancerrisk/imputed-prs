@@ -4,11 +4,12 @@ import numpy as np
 import pytest
 
 from imputed_prs.core.exceptions import ValidationError
-from imputed_prs.core.types import GridSearchResult
+from imputed_prs.core.types import GridSearchResult, OptunaSearchResult
 from imputed_prs.models.tuning import (
     DEFAULT_ALPHAS,
     DEFAULT_L1_RATIOS,
     global_hyperparameter_search,
+    optuna_hyperparameter_search,
 )
 
 
@@ -440,3 +441,364 @@ class TestImportPaths:
         from imputed_prs.core import GridSearchResult
 
         assert GridSearchResult is not None
+
+
+# Skip all Optuna tests if optuna is not installed
+optuna = pytest.importorskip("optuna")
+
+
+class TestOptunaHyperparameterSearch:
+    """Tests for Optuna-based hyperparameter search."""
+
+    def test_basic_usage(self):
+        """Test basic Optuna search."""
+        rng = np.random.default_rng(42)
+        n, m, p = 200, 50, 10
+
+        Z = rng.binomial(2, 0.3, (n, m)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (n, p)).astype(float)
+
+        result = optuna_hyperparameter_search(
+            Z=Z,
+            X_missing=X_missing,
+            n_trials=10,
+            cv_folds=3,
+            seed=42,
+        )
+
+        assert isinstance(result, OptunaSearchResult)
+        assert 0.0 <= result.best_l1_ratio <= 1.0
+        assert result.best_alpha > 0
+        assert result.best_mean_cv_mse >= 0
+        assert np.isfinite(result.best_mean_cv_mse)
+        assert result.n_trials == 10
+        assert result.n_variants_sampled == p
+        assert result.n_variants_failed >= 0
+        assert result.optimization_time_seconds >= 0
+
+    def test_custom_ranges(self):
+        """Test with custom l1_ratio and alpha ranges."""
+        rng = np.random.default_rng(42)
+        n, m, p = 200, 50, 10
+
+        Z = rng.binomial(2, 0.3, (n, m)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (n, p)).astype(float)
+
+        result = optuna_hyperparameter_search(
+            Z=Z,
+            X_missing=X_missing,
+            n_trials=10,
+            l1_ratio_range=(0.2, 0.8),
+            alpha_range=(0.001, 0.1),
+            cv_folds=3,
+            seed=42,
+        )
+
+        assert 0.2 <= result.best_l1_ratio <= 0.8
+        assert 0.001 <= result.best_alpha <= 0.1
+
+    def test_seed_reproducibility(self):
+        """Test that same seed produces identical results."""
+        rng = np.random.default_rng(42)
+        n, m, p = 200, 50, 10
+
+        Z = rng.binomial(2, 0.3, (n, m)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (n, p)).astype(float)
+
+        result1 = optuna_hyperparameter_search(
+            Z=Z,
+            X_missing=X_missing,
+            n_trials=10,
+            cv_folds=3,
+            seed=123,
+        )
+
+        result2 = optuna_hyperparameter_search(
+            Z=Z,
+            X_missing=X_missing,
+            n_trials=10,
+            cv_folds=3,
+            seed=123,
+        )
+
+        assert result1.best_l1_ratio == result2.best_l1_ratio
+        assert result1.best_alpha == result2.best_alpha
+        assert result1.best_mean_cv_mse == result2.best_mean_cv_mse
+
+        # Trial history should be identical
+        assert len(result1.trial_history) == len(result2.trial_history)
+        for t1, t2 in zip(result1.trial_history, result2.trial_history):
+            assert t1["l1_ratio"] == t2["l1_ratio"]
+            assert t1["alpha"] == t2["alpha"]
+            assert t1["mean_cv_mse"] == t2["mean_cv_mse"]
+
+    def test_trial_history_structure(self):
+        """Test trial_history has correct structure."""
+        rng = np.random.default_rng(42)
+        n, m, p = 200, 50, 10
+
+        Z = rng.binomial(2, 0.3, (n, m)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (n, p)).astype(float)
+
+        result = optuna_hyperparameter_search(
+            Z=Z,
+            X_missing=X_missing,
+            n_trials=10,
+            cv_folds=3,
+            seed=42,
+        )
+
+        assert len(result.trial_history) == result.n_trials
+
+        for trial in result.trial_history:
+            assert "trial_number" in trial
+            assert "l1_ratio" in trial
+            assert "alpha" in trial
+            assert "mean_cv_mse" in trial
+            assert "n_variants_evaluated" in trial
+
+            assert isinstance(trial["trial_number"], int)
+            assert 0 <= trial["l1_ratio"] <= 1
+            assert trial["alpha"] > 0
+            assert trial["mean_cv_mse"] >= 0 or trial["mean_cv_mse"] == float("inf")
+
+    def test_respects_n_trials(self):
+        """Test that n_trials limit is respected."""
+        rng = np.random.default_rng(42)
+        n, m, p = 200, 50, 10
+
+        Z = rng.binomial(2, 0.3, (n, m)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (n, p)).astype(float)
+
+        for n_trials in [5, 15, 25]:
+            result = optuna_hyperparameter_search(
+                Z=Z,
+                X_missing=X_missing,
+                n_trials=n_trials,
+                cv_folds=3,
+                seed=42,
+            )
+            assert result.n_trials == n_trials
+            assert len(result.trial_history) == n_trials
+
+    def test_handles_no_predictors(self):
+        """Test edge case with no predictors."""
+        rng = np.random.default_rng(42)
+        n, p = 100, 10
+
+        Z = np.empty((n, 0))  # No predictors
+        X_missing = rng.binomial(2, 0.25, (n, p)).astype(float)
+
+        result = optuna_hyperparameter_search(
+            Z=Z,
+            X_missing=X_missing,
+            n_trials=10,
+            cv_folds=3,
+            seed=42,
+        )
+
+        assert result.best_mean_cv_mse == float("inf")
+        assert result.n_trials == 0
+        assert result.n_variants_failed == p
+        assert len(result.trial_history) == 0
+
+    def test_single_trial(self):
+        """Test with n_trials=1."""
+        rng = np.random.default_rng(42)
+        n, m, p = 200, 50, 10
+
+        Z = rng.binomial(2, 0.3, (n, m)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (n, p)).astype(float)
+
+        result = optuna_hyperparameter_search(
+            Z=Z,
+            X_missing=X_missing,
+            n_trials=1,
+            cv_folds=3,
+            seed=42,
+        )
+
+        assert result.n_trials == 1
+        assert len(result.trial_history) == 1
+
+    def test_single_variant(self):
+        """Test with single target variant."""
+        rng = np.random.default_rng(42)
+        n, m = 200, 50
+
+        Z = rng.binomial(2, 0.3, (n, m)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (n, 1)).astype(float)
+
+        result = optuna_hyperparameter_search(
+            Z=Z,
+            X_missing=X_missing,
+            n_trials=10,
+            cv_folds=3,
+            seed=42,
+        )
+
+        assert result.n_variants_sampled == 1
+
+    def test_sample_indices(self):
+        """Test using sample_indices to select specific variants."""
+        rng = np.random.default_rng(42)
+        n, m, p = 200, 50, 20
+
+        Z = rng.binomial(2, 0.3, (n, m)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (n, p)).astype(float)
+
+        sample_indices = [0, 5, 10]
+
+        result = optuna_hyperparameter_search(
+            Z=Z,
+            X_missing=X_missing,
+            sample_indices=sample_indices,
+            n_trials=10,
+            cv_folds=3,
+            seed=42,
+        )
+
+        assert result.n_variants_sampled == 3
+
+    def test_best_trial_matches_history(self):
+        """Test that best trial in history matches reported best."""
+        rng = np.random.default_rng(42)
+        n, m, p = 200, 50, 10
+
+        Z = rng.binomial(2, 0.3, (n, m)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (n, p)).astype(float)
+
+        result = optuna_hyperparameter_search(
+            Z=Z,
+            X_missing=X_missing,
+            n_trials=15,
+            cv_folds=3,
+            seed=42,
+        )
+
+        # Find minimum MSE from trial history
+        min_mse = min(t["mean_cv_mse"] for t in result.trial_history)
+        assert result.best_mean_cv_mse == min_mse
+
+        # Find the best trial from history
+        best_trial = None
+        for t in result.trial_history:
+            if t["mean_cv_mse"] == min_mse:
+                best_trial = t
+                break
+
+        assert best_trial is not None
+        assert result.best_l1_ratio == best_trial["l1_ratio"]
+        assert result.best_alpha == best_trial["alpha"]
+
+
+class TestOptunaInputValidation:
+    """Tests for Optuna input validation."""
+
+    def test_shape_mismatch_raises_error(self):
+        """Test that mismatched shapes raise ValidationError."""
+        rng = np.random.default_rng(42)
+        Z = rng.binomial(2, 0.3, (100, 50)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (80, 10)).astype(float)
+
+        with pytest.raises(ValidationError, match="Shape mismatch"):
+            optuna_hyperparameter_search(
+                Z=Z,
+                X_missing=X_missing,
+                n_trials=5,
+            )
+
+    def test_invalid_l1_ratio_range_bounds(self):
+        """Test that invalid l1_ratio_range raises ValidationError."""
+        rng = np.random.default_rng(42)
+        Z = rng.binomial(2, 0.3, (100, 50)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (100, 10)).astype(float)
+
+        # Range outside [0, 1]
+        with pytest.raises(ValidationError, match="l1_ratio_range"):
+            optuna_hyperparameter_search(
+                Z=Z,
+                X_missing=X_missing,
+                l1_ratio_range=(-0.1, 0.5),
+                n_trials=5,
+            )
+
+        with pytest.raises(ValidationError, match="l1_ratio_range"):
+            optuna_hyperparameter_search(
+                Z=Z,
+                X_missing=X_missing,
+                l1_ratio_range=(0.5, 1.5),
+                n_trials=5,
+            )
+
+        # Min > max
+        with pytest.raises(ValidationError, match="l1_ratio_range"):
+            optuna_hyperparameter_search(
+                Z=Z,
+                X_missing=X_missing,
+                l1_ratio_range=(0.8, 0.2),
+                n_trials=5,
+            )
+
+    def test_invalid_alpha_range_bounds(self):
+        """Test that invalid alpha_range raises ValidationError."""
+        rng = np.random.default_rng(42)
+        Z = rng.binomial(2, 0.3, (100, 50)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (100, 10)).astype(float)
+
+        # Non-positive values
+        with pytest.raises(ValidationError, match="alpha_range"):
+            optuna_hyperparameter_search(
+                Z=Z,
+                X_missing=X_missing,
+                alpha_range=(0.0, 1.0),  # 0 is invalid
+                n_trials=5,
+            )
+
+        with pytest.raises(ValidationError, match="alpha_range"):
+            optuna_hyperparameter_search(
+                Z=Z,
+                X_missing=X_missing,
+                alpha_range=(-0.1, 1.0),
+                n_trials=5,
+            )
+
+        # Min > max
+        with pytest.raises(ValidationError, match="alpha_range"):
+            optuna_hyperparameter_search(
+                Z=Z,
+                X_missing=X_missing,
+                alpha_range=(1.0, 0.1),
+                n_trials=5,
+            )
+
+    def test_invalid_sample_indices(self):
+        """Test that invalid sample_indices raises ValidationError."""
+        rng = np.random.default_rng(42)
+        Z = rng.binomial(2, 0.3, (100, 50)).astype(float)
+        X_missing = rng.binomial(2, 0.25, (100, 10)).astype(float)
+
+        with pytest.raises(ValidationError, match="invalid index"):
+            optuna_hyperparameter_search(
+                Z=Z,
+                X_missing=X_missing,
+                sample_indices=[0, 5, 15],  # 15 is out of range
+                n_trials=5,
+            )
+
+
+class TestOptunaImportPaths:
+    """Tests for Optuna import paths."""
+
+    def test_import_from_models(self):
+        """Test that optuna_hyperparameter_search can be imported from models."""
+        from imputed_prs.models import optuna_hyperparameter_search, OptunaSearchResult
+
+        assert callable(optuna_hyperparameter_search)
+        assert OptunaSearchResult is not None
+
+    def test_import_optuna_search_result_from_core(self):
+        """Test that OptunaSearchResult can be imported from core."""
+        from imputed_prs.core import OptunaSearchResult
+
+        assert OptunaSearchResult is not None

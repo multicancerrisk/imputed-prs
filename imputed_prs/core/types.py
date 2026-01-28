@@ -324,3 +324,28 @@ class TrainingResult:
     n_variants_failed: int
     n_intercept_only: int
     training_summary: Dict[str, Any]
+
+
+@dataclass
+class OptunaSearchResult:
+    """Result from Optuna hyperparameter search.
+
+    Attributes:
+        best_l1_ratio: Optimal L1 ratio from Optuna.
+        best_alpha: Optimal regularization strength from Optuna.
+        best_mean_cv_mse: Mean CV MSE at optimal parameters.
+        n_trials: Number of trials completed.
+        n_variants_sampled: Number of variants used in search.
+        n_variants_failed: Number of variants where fitting failed at best params.
+        trial_history: List of dicts with trial details (trial_number, l1_ratio, alpha, mean_cv_mse).
+        optimization_time_seconds: Total optimization time.
+    """
+
+    best_l1_ratio: float
+    best_alpha: float
+    best_mean_cv_mse: float
+    n_trials: int
+    n_variants_sampled: int
+    n_variants_failed: int
+    trial_history: List[Dict[str, Any]]
+    optimization_time_seconds: float
