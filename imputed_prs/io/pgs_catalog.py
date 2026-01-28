@@ -705,3 +705,7 @@ def get_pgs_catalog_cache_info(cache_dir: Optional[Path] = None) -> Dict[str, An
         "size_mb": round(total_size / (1024 * 1024), 2),
         "cached_scores": sorted(pgs_ids),
     }
+
+
+# Alias for backward compatibility with API design spec
+fetch_pgs_catalog_score = download_pgs_catalog_score

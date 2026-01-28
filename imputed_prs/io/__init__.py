@@ -7,6 +7,7 @@ from imputed_prs.io.prs_loader import (
 from imputed_prs.io.pgs_catalog import (
     fetch_pgs_catalog_metadata,
     download_pgs_catalog_score,
+    fetch_pgs_catalog_score,
     search_pgs_catalog,
     clear_pgs_catalog_cache,
     get_pgs_catalog_cache_info,
@@ -43,6 +44,7 @@ __all__ = [
     # PGS Catalog
     "fetch_pgs_catalog_metadata",
     "download_pgs_catalog_score",
+    "fetch_pgs_catalog_score",
     "search_pgs_catalog",
     "clear_pgs_catalog_cache",
     "get_pgs_catalog_cache_info",
