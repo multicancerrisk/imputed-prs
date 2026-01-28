@@ -13,6 +13,13 @@ from imputed_prs.io.pgs_catalog import (
     PGSCatalogMetadata,
     PGSSearchResult,
 )
+from imputed_prs.io.platform_loader import (
+    load_platform_variants_from_list,
+    load_platform_from_manifest,
+    load_platform_from_name,
+    list_available_platforms,
+    get_platform_info,
+)
 
 __all__ = [
     # PRS loader
@@ -26,4 +33,10 @@ __all__ = [
     "get_pgs_catalog_cache_info",
     "PGSCatalogMetadata",
     "PGSSearchResult",
+    # Platform loader
+    "load_platform_variants_from_list",
+    "load_platform_from_manifest",
+    "load_platform_from_name",
+    "list_available_platforms",
+    "get_platform_info",
 ]

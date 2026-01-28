@@ -1,8 +1,38 @@
 """Core data types for the imputed-prs library."""
 
 from dataclasses import dataclass, field, asdict
-from typing import Optional, List
+from typing import List, Optional
+
 import numpy as np
+
+
+@dataclass
+class PlatformInfo:
+    """Metadata about a genotyping platform.
+
+    Attributes:
+        name: Internal platform identifier (e.g., "23andme_v5").
+        display_name: Human-readable name (e.g., "23andMe V5").
+        description: Brief description of the platform.
+        genome_build: Reference genome build ("GRCh37" or "GRCh38").
+        n_variants: Number of variants on the platform.
+        chip_technology: Underlying chip technology (e.g., "Illumina GSA").
+        company: Company that offers the platform.
+        version: Platform version identifier.
+        date_introduced: When the platform was introduced (optional).
+        source_url: URL for more information about the platform (optional).
+    """
+
+    name: str
+    display_name: str
+    description: str
+    genome_build: str
+    n_variants: int
+    chip_technology: str
+    company: str
+    version: str
+    date_introduced: Optional[str] = None
+    source_url: Optional[str] = None
 
 
 @dataclass

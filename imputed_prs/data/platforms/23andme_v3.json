@@ -1,0 +1,13 @@
+{
+  "name": "23andme_v3",
+  "display_name": "23andMe V3",
+  "description": "23andMe V3 chip based on Illumina OmniExpress Plus",
+  "genome_build": "GRCh37",
+  "n_variants": 961811,
+  "chip_technology": "Illumina OmniExpress Plus",
+  "company": "23andMe",
+  "version": "3",
+  "date_introduced": "2010-12",
+  "source_url": "https://customercare.23andme.com/hc/en-us/articles/212196868",
+  "variant_file": "23andme_v3_variants.txt.gz"
+}

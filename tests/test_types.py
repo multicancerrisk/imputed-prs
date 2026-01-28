@@ -4,11 +4,12 @@ import numpy as np
 from dataclasses import asdict
 
 from imputed_prs.core.types import (
-    VariantInfo,
-    ImputedVariantModel,
-    PredictionResult,
     CalibrationParams,
     EvaluationMetrics,
+    ImputedVariantModel,
+    PlatformInfo,
+    PredictionResult,
+    VariantInfo,
 )
 
 
@@ -308,3 +309,78 @@ class TestEvaluationMetrics:
         d = asdict(metrics)
         assert d["correlation"] == 0.95
         assert d["calibration_slope"] == 1.02
+
+
+class TestPlatformInfo:
+    """Tests for PlatformInfo dataclass."""
+
+    def test_instantiation(self):
+        """Test creating a PlatformInfo with valid data."""
+        info = PlatformInfo(
+            name="test_platform",
+            display_name="Test Platform",
+            description="A test genotyping platform",
+            genome_build="GRCh37",
+            n_variants=500000,
+            chip_technology="Illumina GSA",
+            company="Test Company",
+            version="1",
+        )
+        assert info.name == "test_platform"
+        assert info.display_name == "Test Platform"
+        assert info.genome_build == "GRCh37"
+        assert info.n_variants == 500000
+        assert info.chip_technology == "Illumina GSA"
+        assert info.company == "Test Company"
+        assert info.version == "1"
+
+    def test_optional_fields_default_none(self):
+        """Test that optional fields default to None."""
+        info = PlatformInfo(
+            name="test_platform",
+            display_name="Test Platform",
+            description="A test genotyping platform",
+            genome_build="GRCh37",
+            n_variants=500000,
+            chip_technology="Illumina GSA",
+            company="Test Company",
+            version="1",
+        )
+        assert info.date_introduced is None
+        assert info.source_url is None
+
+    def test_with_optional_fields(self):
+        """Test setting optional fields."""
+        info = PlatformInfo(
+            name="test_platform",
+            display_name="Test Platform",
+            description="A test genotyping platform",
+            genome_build="GRCh37",
+            n_variants=500000,
+            chip_technology="Illumina GSA",
+            company="Test Company",
+            version="1",
+            date_introduced="2020-01",
+            source_url="https://example.com",
+        )
+        assert info.date_introduced == "2020-01"
+        assert info.source_url == "https://example.com"
+
+    def test_asdict_serialization(self):
+        """Test asdict serialization."""
+        info = PlatformInfo(
+            name="test_platform",
+            display_name="Test Platform",
+            description="A test genotyping platform",
+            genome_build="GRCh37",
+            n_variants=500000,
+            chip_technology="Illumina GSA",
+            company="Test Company",
+            version="1",
+            date_introduced="2020-01",
+            source_url="https://example.com",
+        )
+        d = asdict(info)
+        assert d["name"] == "test_platform"
+        assert d["n_variants"] == 500000
+        assert d["date_introduced"] == "2020-01"

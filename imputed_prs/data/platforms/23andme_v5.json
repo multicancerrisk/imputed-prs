@@ -1,0 +1,13 @@
+{
+  "name": "23andme_v5",
+  "display_name": "23andMe V5",
+  "description": "23andMe V5 chip based on Illumina Global Screening Array",
+  "genome_build": "GRCh37",
+  "n_variants": 635991,
+  "chip_technology": "Illumina Global Screening Array",
+  "company": "23andMe",
+  "version": "5",
+  "date_introduced": "2017-08",
+  "source_url": "https://customercare.23andme.com/hc/en-us/articles/218392668",
+  "variant_file": "23andme_v5_variants.txt.gz"
+}

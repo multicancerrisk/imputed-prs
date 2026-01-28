@@ -1,31 +1,35 @@
 """Core module containing data types and exceptions."""
 
 from imputed_prs.core.types import (
-    VariantInfo,
-    ImputedVariantModel,
-    PredictionResult,
     CalibrationParams,
     EvaluationMetrics,
+    ImputedVariantModel,
+    PlatformInfo,
+    PredictionResult,
+    VariantInfo,
 )
 from imputed_prs.core.exceptions import (
-    ImputedPRSError,
     DataLoadError,
-    ValidationError,
+    ImputedPRSError,
     IncompatibleBuildError,
     MissingVariantsError,
     ModelNotFittedError,
+    ValidationError,
 )
 
 __all__ = [
-    "VariantInfo",
-    "ImputedVariantModel",
-    "PredictionResult",
+    # Types
     "CalibrationParams",
     "EvaluationMetrics",
-    "ImputedPRSError",
+    "ImputedVariantModel",
+    "PlatformInfo",
+    "PredictionResult",
+    "VariantInfo",
+    # Exceptions
     "DataLoadError",
-    "ValidationError",
+    "ImputedPRSError",
     "IncompatibleBuildError",
     "MissingVariantsError",
     "ModelNotFittedError",
+    "ValidationError",
 ]

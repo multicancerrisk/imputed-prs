@@ -1,0 +1,13 @@
+{
+  "name": "ancestrydna_v1",
+  "display_name": "AncestryDNA V1",
+  "description": "AncestryDNA V1 chip based on Illumina OmniExpress",
+  "genome_build": "GRCh37",
+  "n_variants": 728909,
+  "chip_technology": "Illumina OmniExpress",
+  "company": "Ancestry",
+  "version": "1",
+  "date_introduced": "2012-05",
+  "source_url": "https://www.ancestry.com/dna/",
+  "variant_file": "ancestrydna_v1_variants.txt.gz"
+}

@@ -1,0 +1,13 @@
+{
+  "name": "23andme_v4",
+  "display_name": "23andMe V4",
+  "description": "23andMe V4 chip based on Illumina HTS iSelect HD",
+  "genome_build": "GRCh37",
+  "n_variants": 598426,
+  "chip_technology": "Illumina HTS iSelect HD",
+  "company": "23andMe",
+  "version": "4",
+  "date_introduced": "2013-12",
+  "source_url": "https://customercare.23andme.com/hc/en-us/articles/212196868",
+  "variant_file": "23andme_v4_variants.txt.gz"
+}

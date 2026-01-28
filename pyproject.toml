@@ -33,3 +33,9 @@ optuna = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["imputed_prs*"]
+
+[tool.setuptools.package-data]
+imputed_prs = [
+    "data/platforms/*.json",
+    "data/platforms/*.txt.gz",
+]
