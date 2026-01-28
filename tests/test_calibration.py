@@ -1,8 +1,12 @@
 """Tests for the calibration module."""
 
 import numpy as np
+import pytest
 
-from imputed_prs.evaluation.calibration import compute_cv_predicted_prs
+from imputed_prs.evaluation.calibration import (
+    compute_cv_predicted_prs,
+    estimate_cv_calibration,
+)
 
 
 class TestComputeCvPredictedPrs:
@@ -162,3 +166,82 @@ class TestEdgeCases:
         assert np.isnan(s_cv[10])
         assert not np.isnan(s_cv[1])
         assert not np.isnan(s_cv[6])
+
+
+class TestEstimateCvCalibration:
+    """Tests for estimate_cv_calibration function."""
+
+    def test_basic_calibration(self):
+        """Test calibration with synthetic attenuated data."""
+        rng = np.random.default_rng(42)
+        n = 500
+        s_true = rng.normal(0, 1, n)
+        # Attenuated predictions (multiplied by 0.9, plus noise)
+        s_cv = 0.9 * s_true + rng.normal(0, 0.2, n)
+
+        params = estimate_cv_calibration(s_cv, s_true)
+
+        # Slope should be approximately 1/0.9 ≈ 1.11
+        assert 1.0 < params.scaling_factor < 1.3
+        assert params.calibration_r2 > 0.8
+        assert 0 < params.attenuation_factor < 1
+        assert params.n_calibration == n
+
+    def test_perfect_prediction(self):
+        """Test with perfect prediction (s_cv = s_true)."""
+        rng = np.random.default_rng(42)
+        s_true = rng.normal(0, 1, 100)
+        s_cv = s_true.copy()
+
+        params = estimate_cv_calibration(s_cv, s_true)
+
+        np.testing.assert_allclose(params.scaling_factor, 1.0, atol=1e-10)
+        np.testing.assert_allclose(params.calibration_r2, 1.0, atol=1e-10)
+        np.testing.assert_allclose(params.attenuation_factor, 1.0, atol=1e-10)
+
+    def test_nan_filtering(self):
+        """Test that NaN values are properly filtered."""
+        rng = np.random.default_rng(42)
+        s_true = rng.normal(0, 1, 100)
+        s_cv = s_true + rng.normal(0, 0.1, 100)
+
+        # Introduce NaN values
+        s_cv[0] = np.nan
+        s_true[5] = np.nan
+        s_cv[10] = np.nan
+        s_true[10] = np.nan
+
+        params = estimate_cv_calibration(s_cv, s_true)
+
+        # Should have filtered out 3 samples (indices 0, 5, 10)
+        assert params.n_calibration == 97
+
+    def test_insufficient_samples(self):
+        """Test error when too few valid samples."""
+        s_true = np.array([1.0, 2.0, np.nan])
+        s_cv = np.array([1.0, np.nan, 3.0])
+
+        with pytest.raises(ValueError, match="at least 3"):
+            estimate_cv_calibration(s_cv, s_true)
+
+    def test_scaling_factor_se(self):
+        """Test that standard error is computed correctly."""
+        rng = np.random.default_rng(42)
+        s_true = rng.normal(0, 1, 500)
+        s_cv = s_true + rng.normal(0, 0.3, 500)
+
+        params = estimate_cv_calibration(s_cv, s_true)
+
+        # SE should be small and positive
+        assert params.scaling_factor_se > 0
+        assert params.scaling_factor_se < 0.1  # Reasonable for n=500
+
+    def test_zero_variance_true(self):
+        """Test handling of constant true PRS."""
+        s_true = np.full(50, 1.5)
+        s_cv = np.random.default_rng(42).normal(1.5, 0.1, 50)
+
+        params = estimate_cv_calibration(s_cv, s_true)
+
+        assert params.attenuation_factor == 0.0
+        assert params.sd_true == 0.0

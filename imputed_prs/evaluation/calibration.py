@@ -3,6 +3,9 @@
 from typing import Dict
 
 import numpy as np
+from scipy import stats
+
+from imputed_prs.core.types import CalibrationParams
 
 
 def compute_cv_predicted_prs(
@@ -48,3 +51,62 @@ def compute_cv_predicted_prs(
         s_cv += cv_pred * beta
 
     return s_cv
+
+
+def estimate_cv_calibration(
+    s_cv: np.ndarray,
+    s_true: np.ndarray,
+) -> CalibrationParams:
+    """Estimate calibration parameters by regressing true PRS on CV-predicted PRS.
+
+    Fits the model: S_true = α + β * S_cv
+
+    The scaling factor β can be used to correct for attenuation in predictions.
+    When imputation is imperfect, S_cv will have lower variance than S_true,
+    and β > 1 will scale predictions back up.
+
+    Args:
+        s_cv: CV-predicted PRS values (n_samples,). NaN values are excluded.
+        s_true: True PRS values (n_samples,). NaN values are excluded.
+
+    Returns:
+        CalibrationParams with regression results and summary statistics.
+
+    Raises:
+        ValueError: If fewer than 3 valid (non-NaN) samples remain after filtering.
+    """
+    # Filter out NaN values (use samples where both are valid)
+    valid_mask = ~(np.isnan(s_cv) | np.isnan(s_true))
+    s_cv_valid = s_cv[valid_mask]
+    s_true_valid = s_true[valid_mask]
+
+    n = len(s_cv_valid)
+    if n < 3:
+        raise ValueError(f"Need at least 3 valid samples, got {n}")
+
+    # Linear regression: S_true = α + β * S_cv
+    slope, intercept, r_value, p_value, std_err = stats.linregress(
+        s_cv_valid, s_true_valid
+    )
+
+    # Compute standard deviations
+    sd_cv = np.std(s_cv_valid, ddof=1)
+    sd_true = np.std(s_true_valid, ddof=1)
+
+    # Scaled predictions: β * S_cv
+    sd_scaled = abs(slope) * sd_cv if sd_cv > 0 else 0.0
+
+    # Attenuation factor: how much variance is attenuated
+    attenuation = sd_cv / sd_true if sd_true > 0 else 0.0
+
+    return CalibrationParams(
+        scaling_factor=slope,
+        scaling_factor_se=std_err,
+        calibration_intercept=intercept,
+        calibration_r2=r_value**2,
+        sd_cv_predicted=sd_cv,
+        sd_true=sd_true,
+        sd_scaled=sd_scaled,
+        attenuation_factor=attenuation,
+        n_calibration=n,
+    )
