@@ -25,6 +25,11 @@ from imputed_prs.io.genotype_loader import (
     load_genotypes_vcf,
     load_genotypes_plink,
 )
+from imputed_prs.io.user_genotypes import (
+    load_user_genotypes,
+    genotype_to_dosage,
+    detect_genome_build,
+)
 
 __all__ = [
     # PRS loader
@@ -48,4 +53,8 @@ __all__ = [
     "load_genotypes",
     "load_genotypes_vcf",
     "load_genotypes_plink",
+    # User genotype loader
+    "load_user_genotypes",
+    "genotype_to_dosage",
+    "detect_genome_build",
 ]

@@ -32,6 +32,11 @@ optuna = [
     "optuna>=3.0.0",
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests (may require network access)",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["imputed_prs*"]
