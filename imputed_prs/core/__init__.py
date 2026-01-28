@@ -29,6 +29,7 @@ from imputed_prs.core.harmonizer import (
     PartitionResult,
     WindowFilterResult,
 )
+from imputed_prs.core.linear_imputation_prs import LinearImputationPRS
 
 __all__ = [
     # Types
@@ -58,4 +59,6 @@ __all__ = [
     "BuildValidationResult",
     "PartitionResult",
     "WindowFilterResult",
+    # Main API class
+    "LinearImputationPRS",
 ]
