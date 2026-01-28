@@ -293,3 +293,34 @@ class GridSearchResult:
     grid_results: List[Dict[str, Any]]
     n_variants_sampled: int
     n_variants_failed: int
+
+
+@dataclass
+class TrainingResult:
+    """Result from training imputation models for all missing variants.
+
+    Attributes:
+        models: Dictionary mapping variant_id to trained ImputedVariantModel.
+        cv_predictions: Dictionary mapping variant_id to out-of-fold CV predictions.
+            Shape of each array: (n_samples,).
+        n_variants_trained: Number of variants successfully trained.
+        n_variants_failed: Number of variants where training failed.
+        n_intercept_only: Number of variants using intercept-only models.
+        training_summary: Summary statistics including:
+            - mean_r2: Mean imputation R² across variants.
+            - median_r2: Median imputation R² across variants.
+            - std_r2: Standard deviation of R² values.
+            - min_r2: Minimum R² value.
+            - max_r2: Maximum R² value.
+            - n_high_quality: Count with R² > 0.8.
+            - n_medium_quality: Count with 0.4 < R² <= 0.8.
+            - n_low_quality: Count with R² <= 0.4.
+            - mean_n_predictors: Average number of predictors per model.
+    """
+
+    models: Dict[str, "ImputedVariantModel"]
+    cv_predictions: Dict[str, np.ndarray]
+    n_variants_trained: int
+    n_variants_failed: int
+    n_intercept_only: int
+    training_summary: Dict[str, Any]

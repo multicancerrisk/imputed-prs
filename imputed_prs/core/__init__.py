@@ -8,6 +8,7 @@ from imputed_prs.core.types import (
     ImputedVariantModel,
     PlatformInfo,
     PredictionResult,
+    TrainingResult,
     VariantInfo,
 )
 from imputed_prs.core.exceptions import (
@@ -38,6 +39,7 @@ __all__ = [
     "ImputedVariantModel",
     "PlatformInfo",
     "PredictionResult",
+    "TrainingResult",
     "VariantInfo",
     # Exceptions
     "DataLoadError",
