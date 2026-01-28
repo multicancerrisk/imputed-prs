@@ -4,6 +4,11 @@ from imputed_prs.evaluation.calibration import (
     compute_cv_predicted_prs,
     estimate_cv_calibration,
 )
+from imputed_prs.evaluation.evaluator import (
+    CrossValidationResult,
+    ImputationEvaluator,
+    SensitivityResult,
+)
 from imputed_prs.evaluation.metrics import (
     compute_prs_metrics,
     compute_percentile_concordance,
@@ -18,4 +23,7 @@ __all__ = [
     "compute_prs_metrics",
     "compute_percentile_concordance",
     "summarize_imputation_quality",
+    "CrossValidationResult",
+    "ImputationEvaluator",
+    "SensitivityResult",
 ]
