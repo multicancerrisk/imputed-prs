@@ -57,7 +57,7 @@ Where:
 Predictors are restricted to a genomic window around the target variant:
 
 $$
-L_j = \{k : |pos_k - pos_j| \leq \text{window\_size} \text{ and } chr_k = chr_j\}
+L_j = \{k : |pos_k - pos_j| \leq \text{window\\_size} \text{ and } chr_k = chr_j\}
 $$
 
 The default window size is 1 Mb (1,000,000 base pairs). This constraint:
