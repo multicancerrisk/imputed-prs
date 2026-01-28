@@ -31,6 +31,7 @@ from imputed_prs.io.user_genotypes import (
     detect_genome_build,
 )
 from imputed_prs.io.exporters.json_export import export_to_json
+from imputed_prs.io.exporters.arrow_export import export_to_arrow, export_to_parquet
 
 __all__ = [
     # PRS loader
@@ -60,4 +61,6 @@ __all__ = [
     "detect_genome_build",
     # Exporters
     "export_to_json",
+    "export_to_arrow",
+    "export_to_parquet",
 ]
