@@ -16,6 +16,12 @@ from imputed_prs.evaluation.metrics import (
 from imputed_prs.evaluation.quality import (
     summarize_imputation_quality,
 )
+from imputed_prs.evaluation.plotting import (
+    plot_calibration,
+    plot_imputation_quality,
+    plot_variance_contribution,
+    plot_truncation_diagnostics,
+)
 
 __all__ = [
     "compute_cv_predicted_prs",
@@ -26,4 +32,8 @@ __all__ = [
     "CrossValidationResult",
     "ImputationEvaluator",
     "SensitivityResult",
+    "plot_calibration",
+    "plot_imputation_quality",
+    "plot_variance_contribution",
+    "plot_truncation_diagnostics",
 ]
