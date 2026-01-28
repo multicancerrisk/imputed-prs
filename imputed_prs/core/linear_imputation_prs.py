@@ -1,20 +1,40 @@
 """Main LinearImputationPRS class for training and prediction."""
 
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 import numpy as np
 import pandas as pd
 
-from imputed_prs.core.exceptions import ModelNotFittedError
+from imputed_prs.core.exceptions import ModelNotFittedError, ValidationError
+from imputed_prs.core.harmonizer import (
+    align_effect_alleles,
+    partition_variants,
+    validate_genome_build,
+)
 from imputed_prs.core.types import (
     CalibrationParams,
     EvaluationMetrics,
+    GenotypeData,
     ImputedVariantModel,
     PredictionResult,
     TrainingResult,
     VariantInfo,
 )
+from imputed_prs.evaluation.calibration import (
+    compute_cv_predicted_prs,
+    estimate_cv_calibration,
+)
+from imputed_prs.io.genotype_loader import load_genotypes
+from imputed_prs.io.pgs_catalog import download_pgs_catalog_score
+from imputed_prs.io.platform_loader import (
+    load_platform_from_manifest,
+    load_platform_from_name,
+    load_platform_variants_from_list,
+)
+from imputed_prs.io.prs_loader import load_prs_from_dataframe, load_prs_from_file
+from imputed_prs.models.trainer import ImputationModelTrainer
+from imputed_prs.models.tuning import global_hyperparameter_search
 
 
 class LinearImputationPRS:
@@ -146,8 +166,382 @@ class LinearImputationPRS:
             ValidationError: If inputs are invalid or incompatible.
             DataLoadError: If files cannot be loaded.
         """
-        # TODO: Implement in Phase 7.2
-        raise NotImplementedError("fit() will be implemented in Phase 7.2")
+        # Step 1: Input validation - exactly one platform source must be provided
+        platform_sources = [
+            platform_name is not None,
+            platform_manifest is not None,
+            platform_variants is not None,
+        ]
+        if sum(platform_sources) != 1:
+            raise ValidationError(
+                "Exactly one platform source must be provided: "
+                "platform_name, platform_manifest, or platform_variants"
+            )
+
+        # Track effective metadata values
+        effective_prs_id = prs_id
+        effective_platform_name = platform_name
+        effective_genome_build = genome_build
+        pgs_metadata = None
+
+        # Step 2: Load PRS definition
+        if isinstance(prs_definition, pd.DataFrame):
+            prs_df = load_prs_from_dataframe(prs_definition)
+        elif isinstance(prs_definition, str) and prs_definition.upper().startswith("PGS"):
+            # PGS Catalog ID
+            prs_df, pgs_metadata = download_pgs_catalog_score(
+                prs_definition,
+                genome_build=genome_build or "GRCh37",
+            )
+            if effective_prs_id is None:
+                effective_prs_id = prs_definition.upper()
+            if effective_genome_build is None and pgs_metadata:
+                effective_genome_build = pgs_metadata.genome_build
+        else:
+            # File path
+            prs_df = load_prs_from_file(Path(prs_definition))
+
+        if self.verbose >= 2:
+            print(f"Loaded PRS definition with {len(prs_df)} variants")
+
+        # Step 3: Load platform variants
+        platform_info = None
+        if platform_name is not None:
+            platform_variant_set, platform_info = load_platform_from_name(platform_name)
+            effective_platform_name = platform_name
+            if effective_genome_build is None and platform_info:
+                effective_genome_build = platform_info.genome_build
+        elif platform_manifest is not None:
+            platform_variant_set, _ = load_platform_from_manifest(str(platform_manifest))
+            effective_platform_name = Path(platform_manifest).stem
+        else:
+            # platform_variants list
+            platform_variant_set = load_platform_variants_from_list(platform_variants)
+            effective_platform_name = "custom"
+
+        if self.verbose >= 2:
+            print(f"Loaded {len(platform_variant_set)} platform variants")
+
+        # Step 4: Partition variants into observed and missing
+        partition_result = partition_variants(prs_df, platform_variant_set)
+        observed_variant_ids = partition_result.observed  # FrozenSet[str]
+        missing_variant_ids = partition_result.missing  # FrozenSet[str]
+
+        if self.verbose >= 1:
+            print(
+                f"Partitioned variants: {len(observed_variant_ids)} observed, "
+                f"{len(missing_variant_ids)} missing"
+            )
+
+        # Step 5: Load reference genotypes
+        all_needed_variants = set(prs_df["variant_id"]) | platform_variant_set
+        genotype_data = load_genotypes(
+            path=reference_genotypes, variant_ids=all_needed_variants
+        )
+
+        if self.verbose >= 2:
+            print(
+                f"Loaded genotypes: {genotype_data.n_samples} samples, "
+                f"{genotype_data.n_variants} variants"
+            )
+
+        # Step 6: Validate genome build
+        prs_build = effective_genome_build
+        build_result = validate_genome_build(
+            prs_build, genotype_data.genome_build, strict=False
+        )
+        if build_result.warning and self.verbose >= 1:
+            print(f"Warning: {build_result.warning}")
+        if build_result.genotype_build:
+            effective_genome_build = build_result.genotype_build
+        elif build_result.prs_build:
+            effective_genome_build = build_result.prs_build
+
+        # Step 7: Align effect alleles for observed variants
+        alignment_result = align_effect_alleles(
+            prs_df, genotype_data, observed_variant_ids
+        )
+
+        if self.verbose >= 2:
+            print(
+                f"Allele alignment: {alignment_result.n_matched} matched, "
+                f"{alignment_result.n_flipped} flipped"
+            )
+
+        # Step 8: Build training matrices
+        # Build a mapping from variant_id to index in genotype_data
+        geno_var_to_idx: Dict[str, int] = {}
+        for idx, row in genotype_data.variant_info.iterrows():
+            geno_var_to_idx[row["variant_id"]] = idx
+            # Also add chr:pos lookup
+            chrom = str(row["chromosome"]).upper()
+            if chrom.startswith("CHR"):
+                chrom = chrom[3:]
+            pos = str(int(row["position"]))
+            geno_var_to_idx[f"{chrom}:{pos}"] = idx
+
+        # Build platform variant info DataFrame and Z matrix
+        platform_variant_indices = []
+        platform_variant_rows = []
+        for var_id in platform_variant_set:
+            # Try to find in genotype data
+            if var_id in geno_var_to_idx:
+                idx = geno_var_to_idx[var_id]
+                platform_variant_indices.append(idx)
+                row = genotype_data.variant_info.iloc[idx]
+                platform_variant_rows.append({
+                    "variant_id": row["variant_id"],
+                    "chromosome": row["chromosome"],
+                    "position": row["position"],
+                })
+            elif var_id.lower() in geno_var_to_idx:
+                idx = geno_var_to_idx[var_id.lower()]
+                platform_variant_indices.append(idx)
+                row = genotype_data.variant_info.iloc[idx]
+                platform_variant_rows.append({
+                    "variant_id": row["variant_id"],
+                    "chromosome": row["chromosome"],
+                    "position": row["position"],
+                })
+
+        if platform_variant_rows:
+            platform_variant_info = pd.DataFrame(platform_variant_rows)
+            Z = genotype_data.dosage_matrix[:, platform_variant_indices]
+        else:
+            platform_variant_info = pd.DataFrame(
+                columns=["variant_id", "chromosome", "position"]
+            )
+            Z = np.empty((genotype_data.n_samples, 0))
+
+        # Build missing PRS DataFrame and X matrix
+        missing_prs_df = prs_df[prs_df["variant_id"].isin(missing_variant_ids)].copy()
+        missing_prs_df = missing_prs_df.reset_index(drop=True)
+
+        missing_variant_indices = []
+        for var_id in missing_prs_df["variant_id"]:
+            if var_id in geno_var_to_idx:
+                missing_variant_indices.append(geno_var_to_idx[var_id])
+            elif var_id.lower() in geno_var_to_idx:
+                missing_variant_indices.append(geno_var_to_idx[var_id.lower()])
+
+        if missing_variant_indices:
+            X = genotype_data.dosage_matrix[:, missing_variant_indices]
+        else:
+            X = np.empty((genotype_data.n_samples, 0))
+
+        # Update missing_prs_df to only include variants found in genotype data
+        valid_missing_mask = []
+        for var_id in missing_prs_df["variant_id"]:
+            found = var_id in geno_var_to_idx or var_id.lower() in geno_var_to_idx
+            valid_missing_mask.append(found)
+        missing_prs_df = missing_prs_df[valid_missing_mask].reset_index(drop=True)
+
+        if self.verbose >= 2:
+            print(
+                f"Training matrices: Z={Z.shape}, X={X.shape}, "
+                f"missing_prs_df={len(missing_prs_df)} variants"
+            )
+
+        # Step 9: Hyperparameter tuning (if tuning_scope="global")
+        if self.tuning_scope == "global" and X.shape[1] > 0 and Z.shape[1] > 0:
+            if self.verbose >= 1:
+                print("Running global hyperparameter search...")
+            try:
+                grid_result = global_hyperparameter_search(
+                    Z=Z,
+                    X_missing=X,
+                    sample_indices=None,  # Use all variants
+                    cv_folds=self.cv_folds,
+                    random_state=self.random_state,
+                )
+                effective_l1_ratio = grid_result.best_l1_ratio
+                effective_alpha = grid_result.best_alpha
+                if self.verbose >= 1:
+                    print(
+                        f"Best hyperparameters: l1_ratio={effective_l1_ratio}, "
+                        f"alpha={effective_alpha}"
+                    )
+            except ValidationError:
+                # Fall back to defaults if tuning fails
+                effective_l1_ratio = self.l1_ratio
+                effective_alpha = self.alpha
+                if self.verbose >= 1:
+                    print("Hyperparameter search failed, using defaults")
+        elif self.tuning_scope == "none" or X.shape[1] == 0 or Z.shape[1] == 0:
+            effective_l1_ratio = self.l1_ratio
+            effective_alpha = self.alpha
+        else:
+            # per_variant tuning - let trainer handle it
+            effective_l1_ratio = self.l1_ratio
+            effective_alpha = self.alpha
+
+        # Step 10: Train imputation models
+        if X.shape[1] > 0:
+            if self.verbose >= 1:
+                print(f"Training imputation models for {X.shape[1]} variants...")
+
+            trainer = ImputationModelTrainer(
+                window_size=self.window_size,
+                l1_ratio=effective_l1_ratio,
+                alpha=effective_alpha,
+                cv_folds=self.cv_folds,
+                n_jobs=self.n_jobs,
+                random_state=self.random_state,
+                max_predictors=self.max_predictors,
+                verbose=self.verbose,
+            )
+            training_result = trainer.fit_all_variants(
+                Z=Z,
+                X=X,
+                prs_variants=missing_prs_df,
+                platform_variant_info=platform_variant_info,
+            )
+
+            if self.verbose >= 1:
+                print(
+                    f"Trained {training_result.n_variants_trained} models, "
+                    f"{training_result.n_intercept_only} intercept-only"
+                )
+        else:
+            # No missing variants to impute
+            training_result = TrainingResult(
+                models={},
+                cv_predictions={},
+                n_variants_trained=0,
+                n_variants_failed=0,
+                n_intercept_only=0,
+                training_summary={
+                    "mean_r2": 0.0,
+                    "median_r2": 0.0,
+                    "std_r2": 0.0,
+                    "min_r2": 0.0,
+                    "max_r2": 0.0,
+                    "n_high_quality": 0,
+                    "n_medium_quality": 0,
+                    "n_low_quality": 0,
+                    "mean_n_predictors": 0.0,
+                },
+            )
+
+        # Step 11: Compute calibration parameters
+        calibration_params = None
+        if training_result.cv_predictions and len(training_result.cv_predictions) > 0:
+            try:
+                # Build full dosage matrix X_full for all PRS variants
+                all_prs_indices = []
+                for var_id in prs_df["variant_id"]:
+                    if var_id in geno_var_to_idx:
+                        all_prs_indices.append(geno_var_to_idx[var_id])
+                    elif var_id.lower() in geno_var_to_idx:
+                        all_prs_indices.append(geno_var_to_idx[var_id.lower()])
+
+                if all_prs_indices:
+                    X_full = genotype_data.dosage_matrix[:, all_prs_indices]
+
+                    # Get observed variant indices and betas
+                    observed_prs_df = prs_df[
+                        prs_df["variant_id"].isin(observed_variant_ids)
+                    ]
+                    observed_indices_in_full = []
+                    observed_betas = []
+                    prs_var_list = list(prs_df["variant_id"])
+                    for var_id in observed_prs_df["variant_id"]:
+                        if var_id in prs_var_list:
+                            idx = prs_var_list.index(var_id)
+                            observed_indices_in_full.append(idx)
+                            observed_betas.append(
+                                observed_prs_df[
+                                    observed_prs_df["variant_id"] == var_id
+                                ]["beta"].values[0]
+                            )
+
+                    observed_indices = np.array(observed_indices_in_full, dtype=int)
+                    observed_betas = np.array(observed_betas)
+
+                    # Build CV predictions dict with indices into full matrix
+                    cv_preds_by_idx: Dict[int, np.ndarray] = {}
+                    missing_betas = []
+                    for var_id, cv_pred in training_result.cv_predictions.items():
+                        if var_id in prs_var_list:
+                            idx = prs_var_list.index(var_id)
+                            cv_preds_by_idx[idx] = cv_pred
+                            beta_val = prs_df[
+                                prs_df["variant_id"] == var_id
+                            ]["beta"].values[0]
+                            missing_betas.append(beta_val)
+
+                    missing_betas = np.array(missing_betas)
+
+                    # Compute CV-predicted PRS
+                    s_cv = compute_cv_predicted_prs(
+                        X=X_full,
+                        observed_variant_indices=observed_indices,
+                        observed_betas=observed_betas,
+                        cv_predictions=cv_preds_by_idx,
+                        missing_betas=missing_betas,
+                    )
+
+                    # Compute true PRS
+                    all_betas = prs_df["beta"].values
+                    s_true = X_full @ all_betas
+
+                    # Estimate calibration parameters
+                    calibration_params = estimate_cv_calibration(s_cv, s_true)
+
+                    if self.verbose >= 2:
+                        print(
+                            f"Calibration: R²={calibration_params.calibration_r2:.3f}, "
+                            f"scaling={calibration_params.scaling_factor:.3f}"
+                        )
+
+            except (ValueError, IndexError) as e:
+                if self.verbose >= 1:
+                    print(f"Warning: Could not compute calibration parameters: {e}")
+                calibration_params = None
+
+        # Step 12: Build observed VariantInfo objects
+        observed_variants_list: List[VariantInfo] = []
+        for _, row in prs_df[prs_df["variant_id"].isin(observed_variant_ids)].iterrows():
+            other_allele = row.get("other_allele")
+            if pd.isna(other_allele):
+                other_allele = None
+
+            observed_variants_list.append(
+                VariantInfo(
+                    variant_id=row["variant_id"],
+                    chromosome=str(row["chromosome"]),
+                    position=int(row["position"]),
+                    effect_allele=row["effect_allele"],
+                    other_allele=other_allele,
+                    beta=float(row["beta"]),
+                )
+            )
+
+        # Step 13: Populate instance state
+        self._is_fitted = True
+        self._observed_variants = observed_variants_list
+        self._imputed_models = list(training_result.models.values())
+        self._calibration_params = calibration_params
+        self._training_result = training_result
+
+        # Build platform variant index mapping
+        self._platform_variant_index = {}
+        for i, row in enumerate(platform_variant_rows):
+            self._platform_variant_index[row["variant_id"]] = i
+
+        self._prs_id = effective_prs_id
+        self._platform_name = effective_platform_name
+        self._genome_build = effective_genome_build
+        self._model_name = model_name
+
+        if self.verbose >= 1:
+            print(
+                f"Model fitted: {len(self._observed_variants)} observed, "
+                f"{len(self._imputed_models)} imputed variants"
+            )
+
+        # Step 14: Return self for method chaining
+        return self
 
     def predict(
         self,
