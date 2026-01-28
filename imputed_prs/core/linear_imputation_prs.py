@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Literal, Optional, Set, Union
 import numpy as np
 import pandas as pd
 
-from imputed_prs.core.exceptions import ModelNotFittedError, ValidationError
+from imputed_prs.core.exceptions import DataLoadError, ModelNotFittedError, ValidationError
 from imputed_prs.core.harmonizer import (
     align_effect_alleles,
     partition_variants,
@@ -32,6 +32,14 @@ from imputed_prs.io.platform_loader import (
     load_platform_from_name,
     load_platform_variants_from_list,
 )
+from imputed_prs.io.exporters import (
+    export_to_arrow,
+    export_to_hdf5,
+    export_to_json,
+    export_to_parquet,
+    export_variant_table,
+)
+from imputed_prs.io.loaders import load_model_hdf5
 from imputed_prs.io.prs_loader import load_prs_from_dataframe, load_prs_from_file
 from imputed_prs.io.user_genotypes import load_user_genotypes
 from imputed_prs.models.predictor import PRSPredictor
@@ -625,13 +633,88 @@ class LinearImputationPRS:
 
         Raises:
             ModelNotFittedError: If fit() has not been called.
+            ValueError: If an unsupported format is requested.
         """
         if not self._is_fitted:
             raise ModelNotFittedError(
                 "Model has not been fitted. Call fit() before export()."
             )
-        # TODO: Implement in Phase 7.4
-        raise NotImplementedError("export() will be implemented in Phase 7.4")
+
+        # Default formats
+        if formats is None:
+            formats = ["json", "hdf5"]
+
+        # Resolve model name
+        effective_model_name = model_name or self._model_name or "imputed_prs_model"
+
+        # Convert output_dir to Path
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get training summary if available
+        training_summary = None
+        if self._training_result is not None:
+            training_summary = self._training_result.training_summary
+
+        # Common kwargs for all export functions
+        common_kwargs = {
+            "observed_variants": self._observed_variants or [],
+            "imputed_models": self._imputed_models or [],
+            "calibration_params": self._calibration_params,
+            "evaluation_metrics": self._evaluation_metrics,
+            "platform_name": self._platform_name,
+            "prs_id": self._prs_id,
+            "genome_build": self._genome_build,
+            "model_name": effective_model_name,
+            "include_variance_scaling": include_variance_scaling,
+            "training_summary": training_summary,
+        }
+
+        # Valid formats
+        valid_formats = {"json", "arrow", "parquet", "hdf5", "csv"}
+        invalid_formats = set(formats) - valid_formats
+        if invalid_formats:
+            raise ValueError(
+                f"Unsupported export formats: {invalid_formats}. "
+                f"Valid formats: {valid_formats}"
+            )
+
+        # Export to each requested format
+        output_paths: Dict[str, Path] = {}
+
+        for fmt in formats:
+            if fmt == "json":
+                output_path = output_dir / f"{effective_model_name}.json"
+                export_to_json(output_path=output_path, **common_kwargs)
+                output_paths["json"] = output_path
+
+            elif fmt == "arrow":
+                output_path = output_dir / f"{effective_model_name}.arrow"
+                export_to_arrow(output_path=output_path, **common_kwargs)
+                output_paths["arrow"] = output_path
+
+            elif fmt == "parquet":
+                parquet_dir = output_dir / f"{effective_model_name}_parquet"
+                parquet_paths = export_to_parquet(output_path=parquet_dir, **common_kwargs)
+                # Store the directory path as the main parquet output
+                output_paths["parquet"] = parquet_dir
+
+            elif fmt == "hdf5":
+                output_path = output_dir / f"{effective_model_name}.h5"
+                export_to_hdf5(output_path=output_path, **common_kwargs)
+                output_paths["hdf5"] = output_path
+
+            elif fmt == "csv":
+                output_path = output_dir / f"{effective_model_name}_variants.csv"
+                export_variant_table(
+                    output_path=output_path,
+                    observed_variants=self._observed_variants or [],
+                    imputed_models=self._imputed_models or [],
+                    include_variance_scaling=include_variance_scaling,
+                )
+                output_paths["csv"] = output_path
+
+        return output_paths
 
     @classmethod
     def load(cls, path: Union[str, Path]) -> "LinearImputationPRS":
@@ -644,10 +727,135 @@ class LinearImputationPRS:
             Loaded LinearImputationPRS instance ready for prediction.
 
         Raises:
-            DataLoadError: If file cannot be loaded.
+            DataLoadError: If file cannot be loaded or format is unsupported.
         """
-        # TODO: Implement in Phase 7.4
-        raise NotImplementedError("load() will be implemented in Phase 7.4")
+        path = Path(path)
+
+        if not path.exists():
+            raise DataLoadError(f"Model file not found: {path}")
+
+        # Detect format by extension
+        suffix = path.suffix.lower()
+
+        if suffix in (".h5", ".hdf5"):
+            return cls._load_from_hdf5(path)
+        elif suffix == ".json":
+            return cls._load_from_json(path)
+        else:
+            raise DataLoadError(
+                f"Unsupported model file format: {suffix}. "
+                "Supported formats: .h5, .hdf5, .json"
+            )
+
+    @classmethod
+    def _load_from_hdf5(cls, path: Path) -> "LinearImputationPRS":
+        """Load model from HDF5 file."""
+        try:
+            observed, imputed, calib, metrics, metadata = load_model_hdf5(path)
+        except Exception as e:
+            raise DataLoadError(f"Failed to load HDF5 model: {e}") from e
+
+        # Create instance with default parameters
+        instance = cls()
+
+        # Populate fitted state
+        instance._is_fitted = True
+        instance._observed_variants = observed
+        instance._imputed_models = imputed
+        instance._calibration_params = calib
+        instance._evaluation_metrics = metrics
+
+        # Populate metadata from loaded file
+        instance._prs_id = metadata.get("prs_id") or None
+        instance._platform_name = metadata.get("platform_name") or None
+        instance._genome_build = metadata.get("genome_build") or None
+        instance._model_name = metadata.get("model_name") or None
+
+        # Handle empty string values from HDF5
+        if instance._prs_id == "":
+            instance._prs_id = None
+        if instance._platform_name == "":
+            instance._platform_name = None
+        if instance._genome_build == "":
+            instance._genome_build = None
+        if instance._model_name == "":
+            instance._model_name = None
+
+        return instance
+
+    @classmethod
+    def _load_from_json(cls, path: Path) -> "LinearImputationPRS":
+        """Load model from JSON file."""
+        from imputed_prs.io.loaders import load_model_json
+
+        try:
+            data = load_model_json(path)
+        except Exception as e:
+            raise DataLoadError(f"Failed to load JSON model: {e}") from e
+
+        # Create instance with default parameters
+        instance = cls()
+
+        # Parse observed variants
+        observed_variants = []
+        for v in data.get("observed_variants", []):
+            observed_variants.append(
+                VariantInfo(
+                    variant_id=v["variant_id"],
+                    chromosome=v["chromosome"],
+                    position=v["position"],
+                    effect_allele=v["effect_allele"],
+                    other_allele=v.get("other_allele"),
+                    beta=v["beta"],
+                )
+            )
+
+        # Parse imputed models
+        imputed_models = []
+        for m in data.get("imputed_variants", []):
+            imputed_models.append(
+                ImputedVariantModel(
+                    variant_id=m["variant_id"],
+                    chromosome=m["chromosome"],
+                    position=m["position"],
+                    effect_allele=m["effect_allele"],
+                    other_allele=m.get("other_allele"),
+                    beta=m["beta"],
+                    allele_frequency=m["allele_frequency"],
+                    imputation_r2=m["imputation_r2"],
+                    residual_variance=m.get("residual_variance", 0.0),
+                    intercept=m["intercept"],
+                    predictor_variant_ids=m.get("predictor_variant_ids", []),
+                    coefficients=np.array(m.get("coefficients", [])),
+                    is_intercept_only=m.get("is_intercept_only", False),
+                )
+            )
+
+        # Parse calibration params if present
+        calib_params = None
+        if "calibration_params" in data and data["calibration_params"]:
+            calib_params = CalibrationParams(**data["calibration_params"])
+
+        # Parse evaluation metrics if present
+        eval_metrics = None
+        if "evaluation_metrics" in data and data["evaluation_metrics"]:
+            eval_metrics = EvaluationMetrics(**data["evaluation_metrics"])
+
+        # Populate fitted state
+        instance._is_fitted = True
+        instance._observed_variants = observed_variants
+        instance._imputed_models = imputed_models
+        instance._calibration_params = calib_params
+        instance._evaluation_metrics = eval_metrics
+
+        # Populate metadata
+        metadata = data.get("metadata", {})
+        instance._prs_id = metadata.get("prs_id")
+        instance._platform_name = metadata.get("platform_name")
+        instance._genome_build = metadata.get("genome_build")
+        instance._model_name = metadata.get("model_name")
+
+        return instance
 
     @property
     def is_fitted(self) -> bool:

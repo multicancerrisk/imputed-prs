@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from imputed_prs import LinearImputationPRS
-from imputed_prs.core.exceptions import ModelNotFittedError, ValidationError
+from imputed_prs.core.exceptions import DataLoadError, ModelNotFittedError, ValidationError
 from imputed_prs.core.types import (
     CalibrationParams,
     ImputedVariantModel,
@@ -169,15 +169,6 @@ class TestLinearImputationPRSRepr:
 
         assert "window_size=1000000" in repr_str
         assert "cv_folds=5" in repr_str
-
-
-class TestLinearImputationPRSStubMethods:
-    """Test stub methods raise NotImplementedError."""
-
-    def test_load_raises_not_implemented_error(self):
-        """Test load() raises NotImplementedError (stub)."""
-        with pytest.raises(NotImplementedError, match="Phase 7.4"):
-            LinearImputationPRS.load("/path/to/model.hdf5")
 
 
 class TestLinearImputationPRSImports:
@@ -1133,3 +1124,344 @@ class TestLinearImputationPRSGetExpectedVariants:
         expected = fitted_model._get_expected_variants()
 
         assert isinstance(expected, set)
+
+
+# =============================================================================
+# Tests for export() method
+# =============================================================================
+
+
+class TestLinearImputationPRSExport:
+    """Test export() method."""
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_raises_model_not_fitted_error(self, tmp_path):
+        """Test export() raises ModelNotFittedError if called before fit()."""
+        model = LinearImputationPRS()
+
+        with pytest.raises(ModelNotFittedError, match="Model has not been fitted"):
+            model.export(tmp_path)
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_default_formats(self, fitted_model, tmp_path):
+        """Test export() with default formats (json, hdf5)."""
+        paths = fitted_model.export(tmp_path)
+
+        assert "json" in paths
+        assert "hdf5" in paths
+        assert paths["json"].exists()
+        assert paths["hdf5"].exists()
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_json_format(self, fitted_model, tmp_path):
+        """Test export() to JSON format."""
+        paths = fitted_model.export(tmp_path, formats=["json"])
+
+        assert "json" in paths
+        assert paths["json"].suffix == ".json"
+        assert paths["json"].exists()
+
+        # Verify JSON is valid
+        import json
+        with open(paths["json"]) as f:
+            data = json.load(f)
+        assert "metadata" in data
+        assert "observed_variants" in data
+        assert "imputed_variants" in data
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_hdf5_format(self, fitted_model, tmp_path):
+        """Test export() to HDF5 format."""
+        paths = fitted_model.export(tmp_path, formats=["hdf5"])
+
+        assert "hdf5" in paths
+        assert paths["hdf5"].suffix == ".h5"
+        assert paths["hdf5"].exists()
+
+        # Verify HDF5 is valid
+        import h5py
+        with h5py.File(paths["hdf5"], "r") as f:
+            assert "metadata" in f
+            assert "observed_variants" in f
+            assert "imputed_variants" in f
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_arrow_format(self, fitted_model, tmp_path):
+        """Test export() to Arrow format."""
+        paths = fitted_model.export(tmp_path, formats=["arrow"])
+
+        assert "arrow" in paths
+        assert paths["arrow"].suffix == ".arrow"
+        assert paths["arrow"].exists()
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_parquet_format(self, fitted_model, tmp_path):
+        """Test export() to Parquet format."""
+        paths = fitted_model.export(tmp_path, formats=["parquet"])
+
+        assert "parquet" in paths
+        # Parquet returns a directory
+        assert paths["parquet"].is_dir()
+        # Should have parquet files inside
+        parquet_files = list(paths["parquet"].glob("*.parquet"))
+        assert len(parquet_files) > 0
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_csv_format(self, fitted_model, tmp_path):
+        """Test export() to CSV format."""
+        paths = fitted_model.export(tmp_path, formats=["csv"])
+
+        assert "csv" in paths
+        assert paths["csv"].suffix == ".csv"
+        assert paths["csv"].exists()
+
+        # Verify CSV contents
+        df = pd.read_csv(paths["csv"])
+        assert "variant_id" in df.columns
+        assert "status" in df.columns
+        assert len(df) == len(fitted_model.observed_variants) + len(fitted_model.imputed_models)
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_multiple_formats(self, fitted_model, tmp_path):
+        """Test export() with multiple formats."""
+        paths = fitted_model.export(tmp_path, formats=["json", "hdf5", "csv"])
+
+        assert len(paths) == 3
+        assert all(p.exists() for p in paths.values())
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_with_custom_model_name(self, fitted_model, tmp_path):
+        """Test export() with custom model name."""
+        paths = fitted_model.export(tmp_path, model_name="my_custom_model", formats=["json"])
+
+        assert "my_custom_model" in str(paths["json"])
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_invalid_format_raises_error(self, fitted_model, tmp_path):
+        """Test export() raises ValueError for invalid format."""
+        with pytest.raises(ValueError, match="Unsupported export formats"):
+            fitted_model.export(tmp_path, formats=["invalid_format"])
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_creates_output_directory(self, fitted_model, tmp_path):
+        """Test export() creates output directory if it doesn't exist."""
+        new_dir = tmp_path / "new_subdir" / "export"
+        assert not new_dir.exists()
+
+        paths = fitted_model.export(new_dir, formats=["json"])
+
+        assert new_dir.exists()
+        assert paths["json"].exists()
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_export_without_variance_scaling(self, fitted_model, tmp_path):
+        """Test export() with include_variance_scaling=False."""
+        paths = fitted_model.export(
+            tmp_path, formats=["json"], include_variance_scaling=False
+        )
+
+        import json
+        with open(paths["json"]) as f:
+            data = json.load(f)
+
+        # Check metadata indicates variance scaling is excluded
+        assert data["metadata"]["include_variance_scaling"] is False
+
+
+# =============================================================================
+# Tests for load() class method
+# =============================================================================
+
+
+class TestLinearImputationPRSLoad:
+    """Test load() class method."""
+
+    def test_load_raises_error_for_nonexistent_file(self, tmp_path):
+        """Test load() raises DataLoadError for nonexistent file."""
+        nonexistent = tmp_path / "nonexistent.h5"
+
+        with pytest.raises(DataLoadError, match="Model file not found"):
+            LinearImputationPRS.load(nonexistent)
+
+    def test_load_raises_error_for_unsupported_format(self, tmp_path):
+        """Test load() raises DataLoadError for unsupported file format."""
+        unsupported = tmp_path / "model.xyz"
+        unsupported.touch()
+
+        with pytest.raises(DataLoadError, match="Unsupported model file format"):
+            LinearImputationPRS.load(unsupported)
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_load_hdf5_roundtrip(self, fitted_model, tmp_path, user_dosages_dict):
+        """Test save to HDF5 and load roundtrip."""
+        # Export to HDF5
+        paths = fitted_model.export(tmp_path, formats=["hdf5"])
+
+        # Load back
+        loaded_model = LinearImputationPRS.load(paths["hdf5"])
+
+        # Verify loaded model is fitted
+        assert loaded_model.is_fitted
+
+        # Verify variant counts match
+        assert len(loaded_model.observed_variants) == len(fitted_model.observed_variants)
+        assert len(loaded_model.imputed_models) == len(fitted_model.imputed_models)
+
+        # Verify predictions match
+        original_result = fitted_model.predict(user_dosages_dict)
+        loaded_result = loaded_model.predict(user_dosages_dict)
+
+        assert np.isclose(original_result.prs, loaded_result.prs)
+        assert np.isclose(original_result.se, loaded_result.se)
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_load_json_roundtrip(self, fitted_model, tmp_path, user_dosages_dict):
+        """Test save to JSON and load roundtrip."""
+        # Export to JSON
+        paths = fitted_model.export(tmp_path, formats=["json"])
+
+        # Load back
+        loaded_model = LinearImputationPRS.load(paths["json"])
+
+        # Verify loaded model is fitted
+        assert loaded_model.is_fitted
+
+        # Verify variant counts match
+        assert len(loaded_model.observed_variants) == len(fitted_model.observed_variants)
+        assert len(loaded_model.imputed_models) == len(fitted_model.imputed_models)
+
+        # Verify predictions match
+        original_result = fitted_model.predict(user_dosages_dict)
+        loaded_result = loaded_model.predict(user_dosages_dict)
+
+        assert np.isclose(original_result.prs, loaded_result.prs)
+        assert np.isclose(original_result.se, loaded_result.se)
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_load_preserves_metadata(self, fitted_model, tmp_path):
+        """Test load() preserves model metadata."""
+        # Set some metadata
+        fitted_model._prs_id = "TEST_PRS_ID"
+        fitted_model._platform_name = "test_platform"
+        fitted_model._genome_build = "GRCh37"
+        fitted_model._model_name = "test_model"
+
+        # Export and load
+        paths = fitted_model.export(tmp_path, formats=["hdf5"])
+        loaded_model = LinearImputationPRS.load(paths["hdf5"])
+
+        # Verify metadata
+        assert loaded_model._prs_id == "TEST_PRS_ID"
+        assert loaded_model._platform_name == "test_platform"
+        assert loaded_model._genome_build == "GRCh37"
+        assert loaded_model._model_name == "test_model"
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_load_preserves_calibration_params(self, fitted_model, tmp_path):
+        """Test load() preserves calibration parameters if present."""
+        # Export and load
+        paths = fitted_model.export(tmp_path, formats=["hdf5"])
+        loaded_model = LinearImputationPRS.load(paths["hdf5"])
+
+        # If original had calibration params, loaded should too
+        if fitted_model.calibration_params is not None:
+            assert loaded_model.calibration_params is not None
+            assert np.isclose(
+                loaded_model.calibration_params.scaling_factor,
+                fitted_model.calibration_params.scaling_factor,
+            )
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_loaded_model_can_predict(self, fitted_model, tmp_path, user_dosages_dict):
+        """Test loaded model can make predictions."""
+        # Export and load
+        paths = fitted_model.export(tmp_path, formats=["hdf5"])
+        loaded_model = LinearImputationPRS.load(paths["hdf5"])
+
+        # Should be able to predict
+        result = loaded_model.predict(user_dosages_dict)
+
+        assert isinstance(result, PredictionResult)
+        assert not np.isnan(result.prs)
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_loaded_model_summary_works(self, fitted_model, tmp_path):
+        """Test loaded model summary property works."""
+        # Export and load
+        paths = fitted_model.export(tmp_path, formats=["hdf5"])
+        loaded_model = LinearImputationPRS.load(paths["hdf5"])
+
+        # Summary should work
+        summary = loaded_model.summary
+        assert "n_observed" in summary
+        assert "n_imputed" in summary
+        assert summary["n_observed"] == len(fitted_model.observed_variants)
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
+    def test_loaded_model_variant_table_works(self, fitted_model, tmp_path):
+        """Test loaded model variant_table property works."""
+        # Export and load
+        paths = fitted_model.export(tmp_path, formats=["hdf5"])
+        loaded_model = LinearImputationPRS.load(paths["hdf5"])
+
+        # Variant table should work
+        vt = loaded_model.variant_table
+        assert isinstance(vt, pd.DataFrame)
+        assert len(vt) == len(fitted_model.observed_variants) + len(fitted_model.imputed_models)
