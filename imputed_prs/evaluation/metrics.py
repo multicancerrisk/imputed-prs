@@ -48,7 +48,7 @@ def compute_prs_metrics(
     # Spearman rank correlation
     spearman_rho, _ = stats.spearmanr(s_imp, s_tru)
 
-    # Calibration regression: S_true = α + β * S_imputed
+    # Calibration regression: S_true = a + b * S_imputed
     slope, intercept, _, _, _ = stats.linregress(s_imp, s_tru)
 
     return EvaluationMetrics(

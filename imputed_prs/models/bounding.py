@@ -24,13 +24,14 @@ def truncated_normal_variance(
 
     For X ~ N(mu, sigma²) truncated to [lower, upper], computes Var(X | lower <= X <= upper).
 
-    The formula uses standardized bounds alpha = (lower - mu) / sigma and
-    beta = (upper - mu) / sigma:
+    The formula uses standardized bounds z_lower = (lower - mu) / sigma and
+    z_upper = (upper - mu) / sigma:
 
-        Var = sigma² * [1 + (alpha·φ(alpha) - beta·φ(beta))/Z - ((φ(alpha) - φ(beta))/Z)²]
+        Var = sigma² * [1 + (z_lower·φ(z_lower) - z_upper·φ(z_upper))/Z
+              - ((φ(z_lower) - φ(z_upper))/Z)²]
 
     where φ is the standard normal PDF, Φ is the standard normal CDF,
-    and Z = Φ(beta) - Φ(alpha).
+    and Z = Φ(z_upper) - Φ(z_lower).
 
     Args:
         mu: Mean of the untruncated normal distribution.
@@ -45,19 +46,19 @@ def truncated_normal_variance(
     if sigma < _MIN_SIGMA:
         return 0.0
 
-    alpha = (lower - mu) / sigma
-    beta = (upper - mu) / sigma
+    z_lower = (lower - mu) / sigma
+    z_upper = (upper - mu) / sigma
 
-    phi_alpha, phi_beta = norm.pdf(alpha), norm.pdf(beta)
-    Phi_alpha, Phi_beta = norm.cdf(alpha), norm.cdf(beta)
+    phi_lo, phi_hi = norm.pdf(z_lower), norm.pdf(z_upper)
+    Phi_lo, Phi_hi = norm.cdf(z_lower), norm.cdf(z_upper)
 
-    Z = Phi_beta - Phi_alpha
+    Z = Phi_hi - Phi_lo
     if Z < _MIN_Z:
         # Nearly all mass is outside bounds - return minimum variance floor
         return _MIN_SIGMA**2
 
-    term1 = (alpha * phi_alpha - beta * phi_beta) / Z
-    term2 = ((phi_alpha - phi_beta) / Z) ** 2
+    term1 = (z_lower * phi_lo - z_upper * phi_hi) / Z
+    term2 = ((phi_lo - phi_hi) / Z) ** 2
 
     return max(0.0, sigma**2 * (1 + term1 - term2))
 
@@ -74,10 +75,10 @@ def truncated_normal_mean(
 
     The formula uses standardized bounds:
 
-        E[X] = mu + sigma * (φ(alpha) - φ(beta)) / Z
+        E[X] = mu + sigma * (φ(z_lower) - φ(z_upper)) / Z
 
-    where alpha = (lower - mu) / sigma, beta = (upper - mu) / sigma,
-    φ is the standard normal PDF, and Z = Φ(beta) - Φ(alpha).
+    where z_lower = (lower - mu) / sigma, z_upper = (upper - mu) / sigma,
+    φ is the standard normal PDF, and Z = Φ(z_upper) - Φ(z_lower).
 
     Args:
         mu: Mean of the untruncated normal distribution.
@@ -92,13 +93,13 @@ def truncated_normal_mean(
         # Zero variance - just clip mu to bounds
         return max(lower, min(upper, mu))
 
-    alpha = (lower - mu) / sigma
-    beta = (upper - mu) / sigma
+    z_lower = (lower - mu) / sigma
+    z_upper = (upper - mu) / sigma
 
-    phi_alpha, phi_beta = norm.pdf(alpha), norm.pdf(beta)
-    Phi_alpha, Phi_beta = norm.cdf(alpha), norm.cdf(beta)
+    phi_lo, phi_hi = norm.pdf(z_lower), norm.pdf(z_upper)
+    Phi_lo, Phi_hi = norm.cdf(z_lower), norm.cdf(z_upper)
 
-    Z = Phi_beta - Phi_alpha
+    Z = Phi_hi - Phi_lo
     if Z < _MIN_Z:
         # Nearly all mass is outside bounds
         # Return the bound closest to mu
@@ -109,7 +110,7 @@ def truncated_normal_mean(
         else:
             return mu
 
-    truncated_mean = mu + sigma * (phi_alpha - phi_beta) / Z
+    truncated_mean = mu + sigma * (phi_lo - phi_hi) / Z
     # Ensure result is within bounds (numerical safety)
     return max(lower, min(upper, truncated_mean))
 

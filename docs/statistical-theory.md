@@ -1,6 +1,6 @@
 # Statistical Theory
 
-This document describes the statistical methods implemented in the imputed-prs library for computing Polygenic Risk Scores (PRS) when some variants are missing from a genotyping platform. It emphasizes implementation-specific details that improve upon or differ from naive approaches.
+This document describes the statistical methods implemented in the `imputed-prs` library for computing Polygenic Risk Scores (PRS) when some variants defined in the score are not genotyped in a given platform.
 
 ## Table of Contents
 
@@ -21,7 +21,7 @@ This document describes the statistical methods implemented in the imputed-prs l
 
 ## Overview
 
-A Polygenic Risk Score (PRS) aggregates the effects of many genetic variants into a single predictive score:
+A Polygenic Risk Score (PRS) aggregates the effects of many genetic variants into a scalar predictive score:
 
 $$
 S = \sum_j x_j \cdot \beta_j
@@ -29,9 +29,9 @@ $$
 
 Where:
 - $x_j$ is the dosage (0, 1, or 2 copies of the effect allele) for variant $j$
-- $\beta_j$ is the effect size (weight) for variant $j$ from GWAS
+- $\beta_j$ is the effect size (weight) for variant $j$
 
-**The Problem**: Consumer genotyping platforms (23andMe, AncestryDNA, etc.) typically measure only a subset of variants in a PRS definition. Missing variants contribute zero to the score, causing systematic underestimation and increased variance.
+**The Problem**: Genotyping platforms (23andMe, AncestryDNA, etc.) typically measure only a subset of variants in a PRS definition. Naively imputing zero for the dosage of missing variants leads to systematic underestimation and increased variance.
 
 **The Solution**: This library uses linear imputation to predict missing variant dosages from observed (platform) variants, leveraging linkage disequilibrium (LD) patterns in a reference population.
 
@@ -74,24 +74,25 @@ See `imputed_prs/core/harmonizer.py:filter_to_local_window()` for implementation
 The imputation models use Elastic Net regularization, which combines L1 (Lasso) and L2 (Ridge) penalties:
 
 $$
-\min_{w, \gamma} \frac{1}{2n} \|Z_j w + \gamma \mathbf{1} - x_j\|^2 + \lambda \left[ \alpha \|w\|_1 + \frac{1-\alpha}{2} \|w\|_2^2 \right]
+\min_{w, \gamma} \frac{1}{2n} \lVert Z_j w + \gamma - x_j \rVert^2 + \alpha \left[ \rho \lVert w \rVert_1 + \frac{1-\rho}{2} \lVert w \rVert_2^2 \right]
 $$
 
 Where:
+- $n$ is the number of samples
 - $Z_j$ is the matrix of predictor dosages for samples in the training set
 - $x_j$ is the vector of target dosages
-- $\lambda$ (alpha) controls overall regularization strength
-- $\alpha$ (l1_ratio) controls the L1/L2 balance:
-  - $\alpha = 0$: Pure Ridge regression (L2 only)
-  - $\alpha = 1$: Pure Lasso regression (L1 only)
-  - $0 < \alpha < 1$: Elastic Net (both penalties)
+- $\alpha$ (`alpha`) controls overall regularization strength
+- $\rho$ (`l1_ratio`) controls the L1/L2 balance:
+  - $\rho = 0$: Pure Ridge regression (L2 only)
+  - $\rho = 1$: Pure Lasso regression (L1 only)
+  - $0 < \rho < 1$: Elastic Net (both penalties)
 
 ### Default Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `alpha` | 0.01 | Regularization strength $\lambda$ |
-| `l1_ratio` | 0.5 | L1/L2 mixing $\alpha$ (balanced) |
+| `alpha` | 0.01 | Regularization strength $\alpha$ |
+| `l1_ratio` | 0.5 | L1/L2 mixing $\rho$ (balanced) |
 
 ### Hyperparameter Tuning
 
@@ -181,15 +182,15 @@ If we simply clip predictions and use the original residual variance:
 The library models predictions as normally distributed and computes the **variance of the truncated distribution**:
 
 $$
-\text{Var}(X \mid 0 \leq X \leq 2) = \sigma^2 \left[ 1 + \frac{\alpha \cdot \phi(\alpha) - \beta \cdot \phi(\beta)}{Z} - \left( \frac{\phi(\alpha) - \phi(\beta)}{Z} \right)^2 \right]
+\text{Var}(X \mid 0 \leq X \leq 2) = \sigma^2 \left[ 1 + \frac{a \cdot \phi(a) - b \cdot \phi(b)}{Z} - \left( \frac{\phi(a) - \phi(b)}{Z} \right)^2 \right]
 $$
 
 Where:
-- $\alpha = \frac{0 - \mu}{\sigma}$ — standardized lower bound
-- $\beta = \frac{2 - \mu}{\sigma}$ — standardized upper bound
+- $a = \frac{0 - \mu}{\sigma}$ — standardized lower bound
+- $b = \frac{2 - \mu}{\sigma}$ — standardized upper bound
 - $\phi(\cdot)$ is the standard normal PDF
 - $\Phi(\cdot)$ is the standard normal CDF
-- $Z = \Phi(\beta) - \Phi(\alpha)$ — probability mass within bounds
+- $Z = \Phi(b) - \Phi(a)$ — probability mass within bounds
 
 ### Variance Reduction Properties
 
@@ -354,7 +355,7 @@ During training, the library:
 3. Regresses true on CV-predicted to estimate scaling parameters
 
 $$
-S_{true} = \alpha + \beta \cdot S_{cv}
+S_{true} = a + b \cdot S_{cv}
 $$
 
 ### Applying Calibration
@@ -362,11 +363,11 @@ $$
 At prediction time:
 
 $$
-S_{scaled} = \alpha + \beta \cdot S_{raw}
+S_{scaled} = a + b \cdot S_{raw}
 $$
 
 $$
-SE_{scaled} = |\beta| \cdot SE
+SE_{scaled} = |b| \cdot SE
 $$
 
 $$
@@ -377,9 +378,9 @@ $$
 
 | Parameter | Description |
 |-----------|-------------|
-| `scaling_factor` | Slope $\beta$ from calibration regression |
+| `scaling_factor` | Slope $b$ from calibration regression |
 | `scaling_factor_se` | Standard error of slope |
-| `calibration_intercept` | Intercept $\alpha$ |
+| `calibration_intercept` | Intercept $a$ |
 | `calibration_r2` | $R^2$ of calibration fit |
 | `attenuation_factor` | $SD(S_{cv}) / SD(S_{true})$, measures variance loss |
 

@@ -59,7 +59,7 @@ def estimate_cv_calibration(
 ) -> CalibrationParams:
     """Estimate calibration parameters by regressing true PRS on CV-predicted PRS.
 
-    Fits the model: S_true = α + β * S_cv
+    Fits the model: S_true = a + b * S_cv
 
     The scaling factor β can be used to correct for attenuation in predictions.
     When imputation is imperfect, S_cv will have lower variance than S_true,
@@ -84,7 +84,7 @@ def estimate_cv_calibration(
     if n < 3:
         raise ValueError(f"Need at least 3 valid samples, got {n}")
 
-    # Linear regression: S_true = α + β * S_cv
+    # Linear regression: S_true = a + b * S_cv
     slope, intercept, r_value, p_value, std_err = stats.linregress(
         s_cv_valid, s_true_valid
     )
@@ -93,7 +93,7 @@ def estimate_cv_calibration(
     sd_cv = np.std(s_cv_valid, ddof=1)
     sd_true = np.std(s_true_valid, ddof=1)
 
-    # Scaled predictions: β * S_cv
+    # Scaled predictions: b * S_cv
     sd_scaled = abs(slope) * sd_cv if sd_cv > 0 else 0.0
 
     # Attenuation factor: how much variance is attenuated
