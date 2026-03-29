@@ -61,9 +61,9 @@ def estimate_cv_calibration(
 
     Fits the model: S_true = a + b * S_cv
 
-    The scaling factor β can be used to correct for attenuation in predictions.
+    The scaling factor b can be used to correct for attenuation in predictions.
     When imputation is imperfect, S_cv will have lower variance than S_true,
-    and β > 1 will scale predictions back up.
+    and b > 1 will scale predictions back up.
 
     Args:
         s_cv: CV-predicted PRS values (n_samples,). NaN values are excluded.

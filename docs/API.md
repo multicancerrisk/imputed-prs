@@ -6,22 +6,36 @@ Complete API documentation for the imputed-prs library.
 
 ```
 imputed_prs/
-├── __init__.py              # Public API exports
+├── __init__.py                    # Public API exports
 ├── core/
-│   ├── linear_imputation_prs.py  # Main LinearImputationPRS class
-│   ├── types.py             # Data types and dataclasses
-│   └── exceptions.py        # Custom exceptions
+│   ├── linear_imputation_prs.py   # LinearImputationPRS class
+│   ├── linear_projection_prs.py   # LinearProjectionPRS class
+│   ├── types.py                   # Data types and dataclasses
+│   ├── regions.py                 # Region decomposition for projection
+│   └── exceptions.py              # Custom exceptions
+├── models/
+│   ├── elastic_net.py             # Per-variant ElasticNet (imputation)
+│   ├── trainer.py                 # Imputation model trainer
+│   ├── predictor.py               # Imputation PRS predictor
+│   ├── bounding.py                # Dosage clipping and variance adjustment
+│   ├── projection.py              # Per-region ElasticNet (projection)
+│   ├── projection_trainer.py      # Projection model trainer
+│   ├── projection_predictor.py    # Projection PRS predictor
+│   ├── tuning.py                  # Hyperparameter tuning
+│   └── metrics.py                 # Model quality metrics
 ├── io/
-│   ├── prs_loader.py        # PRS file loading
-│   ├── pgs_catalog.py       # PGS Catalog integration
-│   ├── platform_loader.py   # Platform manifest loading
-│   ├── genotype_loader.py   # Reference genotype loading
-│   ├── user_genotypes.py    # DTC genotype loading
-│   └── exporters/           # Export format handlers
+│   ├── prs_loader.py              # PRS file loading
+│   ├── pgs_catalog.py             # PGS Catalog integration
+│   ├── platform_loader.py         # Platform manifest loading
+│   ├── genotype_loader.py         # Reference genotype loading
+│   ├── user_genotypes.py          # DTC genotype loading
+│   └── exporters/                 # Export format handlers
 └── evaluation/
-    ├── evaluator.py         # ImputationEvaluator class
-    ├── metrics.py           # Metric computation
-    └── plotting.py          # Diagnostic plots
+    ├── evaluator.py               # ImputationEvaluator class
+    ├── projection_evaluator.py    # ProjectionEvaluator class
+    ├── calibration.py             # CV-based calibration
+    ├── metrics.py                 # Metric computation
+    └── plotting.py                # Diagnostic plots
 ```
 
 ## Quick Import Examples
@@ -30,6 +44,7 @@ imputed_prs/
 # Main API (most common)
 from imputed_prs import (
     LinearImputationPRS,
+    LinearProjectionPRS,
     ImputationEvaluator,
     list_available_platforms,
     get_platform_info,
@@ -37,12 +52,24 @@ from imputed_prs import (
     fetch_pgs_catalog_score,
 )
 
+# Projection evaluator
+from imputed_prs.evaluation import ProjectionEvaluator
+
 # Data types
 from imputed_prs.core.types import (
     PredictionResult,
     PlatformInfo,
     EvaluationMetrics,
     CalibrationParams,
+    ProjectionRegionModel,
+    ProjectionTrainingResult,
+)
+
+# Region decomposition types
+from imputed_prs.core.regions import (
+    GenomicRegion,
+    RegionDecompositionResult,
+    merge_variant_windows,
 )
 
 # Exceptions
@@ -59,6 +86,24 @@ from imputed_prs.evaluation.plotting import (
     plot_variance_contribution,
 )
 ```
+
+---
+
+## Method Comparison
+
+The library provides two approaches for computing PRS when the genotyping platform is missing some PRS variants. Both methods share the same I/O loaders, calibration procedure, and `PredictionResult` output type. See the [statistical theory](statistical-theory/README.md) for the mathematical foundations.
+
+| Feature | `LinearImputationPRS` | `LinearProjectionPRS` |
+|---------|----------------------|----------------------|
+| **Unit of prediction** | Per-variant dosage | Per-region PRS contribution |
+| **`tuning_scope` parameter** | Yes (`global`/`per_variant`/`none`) | No (fixed parameters) |
+| **`evaluation_genotypes` in `fit()`** | Yes | No |
+| **Dosage clipping** | Yes (truncated normal variance) | No (target is PRS, not dosage) |
+| **Missing predictor handling** | Fallback to intercept-only | Mean-substitution ($2 \cdot AF$) |
+| **Uncertainty source** | $\sum \beta_j^2 \sigma^2_{adj,j}$ | $\sum_R \text{cv\_mse}_R$ |
+| **Export/Load** | Yes | Not yet implemented |
+| **Per-variant diagnostics** | Yes (`imputation_r2` per variant) | No (`cv_r2` per region) |
+| **Key model property** | `imputed_models` | `region_models` |
 
 ---
 
@@ -302,9 +347,179 @@ if model.is_fitted:
 
 ---
 
+## Main API Class: LinearProjectionPRS
+
+The projection-based class for training region-level models and computing PRS predictions. Instead of imputing individual missing variant dosages, it directly learns platform-variant weights to approximate each region's PRS contribution.
+
+### Constructor
+
+```python
+LinearProjectionPRS(
+    window_size: int = 1_000_000,
+    l1_ratio: float = 0.5,
+    alpha: float = 0.01,
+    cv_folds: int = 5,
+    n_jobs: int = 1,
+    random_state: Optional[int] = None,
+    max_predictors: Optional[int] = None,
+    verbose: int = 1,
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `window_size` | `int` | `1_000_000` | Size of genomic window (bp) for defining regions and selecting predictor variants. Overlapping windows merge into regions. |
+| `l1_ratio` | `float` | `0.5` | ElasticNet L1/L2 mixing parameter. 0=Ridge, 1=Lasso. Applied directly to all regions. |
+| `alpha` | `float` | `0.01` | ElasticNet regularization strength. Applied directly to all regions. |
+| `cv_folds` | `int` | `5` | Number of cross-validation folds for training and calibration. |
+| `n_jobs` | `int` | `1` | Number of parallel jobs for training. Use `-1` for all CPUs. |
+| `random_state` | `int` | `None` | Random seed for reproducibility. |
+| `max_predictors` | `int` | `None` | Maximum number of predictor variants per region. If `None`, uses all variants in region. |
+| `verbose` | `int` | `1` | Verbosity level. 0=silent, 1=progress bar, 2=debug output. |
+
+**Note:** Unlike `LinearImputationPRS`, there is no `tuning_scope` parameter. The provided `l1_ratio` and `alpha` are used directly for all regions.
+
+**Example:**
+
+```python
+model = LinearProjectionPRS(
+    window_size=1_000_000,    # 1 Mb window
+    alpha=0.01,
+    l1_ratio=0.5,
+    n_jobs=-1,                # Use all CPUs
+    verbose=1,
+)
+```
+
+---
+
+### fit()
+
+Train projection models on reference genotype data.
+
+```python
+def fit(
+    self,
+    reference_genotypes: Union[str, Path],
+    prs_definition: Union[str, Path, pd.DataFrame],
+    platform_name: Optional[str] = None,
+    platform_manifest: Optional[Union[str, Path]] = None,
+    platform_variants: Optional[List[str]] = None,
+    genome_build: Optional[str] = None,
+    prs_id: Optional[str] = None,
+    model_name: Optional[str] = None,
+) -> "LinearProjectionPRS"
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `reference_genotypes` | `str` or `Path` | Path to reference genotype file (VCF or PLINK format). |
+| `prs_definition` | `str`, `Path`, or `DataFrame` | PRS definition as PGS Catalog ID (e.g., `"PGS000004"`), file path, or DataFrame with variant weights. |
+| `platform_name` | `str` | Name of pre-built platform (e.g., `"23andme_v5"`). Mutually exclusive with `platform_manifest` and `platform_variants`. |
+| `platform_manifest` | `str` or `Path` | Path to custom platform manifest file. |
+| `platform_variants` | `List[str]` | List of platform variant IDs. |
+| `genome_build` | `str` | Genome build (`"GRCh37"` or `"GRCh38"`). Auto-detected if `None`. |
+| `prs_id` | `str` | PRS identifier for metadata. |
+| `model_name` | `str` | Human-readable model name for metadata. |
+
+**Note:** Unlike `LinearImputationPRS.fit()`, there is no `evaluation_genotypes` parameter. Use `ProjectionEvaluator` for external evaluation.
+
+**Returns:** `self` (for method chaining)
+
+**Raises:**
+- `ValidationError`: If inputs are invalid or incompatible.
+- `DataLoadError`: If files cannot be loaded.
+
+**Example:**
+
+```python
+model = LinearProjectionPRS()
+model.fit(
+    reference_genotypes="1000g_eur.vcf.gz",
+    prs_definition="PGS000004",
+    platform_name="23andme_v5",
+    model_name="breast_cancer_23andme_v5",
+)
+```
+
+---
+
+### predict()
+
+Compute PRS for user genotypes.
+
+```python
+def predict(
+    self,
+    user_genotypes: Union[str, Path, pd.DataFrame, Dict[str, float]],
+    apply_calibration: bool = True,
+) -> PredictionResult
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `user_genotypes` | `str`, `Path`, `DataFrame`, or `dict` | User genotype data as file path (DTC format auto-detected), DataFrame with `variant_id` and `genotype` columns, or dict mapping variant_id to dosage values. |
+| `apply_calibration` | `bool` | Whether to apply calibration scaling. Default: `True`. |
+
+**Returns:** `PredictionResult` with PRS value, uncertainty estimates, and diagnostics. The `prs_imputed_component` field contains the sum of regional projection predictions. The `n_truncated` field is always 0 (no dosage clipping in projection).
+
+**Raises:**
+- `ModelNotFittedError`: If `fit()` has not been called.
+- `DataLoadError`: If user genotype file cannot be loaded.
+
+**Example:**
+
+```python
+# From file
+result = model.predict("user_23andme.txt")
+
+# From dict
+dosages = {"rs123": 1.0, "rs456": 2.0, "rs789": 0.0}
+result = model.predict(dosages)
+
+print(f"PRS: {result.prs:.3f} (95% CI: {result.ci_lower:.3f}-{result.ci_upper:.3f})")
+```
+
+---
+
+### Properties
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `is_fitted` | `bool` | Whether the model has been fitted. |
+| `observed_variants` | `List[VariantInfo]` | List of observed (directly measured) variants. |
+| `region_models` | `List[ProjectionRegionModel]` | List of trained projection region models. |
+| `calibration_params` | `CalibrationParams` or `None` | Calibration parameters from CV training. |
+| `summary` | `Dict[str, Any]` | Model summary with region counts and quality statistics. |
+| `variant_table` | `pd.DataFrame` | Per-region summary table with columns: `region_id`, `chromosome`, `start`, `end`, `n_prs_variants`, `n_predictors`, `cv_r2`, `cv_mse`, `is_intercept_only`. |
+
+**Note:** `export()` and `load()` are not yet implemented for the projection method.
+
+**Example:**
+
+```python
+# Check if fitted
+if model.is_fitted:
+    # Get summary
+    print(model.summary)
+    # {'n_observed_variants': 200, 'n_missing_variants': 800, 'n_regions': 50, ...}
+
+    # Get region table
+    df = model.variant_table
+    print(df[df['cv_r2'] > 0.8])  # High-quality regions
+```
+
+---
+
 ## Evaluation: ImputationEvaluator
 
-Evaluator class for assessing fitted models on held-out data.
+Evaluator class for assessing fitted imputation models on held-out data.
 
 ### Constructor
 
@@ -437,6 +652,62 @@ Default parameter grid:
 ```
 
 **Returns:** `SensitivityResult` with results for each parameter combination.
+
+---
+
+## Evaluation: ProjectionEvaluator
+
+Evaluator class for assessing fitted projection models on held-out data.
+
+### Constructor
+
+```python
+ProjectionEvaluator(
+    model: LinearProjectionPRS,
+    verbose: int = 1,
+)
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `model` | `LinearProjectionPRS` | A fitted projection model to evaluate. |
+| `verbose` | `int` | Verbosity level (0=silent, 1=progress, 2=debug). |
+
+**Raises:**
+- `ModelNotFittedError`: If the model has not been fitted.
+
+---
+
+### evaluate()
+
+Evaluate the model on held-out genotype data.
+
+```python
+def evaluate(
+    self,
+    evaluation_genotypes: Union[str, Path, GenotypeData],
+) -> EvaluationMetrics
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `evaluation_genotypes` | `str`, `Path`, or `GenotypeData` | Path to genotype file or pre-loaded data. |
+
+**Returns:** `EvaluationMetrics` comparing projected vs true PRS.
+
+**Example:**
+
+```python
+evaluator = ProjectionEvaluator(model)
+metrics = evaluator.evaluate("held_out_data.vcf.gz")
+print(f"R²: {metrics.r2:.3f}, Correlation: {metrics.correlation:.3f}")
+```
+
+**Note:** Unlike `ImputationEvaluator`, `ProjectionEvaluator` does not yet provide `cross_validate()` or `sensitivity_analysis()` methods.
 
 ---
 
@@ -835,7 +1106,7 @@ def export_variant_table(
 
 ### PredictionResult
 
-Output from PRS prediction.
+Output from PRS prediction. Used by both `LinearImputationPRS` and `LinearProjectionPRS`.
 
 ```python
 @dataclass
@@ -845,17 +1116,19 @@ class PredictionResult:
     ci_lower: float                 # Lower 95% CI bound
     ci_upper: float                 # Upper 95% CI bound
     prs_observed_component: float   # Contribution from observed variants
-    prs_imputed_component: float    # Contribution from imputed variants
+    prs_imputed_component: float    # Contribution from missing variants (see note)
     n_variants_used: int            # Total variants contributing
-    n_variants_imputed: int         # Count of imputed variants
+    n_variants_imputed: int         # Count of missing variants (see note)
     n_variants_intercept_only: int  # Count using intercept-only models
     n_user_variants_missing: int    # User variants not available
-    n_truncated: int                # Imputed dosages that were clipped
+    n_truncated: int                # Dosages clipped (always 0 for projection)
     prs_scaled: Optional[float]     # Scaled PRS (if calibrated)
     se_scaled: Optional[float]      # Scaled SE (if calibrated)
     ci_lower_scaled: Optional[float]
     ci_upper_scaled: Optional[float]
 ```
+
+**Note on shared fields:** The `prs_imputed_component` field represents the missing-variant contribution for both methods: for imputation, it is the sum of imputed dosages times effect sizes ($\sum \hat{x}_j \beta_j$); for projection, it is the sum of regional projection predictions ($\sum_R \hat{S}_R$). Similarly, `n_variants_imputed` counts the missing PRS variants covered by either per-variant imputation models or region models. The `n_truncated` field is always 0 for projection (no dosage clipping).
 
 ---
 
@@ -1031,6 +1304,80 @@ class SensitivityResult:
     best_params: Dict[str, float]
     best_metrics: EvaluationMetrics
     quality_summaries: List[Dict[str, Any]]
+```
+
+---
+
+### ProjectionRegionModel
+
+Stores the trained projection model for a single genomic region.
+
+```python
+@dataclass
+class ProjectionRegionModel:
+    region_id: str                        # e.g., "chr1:1000000-3000000"
+    chromosome: str
+    start: int                            # Region start position
+    end: int                              # Region end position
+    prs_variant_ids: List[str]            # Missing PRS variants in this region
+    betas: np.ndarray                     # Effect sizes, shape: (n_prs_variants,)
+    predictor_variant_ids: List[str]      # Platform variants used as predictors
+    coefficients: np.ndarray              # Learned weights a_R, shape: (n_predictors,)
+    intercept: float                      # Model intercept (mean S_R for intercept-only)
+    cv_mse: float                         # Cross-validated MSE
+    cv_r2: float                          # Cross-validated R-squared
+    is_intercept_only: bool               # True if no predictors or all zero
+    mean_prs_contribution: float          # Mean of S_R across training samples
+    predictor_allele_frequencies: np.ndarray  # AFs for mean-substitution at inference
+```
+
+---
+
+### ProjectionTrainingResult
+
+Result from training projection models for all regions.
+
+```python
+@dataclass
+class ProjectionTrainingResult:
+    region_models: Dict[str, ProjectionRegionModel]  # region_id -> model
+    cv_predictions: Dict[str, np.ndarray]  # region_id -> out-of-fold predictions
+    n_regions_trained: int
+    n_regions_failed: int
+    n_intercept_only: int
+    training_summary: Dict[str, Any]       # mean_r2, median_r2, n_high_quality, etc.
+```
+
+---
+
+### GenomicRegion
+
+A contiguous genomic interval containing one or more missing PRS variants, formed by merging overlapping per-variant windows.
+
+```python
+@dataclass
+class GenomicRegion:
+    chromosome: str            # Normalized (e.g., "1", "X")
+    start: int                 # Start position (inclusive)
+    end: int                   # End position (inclusive)
+    prs_variant_ids: List[str]     # Missing PRS variant IDs in this region
+    prs_variant_indices: List[int] # Indices into the missing PRS DataFrame
+```
+
+---
+
+### RegionDecompositionResult
+
+Result of decomposing PRS variants into non-overlapping regions.
+
+```python
+@dataclass
+class RegionDecompositionResult:
+    regions: List[GenomicRegion]
+    n_regions: int                 # Total number of merged regions
+    n_variants_in_regions: int     # Total PRS variants covered
+    variants_per_region: List[int] # Count of PRS variants per region
+    max_region_span_bp: int        # Largest region span in base pairs
 ```
 
 ---

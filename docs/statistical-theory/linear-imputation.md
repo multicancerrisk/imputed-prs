@@ -1,39 +1,6 @@
-# Statistical Theory
+# Linear Imputation Method
 
-This document describes the statistical methods implemented in the `imputed-prs` library for computing Polygenic Risk Scores (PRS) when some variants defined in the score are not genotyped in a given platform.
-
-## Table of Contents
-
-1. [Overview](#overview)
-2. [The Linear Imputation Model](#the-linear-imputation-model)
-3. [Regularization: Elastic Net](#regularization-elastic-net)
-4. [Cross-Validated R² and Quality Metrics](#cross-validated-r-and-quality-metrics)
-5. [Residual Variance Estimation](#residual-variance-estimation)
-6. [Dosage Bounding and Truncation-Adjusted Variance](#dosage-bounding-and-truncation-adjusted-variance)
-7. [Intercept-Only Models](#intercept-only-models)
-8. [PRS Calculation](#prs-calculation)
-9. [Uncertainty Quantification](#uncertainty-quantification)
-10. [Internal Calibration via Cross-Validation](#internal-calibration-via-cross-validation)
-11. [Inference-Time Behavior](#inference-time-behavior)
-12. [Practical Considerations](#practical-considerations)
-
----
-
-## Overview
-
-A Polygenic Risk Score (PRS) aggregates the effects of many genetic variants into a scalar predictive score:
-
-$$
-S = \sum_j x_j \cdot \beta_j
-$$
-
-Where:
-- $x_j$ is the dosage (0, 1, or 2 copies of the effect allele) for variant $j$
-- $\beta_j$ is the effect size (weight) for variant $j$
-
-**The Problem**: Genotyping platforms (23andMe, AncestryDNA, etc.) typically measure only a subset of variants in a PRS definition. Naively imputing zero for the dosage of missing variants leads to systematic underestimation and increased variance.
-
-**The Solution**: This library uses linear imputation to predict missing variant dosages from observed (platform) variants, leveraging linkage disequilibrium (LD) patterns in a reference population.
+> See [README.md](README.md) for shared notation, regularization, and calibration theory.
 
 ---
 
@@ -57,10 +24,10 @@ Where:
 Predictors are restricted to a genomic window around the target variant:
 
 $$
-L_j = \{k : |pos_k - pos_j| \leq \text{window\\_size} \text{ and } chr_k = chr_j\}
+L_j = \{k : |pos_k - pos_j| \leq W \text{ and } chr_k = chr_j\}
 $$
 
-The default window size is 1 Mb (1,000,000 base pairs). This constraint:
+where the default window size is $W = 1\text{ Mb}$ (1,000,000 base pairs). This constraint:
 - Captures variants in LD with the target
 - Reduces overfitting from distant, uncorrelated variants
 - Improves computational efficiency
@@ -69,46 +36,7 @@ See `imputed_prs/core/harmonizer.py:filter_to_local_window()` for implementation
 
 ---
 
-## Regularization: Elastic Net
-
-The imputation models use Elastic Net regularization, which combines L1 (Lasso) and L2 (Ridge) penalties:
-
-$$
-\min_{w, \gamma} \frac{1}{2n} \lVert Z_j w + \gamma - x_j \rVert^2 + \alpha \left[ \rho \lVert w \rVert_1 + \frac{1-\rho}{2} \lVert w \rVert_2^2 \right]
-$$
-
-Where:
-- $n$ is the number of samples
-- $Z_j$ is the matrix of predictor dosages for samples in the training set
-- $x_j$ is the vector of target dosages
-- $\alpha$ (`alpha`) controls overall regularization strength
-- $\rho$ (`l1_ratio`) controls the L1/L2 balance:
-  - $\rho = 0$: Pure Ridge regression (L2 only)
-  - $\rho = 1$: Pure Lasso regression (L1 only)
-  - $0 < \rho < 1$: Elastic Net (both penalties)
-
-### Default Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `alpha` | 0.01 | Regularization strength $\alpha$ |
-| `l1_ratio` | 0.5 | L1/L2 mixing $\rho$ (balanced) |
-
-### Hyperparameter Tuning
-
-The library supports three tuning strategies via the `tuning_scope` parameter:
-
-| Strategy | Behavior |
-|----------|----------|
-| `"global"` | Tune once on a subset, apply to all variants |
-| `"per_variant"` | Tune separately for each variant (slower) |
-| `"none"` | Use provided `alpha` and `l1_ratio` directly |
-
-See `imputed_prs/models/elastic_net.py:fit_single_variant_model()` for implementation.
-
----
-
-## Cross-Validated R² and Quality Metrics
+## Cross-Validated R-squared and Quality Metrics
 
 Imputation quality is assessed using cross-validated $R^2$ (coefficient of determination):
 
@@ -121,7 +49,7 @@ Where:
 - $SS_{tot} = \sum_i (x_{ij} - \bar{x}_j)^2$ — total sum of squares
 - Predictions are out-of-fold (each sample predicted by a model not trained on it)
 
-### Important: Negative R² Values
+### Important: Negative R-squared Values
 
 **Key implementation detail**: Cross-validated $R^2$ can be negative when predictions are worse than simply predicting the mean. The library:
 
@@ -152,7 +80,7 @@ Where:
 - $r^2_{clipped} = \max(0, \min(1, r^2_j))$ — $R^2$ clipped to valid range
 - $2 \cdot q_j \cdot (1 - q_j)$ is the variance of dosage under Hardy-Weinberg equilibrium
 
-### Why Clip R²?
+### Why Clip R-squared?
 
 - **Negative $R^2$**: Would produce variance > HWE variance (impossible)
 - **$R^2 > 1$**: Could produce negative variance (impossible)
@@ -164,6 +92,8 @@ Clipping ensures physically meaningful variance estimates.
 r2_clipped = max(0.0, min(1.0, r2))
 return 2.0 * q * (1.0 - q) * (1.0 - r2_clipped)
 ```
+
+See `imputed_prs/models/trainer.py:compute_residual_variance()` for implementation.
 
 ---
 
@@ -182,15 +112,15 @@ If we simply clip predictions and use the original residual variance:
 The library models predictions as normally distributed and computes the **variance of the truncated distribution**:
 
 $$
-\text{Var}(X \mid 0 \leq X \leq 2) = \sigma^2 \left[ 1 + \frac{a \cdot \phi(a) - b \cdot \phi(b)}{Z} - \left( \frac{\phi(a) - \phi(b)}{Z} \right)^2 \right]
+\text{Var}(X \mid 0 \leq X \leq 2) = \sigma^2 \left[ 1 + \frac{\alpha_l \cdot \phi(\alpha_l) - \alpha_u \cdot \phi(\alpha_u)}{\Phi(\alpha_u) - \Phi(\alpha_l)} - \left( \frac{\phi(\alpha_l) - \phi(\alpha_u)}{\Phi(\alpha_u) - \Phi(\alpha_l)} \right)^2 \right]
 $$
 
 Where:
-- $a = \frac{0 - \mu}{\sigma}$ — standardized lower bound
-- $b = \frac{2 - \mu}{\sigma}$ — standardized upper bound
+- $\alpha_l = \frac{0 - \mu}{\sigma}$ — standardized lower bound
+- $\alpha_u = \frac{2 - \mu}{\sigma}$ — standardized upper bound
 - $\phi(\cdot)$ is the standard normal PDF
 - $\Phi(\cdot)$ is the standard normal CDF
-- $Z = \Phi(b) - \Phi(a)$ — probability mass within bounds
+- $\Phi(b) - \Phi(a)$ is the probability mass within bounds
 
 ### Variance Reduction Properties
 
@@ -218,6 +148,8 @@ clipped_dosage, adjusted_variance = clip_and_adjust_variance(
     raw_prediction, model.residual_variance
 )
 ```
+
+See `imputed_prs/models/bounding.py:clip_and_adjust_variance()` for implementation.
 
 ---
 
@@ -259,6 +191,8 @@ is_intercept_only = np.allclose(final_model.coef_, 0, atol=1e-10)
 - **Residual variance** = full HWE variance: $2 \cdot q \cdot (1 - q)$
 - **Intercept** = mean dosage = $2q$
 
+See `imputed_prs/models/elastic_net.py` for implementation.
+
 ---
 
 ## PRS Calculation
@@ -289,7 +223,7 @@ $$
 
 Where $M$ is the set of missing (imputed) variants.
 
-See `imputed_prs/models/predictor.py:compute_observed_prs()` and `compute_imputed_prs()`.
+See `imputed_prs/models/predictor.py` for implementation.
 
 ---
 
@@ -333,58 +267,7 @@ ci_lower = prs_raw - 1.96 * se
 ci_upper = prs_raw + 1.96 * se
 ```
 
----
-
-## Internal Calibration via Cross-Validation
-
-Imputation attenuates PRS predictions (reduces variance). The library estimates calibration parameters to correct for this using internal cross-validation.
-
-### Regression Dilution
-
-When predictors are measured with error (or imputed), regression coefficients are biased toward zero. For PRS:
-
-$$
-\mathbb{E}[S_{imputed}] \approx a + b \cdot S_{true} \quad \text{where } b < 1
-$$
-
-### Calibration Regression
-
-During training, the library:
-1. Computes **CV-predicted PRS** using out-of-fold imputation predictions
-2. Computes **true PRS** using actual genotypes
-3. Regresses true on CV-predicted to estimate scaling parameters
-
-$$
-S_{true} = a + b \cdot S_{cv}
-$$
-
-### Applying Calibration
-
-At prediction time:
-
-$$
-S_{scaled} = a + b \cdot S_{raw}
-$$
-
-$$
-SE_{scaled} = |b| \cdot SE
-$$
-
-$$
-CI_{scaled} = \left[ S_{scaled} - 1.96 \cdot SE_{scaled}, \; S_{scaled} + 1.96 \cdot SE_{scaled} \right]
-$$
-
-### Calibration Parameters
-
-| Parameter | Description |
-|-----------|-------------|
-| `scaling_factor` | Slope $b$ from calibration regression |
-| `scaling_factor_se` | Standard error of slope |
-| `calibration_intercept` | Intercept $a$ |
-| `calibration_r2` | $R^2$ of calibration fit |
-| `attenuation_factor` | $SD(S_{cv}) / SD(S_{true})$, measures variance loss |
-
-See `imputed_prs/evaluation/calibration.py:estimate_cv_calibration()` for implementation.
+See `imputed_prs/models/predictor.py:PRSPredictor.predict()` for implementation.
 
 ---
 
@@ -415,11 +298,13 @@ This fallback mechanism means predictions can be made even when:
 - User is missing some platform variants
 - Platform manifest differs slightly from training
 
+See `imputed_prs/models/predictor.py:compute_imputed_prs()` for implementation.
+
 ---
 
 ## Practical Considerations
 
-### Interpreting Imputation R²
+### Interpreting Imputation R-squared
 
 | $R^2$ Range | Quality | Interpretation |
 |-------------|---------|----------------|
@@ -443,18 +328,6 @@ This fallback mechanism means predictions can be made even when:
 - **Population mismatch** between reference and target population
 - **Structural variation regions** with complex LD patterns
 
-### Calibration Importance
-
-Always apply calibration when:
-- Comparing scores across individuals
-- Using scores for risk stratification
-- Interpreting scores relative to a reference population
-
-The raw (uncalibrated) PRS underestimates variance, which can:
-- Compress the score distribution
-- Underestimate tail risks
-- Affect percentile assignments
-
 ### Standard Error Interpretation
 
 The SE reflects uncertainty from imputation only. It does not include:
@@ -466,30 +339,12 @@ For complete uncertainty quantification, consider these additional sources.
 
 ---
 
-## Summary of Key Implementation Details
+## Implementation References
 
-| Feature | Implementation Behavior |
-|---------|------------------------|
-| **Negative $R^2$ handling** | Stored as-is in model; clipped to $[0, 1]$ only for variance calculation |
-| **Truncation-adjusted variance** | Uses truncated normal distribution theory, not simple clipping |
-| **Missing predictor fallback** | Falls back to intercept-only (mean) prediction at inference |
-| **Intercept-only creation** | 4 conditions: no predictors, too few samples, zero variance, all coefficients zero |
-| **Calibration** | Internal CV-based regression to correct for attenuation |
-| **Window constraint** | Local (default 1 Mb) to capture LD while avoiding overfitting |
-
----
-
-## References
-
-For implementation details, see:
-
-| Component | Source File |
-|-----------|-------------|
-| Truncation-adjusted variance | `imputed_prs/models/bounding.py` |
+| Concept | Source File |
+|---------|-------------|
+| Linear imputation model, intercept-only conditions | `imputed_prs/models/elastic_net.py` |
 | Residual variance, $R^2$ clipping | `imputed_prs/models/trainer.py` |
-| PRS calculation, SE, fallback | `imputed_prs/models/predictor.py` |
-| Intercept-only conditions | `imputed_prs/models/elastic_net.py` |
+| Truncation-adjusted variance | `imputed_prs/models/bounding.py` |
+| PRS calculation, SE, missing-predictor fallback | `imputed_prs/models/predictor.py` |
 | CV $R^2$ computation | `imputed_prs/models/metrics.py` |
-| Calibration estimation | `imputed_prs/evaluation/calibration.py` |
-
-For data type definitions, see the [API Reference](API.md#data-types-reference).
