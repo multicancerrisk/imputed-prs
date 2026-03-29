@@ -38,6 +38,7 @@ from imputed_prs.core.regions import (
     merge_variant_windows,
 )
 from imputed_prs.core.linear_imputation_prs import LinearImputationPRS
+from imputed_prs.core.linear_projection_prs import LinearProjectionPRS
 
 __all__ = [
     # Types
@@ -74,6 +75,7 @@ __all__ = [
     "GenomicRegion",
     "RegionDecompositionResult",
     "merge_variant_windows",
-    # Main API class
+    # Main API classes
     "LinearImputationPRS",
+    "LinearProjectionPRS",
 ]

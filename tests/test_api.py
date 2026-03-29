@@ -56,6 +56,7 @@ class TestTopLevelImports:
         expected = {
             "__version__",
             "LinearImputationPRS",
+            "LinearProjectionPRS",
             "list_available_platforms",
             "get_platform_info",
             "search_pgs_catalog",

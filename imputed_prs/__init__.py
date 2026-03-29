@@ -16,8 +16,8 @@ Example:
 
 __version__ = "0.1.0"
 
-# Main API class
-from imputed_prs.core import LinearImputationPRS
+# Main API classes
+from imputed_prs.core import LinearImputationPRS, LinearProjectionPRS
 
 # Convenience functions for platform discovery
 from imputed_prs.io import (
@@ -49,6 +49,7 @@ __all__ = [
     "__version__",
     # Main API
     "LinearImputationPRS",
+    "LinearProjectionPRS",
     # Platform functions
     "list_available_platforms",
     "get_platform_info",
