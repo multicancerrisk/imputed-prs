@@ -523,18 +523,31 @@ class ImputationEvaluator:
         Returns:
             Array of true PRS values (n_samples,).
         """
-        # Build variant-to-index mapping
+        # Build variant-to-index mapping (by variant_id AND chr:pos)
         var_to_idx: Dict[str, int] = {}
         for idx, row in genotype_data.variant_info.iterrows():
             var_to_idx[row["variant_id"]] = idx
+            chrom = str(row["chromosome"]).upper()
+            if chrom.startswith("CHR"):
+                chrom = chrom[3:]
+            var_to_idx[f"{chrom}:{int(row['position'])}"] = idx
 
         n_samples = genotype_data.n_samples
         true_prs = np.zeros(n_samples)
 
+        def _find_idx(variant_id, chromosome, position):
+            """Find genotype index by variant_id or chr:pos."""
+            if variant_id in var_to_idx:
+                return var_to_idx[variant_id]
+            chrpos = f"{chromosome}:{position}"
+            if chrpos in var_to_idx:
+                return var_to_idx[chrpos]
+            return None
+
         # Add observed variant contributions
         for var in self.model.observed_variants:
-            if var.variant_id in var_to_idx:
-                idx = var_to_idx[var.variant_id]
+            idx = _find_idx(var.variant_id, var.chromosome, var.position)
+            if idx is not None:
                 dosages = genotype_data.dosage_matrix[:, idx]
                 # Handle NaN by treating as 0 contribution
                 valid_mask = ~np.isnan(dosages)
@@ -542,8 +555,8 @@ class ImputationEvaluator:
 
         # Add imputed variant contributions (using true genotypes, not imputed)
         for model in self.model.imputed_models:
-            if model.variant_id in var_to_idx:
-                idx = var_to_idx[model.variant_id]
+            idx = _find_idx(model.variant_id, model.chromosome, model.position)
+            if idx is not None:
                 dosages = genotype_data.dosage_matrix[:, idx]
                 valid_mask = ~np.isnan(dosages)
                 true_prs[valid_mask] += dosages[valid_mask] * model.beta
@@ -562,15 +575,34 @@ class ImputationEvaluator:
         Returns:
             Array of imputed PRS values (n_samples,).
         """
-        # Build variant-to-index mapping
+        # Build variant-to-index mapping (by variant_id AND chr:pos)
         var_to_idx: Dict[str, int] = {}
         for idx, row in genotype_data.variant_info.iterrows():
             var_to_idx[row["variant_id"]] = idx
+            chrom = str(row["chromosome"]).upper()
+            if chrom.startswith("CHR"):
+                chrom = chrom[3:]
+            var_to_idx[f"{chrom}:{int(row['position'])}"] = idx
 
         n_samples = genotype_data.n_samples
         imputed_prs = np.zeros(n_samples)
 
         # Get all platform variant IDs (from observed variants and imputation predictors)
+        # and build a mapping from model variant_id to genotype index
+        variant_id_to_geno_idx: Dict[str, int] = {}
+
+        for var in self.model.observed_variants:
+            for key in [var.variant_id, f"{var.chromosome}:{var.position}"]:
+                if key in var_to_idx:
+                    variant_id_to_geno_idx[var.variant_id] = var_to_idx[key]
+                    break
+
+        for model in self.model.imputed_models:
+            for pred_id in model.predictor_variant_ids:
+                if pred_id in var_to_idx:
+                    variant_id_to_geno_idx[pred_id] = var_to_idx[pred_id]
+
+        # Collect all variant IDs the predictor will request
         platform_variant_ids = set()
         for var in self.model.observed_variants:
             platform_variant_ids.add(var.variant_id)
@@ -589,8 +621,8 @@ class ImputationEvaluator:
             # Build dosage dict for this sample
             user_dosages: Dict[str, Optional[float]] = {}
             for var_id in platform_variant_ids:
-                if var_id in var_to_idx:
-                    geno_idx = var_to_idx[var_id]
+                geno_idx = variant_id_to_geno_idx.get(var_id)
+                if geno_idx is not None:
                     dosage = genotype_data.dosage_matrix[sample_idx, geno_idx]
                     if np.isnan(dosage):
                         user_dosages[var_id] = None

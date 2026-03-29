@@ -9,6 +9,8 @@ from imputed_prs.core.types import (
     OptunaSearchResult,
     PlatformInfo,
     PredictionResult,
+    ProjectionRegionModel,
+    ProjectionTrainingResult,
     TrainingResult,
     VariantInfo,
 )
@@ -30,6 +32,11 @@ from imputed_prs.core.harmonizer import (
     PartitionResult,
     WindowFilterResult,
 )
+from imputed_prs.core.regions import (
+    GenomicRegion,
+    RegionDecompositionResult,
+    merge_variant_windows,
+)
 from imputed_prs.core.linear_imputation_prs import LinearImputationPRS
 
 __all__ = [
@@ -42,6 +49,8 @@ __all__ = [
     "OptunaSearchResult",
     "PlatformInfo",
     "PredictionResult",
+    "ProjectionRegionModel",
+    "ProjectionTrainingResult",
     "TrainingResult",
     "VariantInfo",
     # Exceptions
@@ -61,6 +70,10 @@ __all__ = [
     "BuildValidationResult",
     "PartitionResult",
     "WindowFilterResult",
+    # Region decomposition
+    "GenomicRegion",
+    "RegionDecompositionResult",
+    "merge_variant_windows",
     # Main API class
     "LinearImputationPRS",
 ]

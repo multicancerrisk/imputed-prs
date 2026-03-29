@@ -244,7 +244,15 @@ class LinearImputationPRS:
             )
 
         # Step 5: Load reference genotypes
-        all_needed_variants = set(prs_df["variant_id"]) | platform_variant_set
+        # Include PRS variant chr:pos so variants are loaded even if rsIDs
+        # in the reference VCF differ from those in the PRS definition
+        prs_chrpos = set()
+        for _, row in prs_df.iterrows():
+            chrom = str(row["chromosome"]).upper()
+            if chrom.startswith("CHR"):
+                chrom = chrom[3:]
+            prs_chrpos.add(f"{chrom}:{int(row['position'])}")
+        all_needed_variants = set(prs_df["variant_id"]) | platform_variant_set | prs_chrpos
         genotype_data = load_genotypes(
             path=reference_genotypes, variant_ids=all_needed_variants
         )
@@ -328,11 +336,18 @@ class LinearImputationPRS:
         missing_prs_df = missing_prs_df.reset_index(drop=True)
 
         missing_variant_indices = []
-        for var_id in missing_prs_df["variant_id"]:
+        for _, row in missing_prs_df.iterrows():
+            var_id = row["variant_id"]
+            chrom = str(row["chromosome"]).upper()
+            if chrom.startswith("CHR"):
+                chrom = chrom[3:]
+            chrpos = f"{chrom}:{int(row['position'])}"
             if var_id in geno_var_to_idx:
                 missing_variant_indices.append(geno_var_to_idx[var_id])
             elif var_id.lower() in geno_var_to_idx:
                 missing_variant_indices.append(geno_var_to_idx[var_id.lower()])
+            elif chrpos in geno_var_to_idx:
+                missing_variant_indices.append(geno_var_to_idx[chrpos])
 
         if missing_variant_indices:
             X = genotype_data.dosage_matrix[:, missing_variant_indices]
@@ -341,8 +356,15 @@ class LinearImputationPRS:
 
         # Update missing_prs_df to only include variants found in genotype data
         valid_missing_mask = []
-        for var_id in missing_prs_df["variant_id"]:
-            found = var_id in geno_var_to_idx or var_id.lower() in geno_var_to_idx
+        for _, row in missing_prs_df.iterrows():
+            var_id = row["variant_id"]
+            chrom = str(row["chromosome"]).upper()
+            if chrom.startswith("CHR"):
+                chrom = chrom[3:]
+            chrpos = f"{chrom}:{int(row['position'])}"
+            found = (var_id in geno_var_to_idx
+                     or var_id.lower() in geno_var_to_idx
+                     or chrpos in geno_var_to_idx)
             valid_missing_mask.append(found)
         missing_prs_df = missing_prs_df[valid_missing_mask].reset_index(drop=True)
 
@@ -439,11 +461,18 @@ class LinearImputationPRS:
             try:
                 # Build full dosage matrix X_full for all PRS variants
                 all_prs_indices = []
-                for var_id in prs_df["variant_id"]:
+                for _, prs_row in prs_df.iterrows():
+                    var_id = prs_row["variant_id"]
+                    chrom = str(prs_row["chromosome"]).upper()
+                    if chrom.startswith("CHR"):
+                        chrom = chrom[3:]
+                    chrpos = f"{chrom}:{int(prs_row['position'])}"
                     if var_id in geno_var_to_idx:
                         all_prs_indices.append(geno_var_to_idx[var_id])
                     elif var_id.lower() in geno_var_to_idx:
                         all_prs_indices.append(geno_var_to_idx[var_id.lower()])
+                    elif chrpos in geno_var_to_idx:
+                        all_prs_indices.append(geno_var_to_idx[chrpos])
 
                 if all_prs_indices:
                     X_full = genotype_data.dosage_matrix[:, all_prs_indices]

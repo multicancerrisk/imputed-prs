@@ -349,3 +349,86 @@ class OptunaSearchResult:
     n_variants_failed: int
     trial_history: List[Dict[str, Any]]
     optimization_time_seconds: float
+
+
+@dataclass
+class ProjectionRegionModel:
+    """Trained projection model for a single genomic region.
+
+    For region R, this stores the learned weights a_R such that
+    z_R^T a_R + intercept approximates S_R = sum(x_j * beta_j) for
+    missing PRS variants j in R.
+
+    Attributes:
+        region_id: Unique identifier, format "chr{chrom}:{start}-{end}".
+        chromosome: Chromosome.
+        start: Region start position.
+        end: Region end position.
+        prs_variant_ids: Missing PRS variant IDs in this region.
+        betas: Effect sizes for PRS variants in this region. Shape: (n_prs_variants,).
+        predictor_variant_ids: Platform variant IDs used as predictors.
+        coefficients: Learned regression coefficients. Shape: (n_predictors,).
+            Empty array for intercept-only models.
+        intercept: Model intercept (mean of S_R for intercept-only models).
+        cv_mse: Cross-validated MSE for this region's PRS contribution.
+        cv_r2: Cross-validated R-squared for this region's PRS contribution.
+        is_intercept_only: True if no predictors available or all coefficients
+            shrunk to zero.
+        mean_prs_contribution: Mean of S_R across training samples.
+        predictor_allele_frequencies: Allele frequencies for each predictor
+            variant. Shape: (n_predictors,). Used for mean-substitution of
+            missing predictors at inference time.
+    """
+
+    region_id: str
+    chromosome: str
+    start: int
+    end: int
+    prs_variant_ids: List[str]
+    betas: np.ndarray
+    predictor_variant_ids: List[str]
+    coefficients: np.ndarray
+    intercept: float
+    cv_mse: float
+    cv_r2: float
+    is_intercept_only: bool
+    mean_prs_contribution: float
+    predictor_allele_frequencies: np.ndarray
+
+    def to_dict(self) -> dict:
+        """Convert to dictionary, handling numpy arrays.
+
+        Returns:
+            Dictionary representation with numpy arrays converted to lists.
+        """
+        result = asdict(self)
+        result["betas"] = self.betas.tolist()
+        result["coefficients"] = self.coefficients.tolist()
+        result["predictor_allele_frequencies"] = self.predictor_allele_frequencies.tolist()
+        return result
+
+
+@dataclass
+class ProjectionTrainingResult:
+    """Result from training projection models for all regions.
+
+    Attributes:
+        region_models: Dict mapping region_id to ProjectionRegionModel.
+        cv_predictions: Dict mapping region_id to out-of-fold CV predictions
+            of S_R for each sample. Shape of each: (n_samples,).
+        n_regions_trained: Number of regions successfully trained.
+        n_regions_failed: Number of regions where training failed.
+        n_intercept_only: Number of regions using intercept-only models.
+        training_summary: Summary statistics dict with keys:
+            mean_r2, median_r2, std_r2, min_r2, max_r2,
+            n_high_quality (r2 > 0.8), n_medium_quality (0.4-0.8),
+            n_low_quality (r2 <= 0.4), mean_n_predictors,
+            mean_n_prs_variants_per_region.
+    """
+
+    region_models: Dict[str, "ProjectionRegionModel"]
+    cv_predictions: Dict[str, np.ndarray]
+    n_regions_trained: int
+    n_regions_failed: int
+    n_intercept_only: int
+    training_summary: Dict[str, Any]
