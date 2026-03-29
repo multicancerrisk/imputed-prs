@@ -9,6 +9,7 @@ from imputed_prs.evaluation.evaluator import (
     ImputationEvaluator,
     SensitivityResult,
 )
+from imputed_prs.evaluation.projection_evaluator import ProjectionEvaluator
 from imputed_prs.evaluation.metrics import (
     compute_prs_metrics,
     compute_percentile_concordance,
@@ -31,6 +32,7 @@ __all__ = [
     "summarize_imputation_quality",
     "CrossValidationResult",
     "ImputationEvaluator",
+    "ProjectionEvaluator",
     "SensitivityResult",
     "plot_calibration",
     "plot_imputation_quality",
