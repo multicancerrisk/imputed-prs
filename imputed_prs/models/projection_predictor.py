@@ -1,0 +1,171 @@
+"""Prediction pipeline for projection-based PRS computation."""
+
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+
+from imputed_prs.core.types import (
+    CalibrationParams,
+    PredictionResult,
+    ProjectionRegionModel,
+    VariantInfo,
+)
+from imputed_prs.models.predictor import compute_observed_prs
+
+
+def compute_projected_prs(
+    user_dosages: Dict[str, Optional[float]],
+    region_models: List[ProjectionRegionModel],
+) -> Tuple[float, float, int, int]:
+    """Compute PRS contribution from projection regions.
+
+    For each region model:
+    1. Gather predictor dosages from user data.
+    2. For any missing predictor, substitute 2 * AF (population mean dosage).
+    3. Compute prediction: S_hat_R = z_R^T @ a_R + intercept_R.
+    4. No dosage clipping (target is PRS contribution, not a dosage).
+
+    Args:
+        user_dosages: Dict mapping variant_id to dosage (0-2) or None.
+        region_models: List of ProjectionRegionModel objects.
+
+    Returns:
+        Tuple of (prs_projected, total_variance, n_regions_used,
+                  n_predictors_substituted).
+    """
+    if not region_models:
+        return (0.0, 0.0, 0, 0)
+
+    total_prs = 0.0
+    total_variance = 0.0
+    n_regions_used = 0
+    n_predictors_substituted = 0
+
+    for model in region_models:
+        if model.is_intercept_only:
+            prediction = model.intercept
+        else:
+            # Gather predictor dosages, substituting 2*AF for missing
+            predictor_dosages = []
+            for i, pred_id in enumerate(model.predictor_variant_ids):
+                dosage = user_dosages.get(pred_id)
+                if dosage is None:
+                    dosage = 2.0 * model.predictor_allele_frequencies[i]
+                    n_predictors_substituted += 1
+                predictor_dosages.append(dosage)
+
+            predictor_array = np.array(predictor_dosages)
+            prediction = np.dot(predictor_array, model.coefficients) + model.intercept
+
+        total_prs += prediction
+        total_variance += model.cv_mse
+        n_regions_used += 1
+
+    return (total_prs, total_variance, n_regions_used, n_predictors_substituted)
+
+
+class ProjectionPredictor:
+    """Full PRS prediction combining observed and projected components.
+
+    Mirrors PRSPredictor but uses region-based projection models
+    instead of per-variant imputation models.
+
+    Prediction: PRS = S_observed + sum_R(S_hat_R)
+    """
+
+    def __init__(
+        self,
+        observed_variants: List[VariantInfo],
+        region_models: List[ProjectionRegionModel],
+        calibration_params: Optional[CalibrationParams] = None,
+    ):
+        """Initialize the projection predictor.
+
+        Args:
+            observed_variants: List of observed PRS variants (on the platform).
+            region_models: List of trained ProjectionRegionModel objects.
+            calibration_params: Optional calibration parameters for scaling.
+        """
+        self.observed_variants = observed_variants
+        self.region_models = region_models
+        self.calibration_params = calibration_params
+
+        # Pre-compute counts
+        self._n_observed_variants = len(observed_variants)
+        self._n_projected_variants = sum(
+            len(m.prs_variant_ids) for m in region_models
+        )
+        self._n_intercept_only = sum(
+            1 for m in region_models if m.is_intercept_only
+        )
+
+    def predict(
+        self,
+        user_genotypes: Dict[str, Optional[float]],
+        apply_calibration: bool = True,
+    ) -> PredictionResult:
+        """Compute full PRS with uncertainty quantification.
+
+        Args:
+            user_genotypes: Dictionary mapping variant_id to dosage value
+                (0.0, 1.0, 2.0) or None for missing variants.
+            apply_calibration: Whether to apply calibration scaling.
+
+        Returns:
+            PredictionResult with PRS value, confidence intervals,
+            component breakdown, and optionally scaled values.
+        """
+        # Step 1: Compute observed component (reused from predictor.py)
+        prs_observed, n_observed_used = compute_observed_prs(
+            user_genotypes, self.observed_variants
+        )
+
+        # Step 2: Compute projected component
+        prs_projected, total_variance, n_regions_used, _ = compute_projected_prs(
+            user_genotypes, self.region_models
+        )
+
+        # Step 3: Combine components
+        prs_raw = prs_observed + prs_projected
+
+        # Step 4: Compute standard error and confidence intervals
+        se = np.sqrt(total_variance) if total_variance > 0 else 0.0
+        ci_lower = prs_raw - 1.96 * se
+        ci_upper = prs_raw + 1.96 * se
+
+        # Step 5: Count variants
+        n_variants_used = n_observed_used + self._n_projected_variants
+        n_user_variants_missing = (
+            self._n_observed_variants + self._n_projected_variants
+        ) - n_variants_used
+
+        # Step 6: Apply calibration if requested and available
+        prs_scaled = None
+        se_scaled = None
+        ci_lower_scaled = None
+        ci_upper_scaled = None
+
+        if apply_calibration and self.calibration_params is not None:
+            params = self.calibration_params
+            prs_scaled = params.scaling_factor * prs_raw + params.calibration_intercept
+            se_scaled = abs(params.scaling_factor) * se
+            ci_lower_scaled = prs_scaled - 1.96 * se_scaled
+            ci_upper_scaled = prs_scaled + 1.96 * se_scaled
+
+        return PredictionResult(
+            prs=prs_raw,
+            se=se,
+            ci_lower=ci_lower,
+            ci_upper=ci_upper,
+            prs_observed_component=prs_observed,
+            prs_imputed_component=prs_projected,
+            n_variants_used=n_variants_used,
+            n_variants_imputed=self._n_projected_variants,
+            n_variants_intercept_only=self._n_intercept_only,
+            n_user_variants_missing=n_user_variants_missing,
+            n_truncated=0,
+            prs_scaled=prs_scaled,
+            se_scaled=se_scaled,
+            ci_lower_scaled=ci_lower_scaled,
+            ci_upper_scaled=ci_upper_scaled,
+        )
