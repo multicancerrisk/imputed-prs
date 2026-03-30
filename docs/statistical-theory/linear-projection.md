@@ -140,14 +140,14 @@ See `imputed_prs/models/projection_predictor.py:compute_projected_prs()` for imp
 The standard error for the projected PRS is:
 
 $$
-SE = \sqrt{\sum_R \text{cv\_mse}_R}
+SE = \sqrt{\sum_R \text{cv\\_mse}_R}
 $$
 
-Where $\text{cv\_mse}_R$ is the cross-validated mean squared error for region $R$.
+Where $\text{cv\\_mse}_R$ is the cross-validated mean squared error for region $R$.
 
 ### Why This Differs from Imputation
 
-The imputation SE composes per-variant terms $\beta_j^2 \sigma^2_{adjusted,j}$ because each variant is imputed independently and then multiplied by its effect size. The projection SE uses $\text{cv\_mse}_R$ directly because the training target $S_R$ already incorporates the effect sizes -- the CV-MSE measures PRS prediction error, not dosage prediction error.
+The imputation SE composes per-variant terms $\beta_j^2 \sigma^2_{adjusted,j}$ because each variant is imputed independently and then multiplied by its effect size. The projection SE uses $\text{cv\\_mse}_R$ directly because the training target $S_R$ already incorporates the effect sizes -- the CV-MSE measures PRS prediction error, not dosage prediction error.
 
 ### 95% Confidence Interval
 
