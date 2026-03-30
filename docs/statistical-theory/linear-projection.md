@@ -78,7 +78,7 @@ $$
 **Imputation approach**: Each missing variant's OLS imputation is $\hat{x}_j = P_Z x_j$, so $\hat{X}_M = P_Z X_M$:
 
 $$
-\hat{S}_{imp} = X_O \beta_O + \hat{X}_M \beta_M = X_O \beta_O + P_Z X_M \beta_M = \hat{S}_{proj} \quad \square
+\hat{S}_{imp} = X_O \beta_O + \hat{X}_M \beta_M = X_O \beta_O + P_Z X_M \beta_M = \hat{S}_{proj}
 $$
 
 ---
