@@ -8,7 +8,10 @@ import pandas as pd
 
 from imputed_prs.core.exceptions import ModelNotFittedError, ValidationError
 from imputed_prs.core.harmonizer import (
-    align_effect_alleles,
+    _is_ambiguous_snp,
+    _normalize_chromosome,
+    build_reference_allele_index,
+    match_oriented_dosage,
     partition_variants,
     validate_genome_build,
 )
@@ -62,6 +65,8 @@ class LinearProjectionPRS:
         n_jobs: int = 1,
         random_state: Optional[int] = None,
         max_predictors: Optional[int] = None,
+        exclude_ambiguous: bool = False,
+        ambiguous_maf_threshold: float = 0.4,
         verbose: int = 1,
     ):
         """Initialize the projection PRS model.
@@ -87,6 +92,8 @@ class LinearProjectionPRS:
         self.n_jobs = n_jobs
         self.random_state = random_state
         self.max_predictors = max_predictors
+        self.exclude_ambiguous = exclude_ambiguous
+        self.ambiguous_maf_threshold = ambiguous_maf_threshold
         self.verbose = verbose
 
         # Fitted state
@@ -96,6 +103,8 @@ class LinearProjectionPRS:
         self._calibration_params: Optional[CalibrationParams] = None
         self._training_result: Optional[ProjectionTrainingResult] = None
         self._platform_variant_index: Optional[Dict[str, int]] = None
+        # Per-variant disposition records (see LinearImputationPRS for the schema).
+        self._variant_dispositions: Optional[List[Dict[str, Any]]] = None
 
         # Metadata
         self._prs_id: Optional[str] = None
@@ -228,26 +237,46 @@ class LinearProjectionPRS:
         elif build_result.prs_build:
             effective_genome_build = build_result.prs_build
 
-        # Step 7: Align effect alleles for observed variants
-        alignment_result = align_effect_alleles(
-            prs_df, genotype_data, observed_variant_ids
-        )
+        # Step 7: Build allele-aware reference indices (see LinearImputationPRS).
+        reference_index = build_reference_allele_index(genotype_data.variant_info)
+        reference_contigs = {
+            _normalize_chromosome(str(c))
+            for c in genotype_data.variant_info["chromosome"].unique()
+        }
 
-        if self.verbose >= 2:
-            print(
-                f"Allele alignment: {alignment_result.n_matched} matched, "
-                f"{alignment_result.n_flipped} flipped"
-            )
-
-        # Step 8: Build training matrices
+        # Step 8: Build training matrices.
+        # Mapping for platform predictor lookups (first occurrence wins).
         geno_var_to_idx: Dict[str, int] = {}
         for idx, row in genotype_data.variant_info.iterrows():
-            geno_var_to_idx[row["variant_id"]] = idx
-            chrom = str(row["chromosome"]).upper()
-            if chrom.startswith("CHR"):
-                chrom = chrom[3:]
+            geno_var_to_idx.setdefault(row["variant_id"], idx)
+            chrom = _normalize_chromosome(str(row["chromosome"]))
             pos = str(int(row["position"]))
-            geno_var_to_idx[f"{chrom}:{pos}"] = idx
+            geno_var_to_idx.setdefault(f"{chrom}:{pos}", idx)
+
+        # Optional QC — exclude strand-ambiguous SNPs with high reference MAF.
+        ambiguous_excluded_ids: Set[str] = set()
+        if self.exclude_ambiguous:
+            for _, row in prs_df.iterrows():
+                effect = str(row["effect_allele"]).upper()
+                other = row.get("other_allele")
+                if pd.isna(other):
+                    continue
+                if not _is_ambiguous_snp(effect, str(other).upper()):
+                    continue
+                match = match_oriented_dosage(
+                    row["chromosome"], int(row["position"]), effect, other,
+                    genotype_data.variant_info, genotype_data.dosage_matrix,
+                    reference_index,
+                )
+                if match is None:
+                    continue
+                dosage = match[1]
+                valid = ~np.isnan(dosage)
+                if not np.any(valid):
+                    continue
+                af = float(np.mean(dosage[valid]) / 2.0)
+                if min(af, 1.0 - af) > self.ambiguous_maf_threshold:
+                    ambiguous_excluded_ids.add(row["variant_id"])
 
         # Build platform variant info DataFrame and Z matrix
         platform_variant_indices = []
@@ -281,42 +310,40 @@ class LinearProjectionPRS:
             )
             Z = np.empty((genotype_data.n_samples, 0))
 
-        # Build missing PRS DataFrame and X matrix
-        missing_prs_df = prs_df[prs_df["variant_id"].isin(missing_variant_ids)].copy()
-        missing_prs_df = missing_prs_df.reset_index(drop=True)
-
-        missing_variant_indices = []
-        for _, row in missing_prs_df.iterrows():
+        # Build the missing-variant target matrix X using effect-allele-oriented
+        # dosages, recording a reason for any variant that cannot be placed.
+        missing_drop_reason: Dict[str, str] = {}
+        missing_prs_rows: List[pd.Series] = []
+        missing_columns: List[np.ndarray] = []
+        for _, row in prs_df[prs_df["variant_id"].isin(missing_variant_ids)].iterrows():
             var_id = row["variant_id"]
-            chrom = str(row["chromosome"]).upper()
-            if chrom.startswith("CHR"):
-                chrom = chrom[3:]
-            chrpos = f"{chrom}:{int(row['position'])}"
-            if var_id in geno_var_to_idx:
-                missing_variant_indices.append(geno_var_to_idx[var_id])
-            elif var_id.lower() in geno_var_to_idx:
-                missing_variant_indices.append(geno_var_to_idx[var_id.lower()])
-            elif chrpos in geno_var_to_idx:
-                missing_variant_indices.append(geno_var_to_idx[chrpos])
+            if var_id in ambiguous_excluded_ids:
+                missing_drop_reason[var_id] = "ambiguous_excluded"
+                continue
+            match = match_oriented_dosage(
+                row["chromosome"], int(row["position"]),
+                row["effect_allele"], row.get("other_allele"),
+                genotype_data.variant_info, genotype_data.dosage_matrix,
+                reference_index,
+            )
+            if match is None:
+                chrom_n = _normalize_chromosome(str(row["chromosome"]))
+                if chrom_n not in reference_contigs:
+                    missing_drop_reason[var_id] = "reference_contig_missing"
+                elif f"{chrom_n}:{int(row['position'])}" in reference_index:
+                    missing_drop_reason[var_id] = "allele_mismatch"
+                else:
+                    missing_drop_reason[var_id] = "not_in_reference"
+                continue
+            missing_columns.append(match[1])
+            missing_prs_rows.append(row)
 
-        if missing_variant_indices:
-            X = genotype_data.dosage_matrix[:, missing_variant_indices]
+        if missing_prs_rows:
+            missing_prs_df = pd.DataFrame(missing_prs_rows).reset_index(drop=True)
+            X = np.column_stack(missing_columns).astype(np.float32)
         else:
-            X = np.empty((genotype_data.n_samples, 0))
-
-        # Update missing_prs_df to only include variants found in genotype data
-        valid_missing_mask = []
-        for _, row in missing_prs_df.iterrows():
-            var_id = row["variant_id"]
-            chrom = str(row["chromosome"]).upper()
-            if chrom.startswith("CHR"):
-                chrom = chrom[3:]
-            chrpos = f"{chrom}:{int(row['position'])}"
-            found = (var_id in geno_var_to_idx
-                     or var_id.lower() in geno_var_to_idx
-                     or chrpos in geno_var_to_idx)
-            valid_missing_mask.append(found)
-        missing_prs_df = missing_prs_df[valid_missing_mask].reset_index(drop=True)
+            missing_prs_df = prs_df.iloc[0:0].copy()
+            X = np.empty((genotype_data.n_samples, 0), dtype=np.float32)
 
         if self.verbose >= 2:
             print(
@@ -376,59 +403,62 @@ class LinearProjectionPRS:
         calibration_params = None
         if training_result.cv_predictions and len(training_result.cv_predictions) > 0:
             try:
-                # Build full dosage matrix X_full for all PRS variants
-                all_prs_indices = []
+                # Build the placed-variant matrix with effect-oriented dosages.
+                covered_ids = set()
+                for region in training_result.region_models.values():
+                    covered_ids.update(region.prs_variant_ids)
+
+                placed_columns: List[np.ndarray] = []
+                placed_var_ids: List[str] = []
+                placed_betas: List[float] = []
                 for _, prs_row in prs_df.iterrows():
                     var_id = prs_row["variant_id"]
-                    chrom = str(prs_row["chromosome"]).upper()
-                    if chrom.startswith("CHR"):
-                        chrom = chrom[3:]
-                    chrpos = f"{chrom}:{int(prs_row['position'])}"
-                    if var_id in geno_var_to_idx:
-                        all_prs_indices.append(geno_var_to_idx[var_id])
-                    elif var_id.lower() in geno_var_to_idx:
-                        all_prs_indices.append(geno_var_to_idx[var_id.lower()])
-                    elif chrpos in geno_var_to_idx:
-                        all_prs_indices.append(geno_var_to_idx[chrpos])
+                    is_observed = (
+                        var_id in observed_variant_ids
+                        and var_id not in ambiguous_excluded_ids
+                    )
+                    if not (is_observed or var_id in covered_ids):
+                        continue
+                    match = match_oriented_dosage(
+                        prs_row["chromosome"], int(prs_row["position"]),
+                        prs_row["effect_allele"], prs_row.get("other_allele"),
+                        genotype_data.variant_info, genotype_data.dosage_matrix,
+                        reference_index,
+                    )
+                    if match is None:
+                        continue
+                    placed_columns.append(match[1])
+                    placed_var_ids.append(var_id)
+                    placed_betas.append(float(prs_row["beta"]))
 
-                if all_prs_indices:
-                    X_full = genotype_data.dosage_matrix[:, all_prs_indices]
+                if placed_columns:
+                    X_full = np.nan_to_num(
+                        np.column_stack(placed_columns).astype(np.float32)
+                    )
+                    all_betas = np.array(placed_betas)
+                    id_to_col = {vid: i for i, vid in enumerate(placed_var_ids)}
 
-                    # Get observed variant indices and betas for S_cv observed component
-                    observed_prs_df = prs_df[
-                        prs_df["variant_id"].isin(observed_variant_ids)
-                    ]
-                    observed_indices_in_full = []
-                    observed_betas_list = []
-                    prs_var_list = list(prs_df["variant_id"])
-                    for var_id in observed_prs_df["variant_id"]:
-                        if var_id in prs_var_list:
-                            idx = prs_var_list.index(var_id)
-                            observed_indices_in_full.append(idx)
-                            observed_betas_list.append(
-                                observed_prs_df[
-                                    observed_prs_df["variant_id"] == var_id
-                                ]["beta"].values[0]
-                            )
+                    # Observed component for S_cv (oriented true genotypes x betas)
+                    observed_indices = np.array(
+                        [id_to_col[vid] for vid in placed_var_ids
+                         if vid in observed_variant_ids],
+                        dtype=int,
+                    )
+                    observed_betas = np.array(
+                        [all_betas[i] for i in observed_indices]
+                    )
 
-                    observed_indices = np.array(observed_indices_in_full, dtype=int)
-                    observed_betas = np.array(observed_betas_list)
-
-                    # Build S_cv: observed true genotypes + projected CV predictions
                     n_samples = X_full.shape[0]
                     s_cv = np.zeros(n_samples)
-
-                    # Observed component: true genotypes x betas
                     if len(observed_indices) > 0:
                         s_cv += X_full[:, observed_indices] @ observed_betas
 
-                    # Projected component: sum region CV predictions
-                    # (already predictions of S_R = X_R @ beta_R, no beta scaling needed)
+                    # Projected component: sum region CV predictions of S_R
+                    # (already S_R = X_R @ beta_R on oriented dosages).
                     for region_id, cv_pred in training_result.cv_predictions.items():
                         s_cv += cv_pred
 
-                    # True PRS: X_full @ all_betas
-                    all_betas = prs_df["beta"].values
+                    # True PRS from the same effect-oriented matrix
                     s_true = X_full @ all_betas
 
                     # Estimate calibration parameters
@@ -445,9 +475,11 @@ class LinearProjectionPRS:
                     print(f"Warning: Could not compute calibration parameters: {e}")
                 calibration_params = None
 
-        # Step 11: Build observed VariantInfo objects
+        # Step 11: Build observed VariantInfo objects (excluding QC-dropped SNPs)
         observed_variants_list: List[VariantInfo] = []
         for _, row in prs_df[prs_df["variant_id"].isin(observed_variant_ids)].iterrows():
+            if row["variant_id"] in ambiguous_excluded_ids:
+                continue
             other_allele = row.get("other_allele")
             if pd.isna(other_allele):
                 other_allele = None
@@ -462,6 +494,20 @@ class LinearProjectionPRS:
                     beta=float(row["beta"]),
                 )
             )
+
+        # Step 11b: Record a disposition for every input PRS variant so coverage
+        # is reported honestly (no silent loss).
+        observed_kept_ids = {v.variant_id for v in observed_variants_list}
+        covered_ids: Set[str] = set()
+        for region in training_result.region_models.values():
+            covered_ids.update(region.prs_variant_ids)
+        self._variant_dispositions = self._build_variant_dispositions(
+            prs_df=prs_df,
+            observed_kept_ids=observed_kept_ids,
+            covered_ids=covered_ids,
+            ambiguous_excluded_ids=ambiguous_excluded_ids,
+            missing_drop_reason=missing_drop_reason,
+        )
 
         # Step 12: Populate instance state
         self._is_fitted = True
@@ -487,6 +533,51 @@ class LinearProjectionPRS:
             )
 
         return self
+
+    def _build_variant_dispositions(
+        self,
+        prs_df: pd.DataFrame,
+        observed_kept_ids: Set[str],
+        covered_ids: Set[str],
+        ambiguous_excluded_ids: Set[str],
+        missing_drop_reason: Dict[str, str],
+    ) -> List[Dict[str, Any]]:
+        """Build one disposition record per input PRS variant.
+
+        Every row of ``prs_df`` yields exactly one record. ``status`` is one of
+        {observed, projected, dropped}; ``reason`` is None for placed variants,
+        or one of {ambiguous_excluded, reference_contig_missing, allele_mismatch,
+        not_in_reference, training_failed} for dropped ones.
+        """
+        dispositions: List[Dict[str, Any]] = []
+        for _, row in prs_df.iterrows():
+            var_id = row["variant_id"]
+            other_allele = row.get("other_allele")
+            if pd.isna(other_allele):
+                other_allele = None
+
+            reason: Optional[str] = None
+            if var_id in ambiguous_excluded_ids:
+                status, reason = "dropped", "ambiguous_excluded"
+            elif var_id in observed_kept_ids:
+                status = "observed"
+            elif var_id in covered_ids:
+                status = "projected"
+            else:
+                status = "dropped"
+                reason = missing_drop_reason.get(var_id, "training_failed")
+
+            dispositions.append({
+                "variant_id": var_id,
+                "chromosome": str(row["chromosome"]),
+                "position": int(row["position"]),
+                "effect_allele": row["effect_allele"],
+                "other_allele": other_allele,
+                "beta": float(row["beta"]),
+                "status": status,
+                "reason": reason,
+            })
+        return dispositions
 
     def predict(
         self,
@@ -603,9 +694,28 @@ class LinearProjectionPRS:
             from dataclasses import asdict
             calibration_dict = asdict(self._calibration_params)
 
+        # Honest coverage from the per-variant disposition record.
+        if self._variant_dispositions is not None:
+            n_definition = len(self._variant_dispositions)
+            dropped_by_reason: Dict[str, int] = {}
+            for d in self._variant_dispositions:
+                if d["status"] == "dropped":
+                    key = d["reason"] or "unknown"
+                    dropped_by_reason[key] = dropped_by_reason.get(key, 0) + 1
+            n_dropped = sum(dropped_by_reason.values())
+        else:
+            n_definition = n_observed + n_missing
+            dropped_by_reason = {}
+            n_dropped = 0
+        coverage = (n_observed + n_missing) / n_definition if n_definition else 0.0
+
         return {
             "n_observed_variants": n_observed,
             "n_missing_variants": n_missing,
+            "n_definition_variants": n_definition,
+            "n_dropped": n_dropped,
+            "dropped_by_reason": dropped_by_reason,
+            "coverage": coverage,
             "n_regions": n_regions,
             "n_intercept_only_regions": n_intercept_only,
             "training_summary": (
@@ -620,6 +730,19 @@ class LinearProjectionPRS:
             "window_size": self.window_size,
             "cv_folds": self.cv_folds,
         }
+
+    @property
+    def variant_dispositions(self) -> pd.DataFrame:
+        """Per-variant disposition table (status/reason for every PRS variant).
+
+        Raises:
+            ModelNotFittedError: If fit() has not been called.
+        """
+        if not self._is_fitted:
+            raise ModelNotFittedError(
+                "Model has not been fitted. Call fit() first."
+            )
+        return pd.DataFrame(self._variant_dispositions or [])
 
     @property
     def variant_table(self) -> pd.DataFrame:

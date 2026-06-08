@@ -289,25 +289,40 @@ def _load_vcf_with_cyvcf2(
             if not _variant_matches(var_id, chrom, pos, rsid_set, chrpos_set):
                 continue
 
-        # Extract dosage
-        dosage = _extract_dosage(variant, dosage_field, len(sample_ids))
-        if dosage is None:
-            logger.warning(f"Could not extract dosage for variant {var_id}, skipping")
-            continue
+        # Extract dosage(s). Multi-allelic records are split into one entry per
+        # ALT allele, each with its own allele-specific dosage, so that downstream
+        # chr:pos:ref:alt matching is exact and dosages are never conflated across
+        # distinct alternate alleles.
+        alts = list(variant.ALT)
+        if len(alts) <= 1:
+            dosage = _extract_dosage(variant, dosage_field, len(sample_ids))
+            if dosage is None:
+                logger.warning(f"Could not extract dosage for variant {var_id}, skipping")
+                continue
+            per_alt = [(alts[0] if alts else None, dosage)]
+        else:
+            alt_dosages = _allele_specific_dosages(variant, len(alts), len(sample_ids))
+            if alt_dosages is None:
+                logger.warning(
+                    f"Could not extract allele-specific dosages for multi-allelic "
+                    f"variant {var_id}, skipping"
+                )
+                continue
+            per_alt = list(zip(alts, alt_dosages))
 
-        dosages.append(dosage)
-        variant_records.append({
-            "variant_id": var_id,
-            "chromosome": chrom,
-            "position": pos,
-            "ref_allele": variant.REF,
-            "alt_allele": variant.ALT[0] if variant.ALT else None,
-        })
+        for alt_allele, dosage in per_alt:
+            dosages.append(dosage)
+            variant_records.append({
+                "variant_id": var_id,
+                "chromosome": chrom,
+                "position": pos,
+                "ref_allele": variant.REF,
+                "alt_allele": alt_allele,
+            })
 
-        # Track missing rate
-        n_missing = np.sum(np.isnan(dosage))
-        n_missing_total += n_missing
-        n_genotypes_total += len(dosage)
+            # Track missing rate
+            n_missing_total += np.sum(np.isnan(dosage))
+            n_genotypes_total += len(dosage)
 
     vcf.close()
 
@@ -344,6 +359,45 @@ def _load_vcf_with_cyvcf2(
         sample_ids=sample_ids,
         source_file=str(path),
     )
+
+
+def _allele_specific_dosages(
+    variant, n_alt: int, n_samples: int
+) -> Optional[List[np.ndarray]]:
+    """Compute per-ALT allele-specific dosages from genotype calls.
+
+    For a multi-allelic record, returns a list of ``n_alt`` arrays where the
+    i-th array counts copies of ALT allele ``i + 1`` for each sample (0, 1, 2),
+    with NaN for missing genotypes. This avoids conflating distinct ALT alleles,
+    which ``gt_types`` would otherwise collapse into a single non-reference count.
+
+    Args:
+        variant: cyvcf2 Variant object.
+        n_alt: Number of ALT alleles in the record.
+        n_samples: Expected number of samples.
+
+    Returns:
+        List of dosage arrays (one per ALT allele), or None if per-allele
+        genotype calls are unavailable.
+    """
+    try:
+        allele_array = variant.genotype.array()
+    except Exception:
+        return None
+
+    if allele_array is None or allele_array.shape[0] != n_samples or allele_array.shape[1] < 2:
+        return None
+
+    # Columns 0 and 1 are the two called alleles (column 2, if present, is phase).
+    called = allele_array[:, :2]
+    missing = np.any(called < 0, axis=1)
+
+    result: List[np.ndarray] = []
+    for allele_value in range(1, n_alt + 1):
+        dosage = (called == allele_value).sum(axis=1).astype(np.float32)
+        dosage[missing] = np.nan
+        result.append(dosage)
+    return result
 
 
 def _extract_dosage(variant, dosage_field: str, n_samples: int) -> Optional[np.ndarray]:

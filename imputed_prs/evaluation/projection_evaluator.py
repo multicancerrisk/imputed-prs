@@ -124,42 +124,44 @@ class ProjectionEvaluator:
         Returns:
             Array of true PRS values (n_samples,).
         """
-        # Build variant-to-index mapping (by variant_id AND chr:pos)
-        var_to_idx: Dict[str, int] = {}
-        for idx, row in genotype_data.variant_info.iterrows():
-            var_to_idx[row["variant_id"]] = idx
-            chrom = str(row["chromosome"]).upper()
-            if chrom.startswith("CHR"):
-                chrom = chrom[3:]
-            var_to_idx[f"{chrom}:{int(row['position'])}"] = idx
+        from imputed_prs.core.harmonizer import (
+            build_reference_allele_index,
+            match_oriented_dosage,
+        )
 
+        reference_index = build_reference_allele_index(genotype_data.variant_info)
         n_samples = genotype_data.n_samples
         true_prs = np.zeros(n_samples)
 
-        def _find_idx(variant_id, chromosome, position):
-            """Find genotype index by variant_id or chr:pos."""
-            if variant_id in var_to_idx:
-                return var_to_idx[variant_id]
-            chrpos = f"{chromosome}:{position}"
-            if chrpos in var_to_idx:
-                return var_to_idx[chrpos]
-            return None
-
-        # Add observed variant contributions
+        # Observed variant contributions use effect-allele-oriented dosages.
         for var in self.model.observed_variants:
-            idx = _find_idx(var.variant_id, var.chromosome, var.position)
-            if idx is not None:
-                dosages = genotype_data.dosage_matrix[:, idx]
-                valid_mask = ~np.isnan(dosages)
-                true_prs[valid_mask] += dosages[valid_mask] * var.beta
+            match = match_oriented_dosage(
+                var.chromosome, var.position, var.effect_allele, var.other_allele,
+                genotype_data.variant_info, genotype_data.dosage_matrix,
+                reference_index,
+            )
+            if match is None:
+                continue
+            dosages = match[1]
+            valid_mask = ~np.isnan(dosages)
+            true_prs[valid_mask] += dosages[valid_mask] * var.beta
 
-        # Add missing variant contributions (using true genotypes, not projected)
-        # Region models contain multiple PRS variants each
+        # Region (missing) variant contributions. Region models do not store
+        # per-variant alleles, so these use the first reference row at each locus
+        # (correct for the common effect==ALT biallelic case). The analysis
+        # pipeline avoids this path by scoring the true PRS via the imputation
+        # evaluator, which has full allele information.
+        var_to_idx: Dict[str, int] = {}
+        for idx, row in genotype_data.variant_info.iterrows():
+            var_to_idx.setdefault(row["variant_id"], idx)
+            chrom = str(row["chromosome"]).upper()
+            if chrom.startswith("CHR"):
+                chrom = chrom[3:]
+            var_to_idx.setdefault(f"{chrom}:{int(row['position'])}", idx)
+
         for region_model in self.model.region_models:
             for i, var_id in enumerate(region_model.prs_variant_ids):
                 beta = float(region_model.betas[i])
-                # Look up variant in genotype data
-                # We need chromosome and position - extract from region
                 idx = var_to_idx.get(var_id)
                 if idx is not None:
                     dosages = genotype_data.dosage_matrix[:, idx]
@@ -180,61 +182,64 @@ class ProjectionEvaluator:
         Returns:
             Array of projected PRS values (n_samples,).
         """
-        # Build variant-to-index mapping (by variant_id AND chr:pos)
+        from imputed_prs.core.harmonizer import (
+            build_reference_allele_index,
+            match_oriented_dosage,
+        )
+
+        n_samples = genotype_data.n_samples
+
+        # Observed component: effect-allele-oriented dosages (consistent with the
+        # oriented true PRS used in evaluation and with the oriented projection
+        # targets the region models were trained on).
+        reference_index = build_reference_allele_index(genotype_data.variant_info)
+        observed_prs = np.zeros(n_samples)
+        for var in self.model.observed_variants:
+            match = match_oriented_dosage(
+                var.chromosome, var.position, var.effect_allele, var.other_allele,
+                genotype_data.variant_info, genotype_data.dosage_matrix,
+                reference_index,
+            )
+            if match is None:
+                continue
+            dosages = match[1]
+            valid_mask = ~np.isnan(dosages)
+            observed_prs[valid_mask] += dosages[valid_mask] * var.beta
+
+        # Projected component: predict each region's S_R from raw platform
+        # dosages (predictors kept raw, matching how the models were trained).
         var_to_idx: Dict[str, int] = {}
         for idx, row in genotype_data.variant_info.iterrows():
-            var_to_idx[row["variant_id"]] = idx
+            var_to_idx.setdefault(row["variant_id"], idx)
             chrom = str(row["chromosome"]).upper()
             if chrom.startswith("CHR"):
                 chrom = chrom[3:]
-            var_to_idx[f"{chrom}:{int(row['position'])}"] = idx
+            var_to_idx.setdefault(f"{chrom}:{int(row['position'])}", idx)
 
-        n_samples = genotype_data.n_samples
-        projected_prs = np.zeros(n_samples)
-
-        # Build mapping from variant_id to genotype index for all needed variants
-        variant_id_to_geno_idx: Dict[str, int] = {}
-
-        for var in self.model.observed_variants:
-            for key in [var.variant_id, f"{var.chromosome}:{var.position}"]:
-                if key in var_to_idx:
-                    variant_id_to_geno_idx[var.variant_id] = var_to_idx[key]
-                    break
-
+        predictor_ids: Set[str] = set()
         for region_model in self.model.region_models:
-            for pred_id in region_model.predictor_variant_ids:
-                if pred_id in var_to_idx:
-                    variant_id_to_geno_idx[pred_id] = var_to_idx[pred_id]
+            predictor_ids.update(region_model.predictor_variant_ids)
 
-        # Collect all variant IDs the predictor will request
-        platform_variant_ids = set()
-        for var in self.model.observed_variants:
-            platform_variant_ids.add(var.variant_id)
-        for region_model in self.model.region_models:
-            platform_variant_ids.update(region_model.predictor_variant_ids)
-
-        # Create predictor (no calibration for evaluation)
+        # Observed variants are scored above (oriented); the predictor only
+        # contributes the projected component here.
         predictor = ProjectionPredictor(
-            observed_variants=self.model.observed_variants,
+            observed_variants=[],
             region_models=self.model.region_models,
             calibration_params=None,
         )
 
-        # Compute for each sample
+        projected_component = np.zeros(n_samples)
         for sample_idx in range(n_samples):
             user_dosages: Dict[str, Optional[float]] = {}
-            for var_id in platform_variant_ids:
-                geno_idx = variant_id_to_geno_idx.get(var_id)
+            for var_id in predictor_ids:
+                geno_idx = var_to_idx.get(var_id)
                 if geno_idx is not None:
                     dosage = genotype_data.dosage_matrix[sample_idx, geno_idx]
-                    if np.isnan(dosage):
-                        user_dosages[var_id] = None
-                    else:
-                        user_dosages[var_id] = float(dosage)
+                    user_dosages[var_id] = None if np.isnan(dosage) else float(dosage)
                 else:
                     user_dosages[var_id] = None
 
             result = predictor.predict(user_dosages, apply_calibration=False)
-            projected_prs[sample_idx] = result.prs
+            projected_component[sample_idx] = result.prs
 
-        return projected_prs
+        return observed_prs + projected_component

@@ -460,3 +460,54 @@ class TestImportErrors:
         # This verifies pandas-plink is installed and importable
         from pandas_plink import read_plink1_bin
         assert callable(read_plink1_bin)
+
+
+class TestMultiAllelicSplitting:
+    """Multi-allelic records split into per-ALT rows with allele-specific dosage."""
+
+    def test_multiallelic_record_split(self, tmp_path):
+        """A REF=A ALT=G,T record yields two rows with allele-specific dosages."""
+        pytest.importorskip("cyvcf2")
+        vcf = tmp_path / "multi.vcf"
+        # 5 samples: genotypes mix ALT1 (G, allele idx 1) and ALT2 (T, allele idx 2)
+        vcf.write_text(
+            "##fileformat=VCFv4.2\n"
+            "##contig=<ID=1,length=1000000>\n"
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT"
+            "\tS1\tS2\tS3\tS4\tS5\n"
+            # S1=G/G(2 of ALT1) S2=A/G(1 ALT1) S3=A/T(1 ALT2) S4=T/T(2 ALT2) S5=A/A(ref)
+            "1\t500\trsm\tA\tG,T\t.\t.\t.\tGT\t1/1\t0/1\t0/2\t2/2\t0/0\n"
+        )
+        data = load_genotypes_vcf(vcf)
+
+        assert data.n_variants == 2  # one row per ALT
+        vi = data.variant_info
+        assert list(vi["ref_allele"]) == ["A", "A"]
+        assert set(vi["alt_allele"]) == {"G", "T"}
+
+        # ALT=G dosage counts only G copies: S1=2, S2=1, others 0
+        g_idx = vi.index[vi["alt_allele"] == "G"][0]
+        np.testing.assert_array_equal(
+            data.dosage_matrix[:, g_idx], [2.0, 1.0, 0.0, 0.0, 0.0]
+        )
+        # ALT=T dosage counts only T copies: S3=1, S4=2, others 0
+        t_idx = vi.index[vi["alt_allele"] == "T"][0]
+        np.testing.assert_array_equal(
+            data.dosage_matrix[:, t_idx], [0.0, 0.0, 1.0, 2.0, 0.0]
+        )
+
+    def test_biallelic_unchanged(self, tmp_path):
+        """A biallelic record still yields a single row (fast path)."""
+        pytest.importorskip("cyvcf2")
+        vcf = tmp_path / "bi.vcf"
+        vcf.write_text(
+            "##fileformat=VCFv4.2\n"
+            "##contig=<ID=1,length=1000000>\n"
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">\n'
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\n"
+            "1\t500\trsb\tA\tG\t.\t.\t.\tGT\t0/0\t0/1\t1/1\n"
+        )
+        data = load_genotypes_vcf(vcf)
+        assert data.n_variants == 1
+        np.testing.assert_array_equal(data.dosage_matrix[:, 0], [0.0, 1.0, 2.0])

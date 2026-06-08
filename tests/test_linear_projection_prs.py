@@ -250,6 +250,10 @@ class TestLinearProjectionPRSProperties:
         expected_keys = {
             "n_observed_variants",
             "n_missing_variants",
+            "n_definition_variants",
+            "n_dropped",
+            "dropped_by_reason",
+            "coverage",
             "n_regions",
             "n_intercept_only_regions",
             "training_summary",

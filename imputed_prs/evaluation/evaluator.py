@@ -515,7 +515,9 @@ class ImputationEvaluator:
     def _compute_true_prs(self, genotype_data: GenotypeData) -> np.ndarray:
         """Compute true PRS from full genotype data.
 
-        Calculates sum(dosage * beta) for all PRS variants.
+        Calculates sum(effect_dosage * beta) for all placed PRS variants, using
+        effect-allele-oriented dosages so the gold standard is allele-correct
+        (and consistent with the imputation target the models were trained on).
 
         Args:
             genotype_data: GenotypeData containing all samples.
@@ -523,43 +525,36 @@ class ImputationEvaluator:
         Returns:
             Array of true PRS values (n_samples,).
         """
-        # Build variant-to-index mapping (by variant_id AND chr:pos)
-        var_to_idx: Dict[str, int] = {}
-        for idx, row in genotype_data.variant_info.iterrows():
-            var_to_idx[row["variant_id"]] = idx
-            chrom = str(row["chromosome"]).upper()
-            if chrom.startswith("CHR"):
-                chrom = chrom[3:]
-            var_to_idx[f"{chrom}:{int(row['position'])}"] = idx
+        from imputed_prs.core.harmonizer import (
+            build_reference_allele_index,
+            match_oriented_dosage,
+        )
 
+        reference_index = build_reference_allele_index(genotype_data.variant_info)
         n_samples = genotype_data.n_samples
         true_prs = np.zeros(n_samples)
 
-        def _find_idx(variant_id, chromosome, position):
-            """Find genotype index by variant_id or chr:pos."""
-            if variant_id in var_to_idx:
-                return var_to_idx[variant_id]
-            chrpos = f"{chromosome}:{position}"
-            if chrpos in var_to_idx:
-                return var_to_idx[chrpos]
-            return None
+        # All placed variants (observed + imputed); dropped variants are absent
+        # from both lists and therefore correctly excluded.
+        placed = [
+            (v.chromosome, v.position, v.effect_allele, v.other_allele, v.beta)
+            for v in self.model.observed_variants
+        ] + [
+            (m.chromosome, m.position, m.effect_allele, m.other_allele, m.beta)
+            for m in self.model.imputed_models
+        ]
 
-        # Add observed variant contributions
-        for var in self.model.observed_variants:
-            idx = _find_idx(var.variant_id, var.chromosome, var.position)
-            if idx is not None:
-                dosages = genotype_data.dosage_matrix[:, idx]
-                # Handle NaN by treating as 0 contribution
-                valid_mask = ~np.isnan(dosages)
-                true_prs[valid_mask] += dosages[valid_mask] * var.beta
-
-        # Add imputed variant contributions (using true genotypes, not imputed)
-        for model in self.model.imputed_models:
-            idx = _find_idx(model.variant_id, model.chromosome, model.position)
-            if idx is not None:
-                dosages = genotype_data.dosage_matrix[:, idx]
-                valid_mask = ~np.isnan(dosages)
-                true_prs[valid_mask] += dosages[valid_mask] * model.beta
+        for chromosome, position, effect_allele, other_allele, beta in placed:
+            match = match_oriented_dosage(
+                chromosome, position, effect_allele, other_allele,
+                genotype_data.variant_info, genotype_data.dosage_matrix,
+                reference_index,
+            )
+            if match is None:
+                continue
+            dosages = match[1]
+            valid_mask = ~np.isnan(dosages)
+            true_prs[valid_mask] += dosages[valid_mask] * beta
 
         return true_prs
 
@@ -575,67 +570,67 @@ class ImputationEvaluator:
         Returns:
             Array of imputed PRS values (n_samples,).
         """
-        # Build variant-to-index mapping (by variant_id AND chr:pos)
+        from imputed_prs.core.harmonizer import (
+            build_reference_allele_index,
+            match_oriented_dosage,
+        )
+
+        n_samples = genotype_data.n_samples
+
+        # Observed component: effect-allele-oriented dosages (consistent with the
+        # true PRS and with how the imputation targets were oriented in training).
+        reference_index = build_reference_allele_index(genotype_data.variant_info)
+        observed_prs = np.zeros(n_samples)
+        for var in self.model.observed_variants:
+            match = match_oriented_dosage(
+                var.chromosome, var.position, var.effect_allele, var.other_allele,
+                genotype_data.variant_info, genotype_data.dosage_matrix,
+                reference_index,
+            )
+            if match is None:
+                continue
+            dosages = match[1]
+            valid_mask = ~np.isnan(dosages)
+            observed_prs[valid_mask] += dosages[valid_mask] * var.beta
+
+        # Imputed component: predict each missing variant from raw platform
+        # dosages. Predictors are kept raw to match how the models were trained
+        # (first-occurrence row wins, mirroring fit-time predictor selection).
         var_to_idx: Dict[str, int] = {}
         for idx, row in genotype_data.variant_info.iterrows():
-            var_to_idx[row["variant_id"]] = idx
+            var_to_idx.setdefault(row["variant_id"], idx)
             chrom = str(row["chromosome"]).upper()
             if chrom.startswith("CHR"):
                 chrom = chrom[3:]
-            var_to_idx[f"{chrom}:{int(row['position'])}"] = idx
+            var_to_idx.setdefault(f"{chrom}:{int(row['position'])}", idx)
 
-        n_samples = genotype_data.n_samples
-        imputed_prs = np.zeros(n_samples)
-
-        # Get all platform variant IDs (from observed variants and imputation predictors)
-        # and build a mapping from model variant_id to genotype index
-        variant_id_to_geno_idx: Dict[str, int] = {}
-
-        for var in self.model.observed_variants:
-            for key in [var.variant_id, f"{var.chromosome}:{var.position}"]:
-                if key in var_to_idx:
-                    variant_id_to_geno_idx[var.variant_id] = var_to_idx[key]
-                    break
-
+        predictor_ids: Set[str] = set()
         for model in self.model.imputed_models:
-            for pred_id in model.predictor_variant_ids:
-                if pred_id in var_to_idx:
-                    variant_id_to_geno_idx[pred_id] = var_to_idx[pred_id]
+            predictor_ids.update(model.predictor_variant_ids)
 
-        # Collect all variant IDs the predictor will request
-        platform_variant_ids = set()
-        for var in self.model.observed_variants:
-            platform_variant_ids.add(var.variant_id)
-        for model in self.model.imputed_models:
-            platform_variant_ids.update(model.predictor_variant_ids)
-
-        # Create predictor
+        # Observed variants are scored above (oriented), so the predictor only
+        # contributes the imputed component here.
         predictor = PRSPredictor(
-            observed_variants=self.model.observed_variants,
+            observed_variants=[],
             imputed_models=self.model.imputed_models,
             calibration_params=None,  # Don't apply calibration for evaluation
         )
 
-        # Compute for each sample
+        imputed_component = np.zeros(n_samples)
         for sample_idx in range(n_samples):
-            # Build dosage dict for this sample
             user_dosages: Dict[str, Optional[float]] = {}
-            for var_id in platform_variant_ids:
-                geno_idx = variant_id_to_geno_idx.get(var_id)
+            for var_id in predictor_ids:
+                geno_idx = var_to_idx.get(var_id)
                 if geno_idx is not None:
                     dosage = genotype_data.dosage_matrix[sample_idx, geno_idx]
-                    if np.isnan(dosage):
-                        user_dosages[var_id] = None
-                    else:
-                        user_dosages[var_id] = float(dosage)
+                    user_dosages[var_id] = None if np.isnan(dosage) else float(dosage)
                 else:
                     user_dosages[var_id] = None
 
-            # Compute prediction
             result = predictor.predict(user_dosages, apply_calibration=False)
-            imputed_prs[sample_idx] = result.prs
+            imputed_component[sample_idx] = result.prs
 
-        return imputed_prs
+        return observed_prs + imputed_component
 
     def _subset_genotype_data(
         self, genotype_data: GenotypeData, sample_indices: np.ndarray

@@ -669,3 +669,96 @@ def align_effect_alleles(
         n_ambiguous=n_ambiguous,
         n_unmatched_alleles=n_unmatched_alleles,
     )
+
+
+def build_reference_allele_index(variant_info: pd.DataFrame) -> Dict[str, List[int]]:
+    """Map each normalized ``chr:pos`` to the reference rows at that locus.
+
+    After multi-allelic records are split (one row per ALT allele), a single
+    genomic position can map to several rows. This index groups the candidate
+    rows so allele-aware matching can select the correct one.
+
+    Parameters
+    ----------
+    variant_info : pd.DataFrame
+        Reference variant metadata with columns chromosome, position,
+        ref_allele, alt_allele.
+
+    Returns
+    -------
+    Dict[str, List[int]]
+        Mapping from "chrom:pos" to a list of *positional* row indices.
+    """
+    index: Dict[str, List[int]] = {}
+    for pos_idx, (_, row) in enumerate(variant_info.iterrows()):
+        chrom = _normalize_chromosome(str(row["chromosome"]))
+        pos = int(row["position"])
+        index.setdefault(f"{chrom}:{pos}", []).append(pos_idx)
+    return index
+
+
+def match_oriented_dosage(
+    chromosome: str,
+    position: int,
+    effect_allele: str,
+    other_allele: Optional[str],
+    variant_info: pd.DataFrame,
+    dosage_matrix: np.ndarray,
+    reference_index: Dict[str, List[int]],
+) -> Optional[Tuple[int, np.ndarray, bool]]:
+    """Resolve a PRS variant against the reference and return effect-oriented dosage.
+
+    Matching keys on ``chr:pos`` and then resolves the exact reference row by
+    comparing the PRS ``(effect, other)`` alleles against each candidate's
+    ``(ref, alt)`` — directly and via the complementary strand. The returned
+    dosage counts copies of the *effect* allele: it is flipped to ``2 - dosage``
+    when the effect allele is the reference allele, since the per-row dosage
+    counts the ALT allele.
+
+    Parameters
+    ----------
+    chromosome, position : str, int
+        PRS variant locus.
+    effect_allele, other_allele : str, Optional[str]
+        PRS effect and other alleles. ``other_allele`` may be None/NaN.
+    variant_info : pd.DataFrame
+        Reference variant metadata (must include ref_allele, alt_allele).
+    dosage_matrix : np.ndarray
+        Reference dosage matrix (n_samples x n_variants), ALT-allele counts.
+    reference_index : Dict[str, List[int]]
+        Output of :func:`build_reference_allele_index` for ``variant_info``.
+
+    Returns
+    -------
+    Optional[Tuple[int, np.ndarray, bool]]
+        ``(reference_row_index, oriented_dosage, was_flipped)``, or None when no
+        allele-compatible reference variant exists at the locus.
+    """
+    chrom = _normalize_chromosome(str(chromosome))
+    candidates = reference_index.get(f"{chrom}:{int(position)}")
+    if not candidates:
+        return None
+
+    effect = str(effect_allele).upper()
+    if other_allele is None or (isinstance(other_allele, float) and pd.isna(other_allele)):
+        other = ""
+    else:
+        other = str(other_allele).upper()
+
+    # Pass 1 matches alleles directly; pass 2 retries on the complementary strand.
+    for use_complement in (False, True):
+        eff = _complement(effect) if use_complement else effect
+        oth = _complement(other) if (use_complement and other) else other
+        for idx in candidates:
+            row = variant_info.iloc[idx]
+            ref = str(row["ref_allele"]).upper()
+            alt = str(row["alt_allele"]).upper()
+            dosage = dosage_matrix[:, idx]
+            # Effect allele is the ALT -> dosage already counts the effect allele.
+            if eff == alt and (oth == ref or oth == ""):
+                return idx, dosage.copy(), False
+            # Effect allele is the REF -> flip so dosage counts the effect allele.
+            if eff == ref and (oth == alt or oth == ""):
+                return idx, 2.0 - dosage, True
+
+    return None

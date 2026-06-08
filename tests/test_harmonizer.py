@@ -15,11 +15,81 @@ from imputed_prs.core.harmonizer import (
     _normalize_build,
     _normalize_chromosome,
     align_effect_alleles,
+    build_reference_allele_index,
     filter_to_local_window,
+    match_oriented_dosage,
     partition_variants,
     validate_genome_build,
 )
 from imputed_prs.core.types import GenotypeData
+
+
+class TestMatchOrientedDosage:
+    """Tests for allele-aware, effect-oriented dosage matching."""
+
+    @staticmethod
+    def _ref(records):
+        """Build (variant_info, dosage_matrix, index) from (chrom,pos,ref,alt,dosages)."""
+        variant_info = pd.DataFrame([
+            {"variant_id": f"{c}:{p}", "chromosome": c, "position": p,
+             "ref_allele": ref, "alt_allele": alt}
+            for c, p, ref, alt, _ in records
+        ])
+        dosage_matrix = np.array([d for *_, d in records], dtype=float).T
+        return variant_info, dosage_matrix, build_reference_allele_index(variant_info)
+
+    def test_effect_is_alt_no_flip(self):
+        """When effect allele == ALT, dosage is returned unflipped."""
+        vi, dm, idx = self._ref([("1", 100, "A", "G", [0.0, 1.0, 2.0])])
+        out = match_oriented_dosage("1", 100, "G", "A", vi, dm, idx)
+        assert out is not None
+        _, dosage, flipped = out
+        assert flipped is False
+        np.testing.assert_array_equal(dosage, [0.0, 1.0, 2.0])
+
+    def test_effect_is_ref_flips(self):
+        """When effect allele == REF, dosage is flipped to 2 - dosage."""
+        vi, dm, idx = self._ref([("1", 100, "A", "G", [0.0, 1.0, 2.0])])
+        out = match_oriented_dosage("1", 100, "A", "G", vi, dm, idx)
+        assert out is not None
+        _, dosage, flipped = out
+        assert flipped is True
+        np.testing.assert_array_equal(dosage, [2.0, 1.0, 0.0])
+
+    def test_multiallelic_resolves_correct_alt(self):
+        """At a split multi-allelic locus, the effect allele picks its own row."""
+        vi, dm, idx = self._ref([
+            ("4", 187503758, "A", "G", [0.0, 1.0, 0.0]),  # wrong allele
+            ("4", 187503758, "A", "T", [2.0, 0.0, 1.0]),  # effect=T lives here
+        ])
+        out = match_oriented_dosage("4", 187503758, "T", "A", vi, dm, idx)
+        assert out is not None
+        geno_idx, dosage, flipped = out
+        assert geno_idx == 1
+        assert flipped is False
+        np.testing.assert_array_equal(dosage, [2.0, 0.0, 1.0])
+
+    def test_strand_complement_match(self):
+        """A SNP on the opposite strand still matches via complement."""
+        vi, dm, idx = self._ref([("1", 100, "C", "T", [0.0, 1.0, 2.0])])
+        # effect=A / other=G is the reverse-complement strand of T/C
+        out = match_oriented_dosage("1", 100, "A", "G", vi, dm, idx)
+        assert out is not None
+        _, dosage, flipped = out
+        assert flipped is False  # A complements to T == ALT
+        np.testing.assert_array_equal(dosage, [0.0, 1.0, 2.0])
+
+    def test_no_allele_match_returns_none(self):
+        """A position present but with a different ALT allele returns None."""
+        # Locus is A/G; the PRS variant A/T has an ALT (T) that is not present
+        # (and does not strand-match), so there is no compatible reference row.
+        vi, dm, idx = self._ref([("1", 100, "A", "G", [0.0, 1.0, 2.0])])
+        assert match_oriented_dosage("1", 100, "T", "A", vi, dm, idx) is None
+
+    def test_absent_locus_returns_none(self):
+        """A locus absent from the reference returns None."""
+        vi, dm, idx = self._ref([("1", 100, "A", "G", [0.0, 1.0, 2.0])])
+        assert match_oriented_dosage("1", 999, "A", "G", vi, dm, idx) is None
 
 
 class TestComplement:

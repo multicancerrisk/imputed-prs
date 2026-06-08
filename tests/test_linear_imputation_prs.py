@@ -1465,3 +1465,107 @@ class TestLinearImputationPRSLoad:
         vt = loaded_model.variant_table
         assert isinstance(vt, pd.DataFrame)
         assert len(vt) == len(fitted_model.observed_variants) + len(fitted_model.imputed_models)
+
+
+class TestVariantDispositionsAndCoverage:
+    """Tests for honest coverage reporting and per-variant dispositions."""
+
+    def _fit(self, vcf, prs_df, platform, **kwargs):
+        model = LinearImputationPRS(
+            window_size=500_000, cv_folds=3, tuning_scope="none",
+            verbose=0, random_state=42, **kwargs,
+        )
+        model.fit(reference_genotypes=vcf, prs_definition=prs_df,
+                  platform_variants=platform)
+        return model
+
+    def test_summary_coverage_keys_all_found(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """All variants found -> full coverage and the new honest-coverage keys."""
+        pytest.importorskip("cyvcf2")
+        s = self._fit(synthetic_vcf_file, synthetic_prs_df, platform_variants_partial).summary
+        assert s["n_definition_variants"] == 5
+        assert s["n_total_variants"] == 5
+        assert s["n_dropped"] == 0
+        assert s["dropped_by_reason"] == {}
+        assert s["coverage"] == 1.0
+
+    def test_variant_table_has_reason_column(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        pytest.importorskip("cyvcf2")
+        vt = self._fit(synthetic_vcf_file, synthetic_prs_df,
+                       platform_variants_partial).variant_table
+        assert "reason" in vt.columns
+        assert len(vt) == 5
+
+    def test_dropped_variant_not_in_reference(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """A PRS variant absent from the reference is recorded, not silently lost."""
+        pytest.importorskip("cyvcf2")
+        prs = pd.concat([synthetic_prs_df, pd.DataFrame([{
+            "variant_id": "rs_missing", "chromosome": "1", "position": 200000,
+            "effect_allele": "A", "other_allele": "G", "beta": 0.3,
+        }])], ignore_index=True)
+
+        model = self._fit(synthetic_vcf_file, prs, platform_variants_partial)
+        s = model.summary
+        assert s["n_definition_variants"] == 6  # full definition, not post-drop
+        assert s["n_dropped"] == 1
+        assert s["coverage"] < 1.0
+        assert s["dropped_by_reason"].get("not_in_reference") == 1
+
+        vt = model.variant_table
+        assert len(vt) == 6
+        row = vt[vt["variant_id"] == "rs_missing"].iloc[0]
+        assert row["status"] == "dropped"
+        assert row["reason"] == "not_in_reference"
+
+    def test_reference_contig_missing(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """A variant on a contig absent from the reference is flagged distinctly."""
+        pytest.importorskip("cyvcf2")
+        prs = pd.concat([synthetic_prs_df, pd.DataFrame([{
+            "variant_id": "rsX", "chromosome": "X", "position": 5000,
+            "effect_allele": "A", "other_allele": "G", "beta": 0.3,
+        }])], ignore_index=True)
+
+        model = self._fit(synthetic_vcf_file, prs, platform_variants_partial)
+        vt = model.variant_table
+        row = vt[vt["variant_id"] == "rsX"].iloc[0]
+        assert row["status"] == "dropped"
+        assert row["reason"] == "reference_contig_missing"
+        assert model.summary["dropped_by_reason"].get("reference_contig_missing") == 1
+
+    def test_exclude_ambiguous_drops_palindrome(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """rs5 is a palindromic A/T SNP with MAF~0.45; QC drops it only when enabled."""
+        pytest.importorskip("cyvcf2")
+        kept = self._fit(synthetic_vcf_file, synthetic_prs_df,
+                         platform_variants_partial, exclude_ambiguous=False)
+        assert "rs5" not in set(
+            kept.variant_table.loc[kept.variant_table.status == "dropped", "variant_id"]
+        )
+
+        dropped = self._fit(synthetic_vcf_file, synthetic_prs_df,
+                            platform_variants_partial,
+                            exclude_ambiguous=True, ambiguous_maf_threshold=0.4)
+        vt = dropped.variant_table
+        row = vt[vt["variant_id"] == "rs5"].iloc[0]
+        assert row["status"] == "dropped"
+        assert row["reason"] == "ambiguous_excluded"
+        assert dropped.summary["dropped_by_reason"].get("ambiguous_excluded") == 1
+
+    def test_disposition_completeness(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """Every input PRS variant appears exactly once in the variant table."""
+        pytest.importorskip("cyvcf2")
+        model = self._fit(synthetic_vcf_file, synthetic_prs_df, platform_variants_partial)
+        vt = model.variant_table
+        assert len(vt) == len(synthetic_prs_df)
+        assert sorted(vt["variant_id"]) == sorted(synthetic_prs_df["variant_id"])
