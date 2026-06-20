@@ -139,7 +139,21 @@ def _fit_one_region(
     try:
         # Get betas for PRS variants in this region
         indices = region.prs_variant_indices
-        betas = prs_variants.iloc[indices]["beta"].values.astype(np.float64)
+        prs_rows = prs_variants.iloc[indices]
+        betas = prs_rows["beta"].values.astype(np.float64)
+
+        # Per-PRS-variant locus + alleles, index-aligned with betas. Lets the
+        # evaluator orient the true PRS (effect==REF, strand-flip, multiallelic)
+        # instead of assuming effect==ALT at the first reference row.
+        prs_positions = [int(p) for p in prs_rows["position"].tolist()]
+        prs_effect_alleles = [str(a) for a in prs_rows["effect_allele"].tolist()]
+        if "other_allele" in prs_rows.columns:
+            prs_other_alleles = [
+                None if pd.isna(a) else str(a)
+                for a in prs_rows["other_allele"].tolist()
+            ]
+        else:
+            prs_other_alleles = [None] * len(indices)
 
         # Compute target: S_R = X[:, indices] @ betas
         X_region = X[:, indices]
@@ -207,6 +221,9 @@ def _fit_one_region(
             predictor_positions=predictor_positions,
             predictor_counted_alleles=predictor_counted_alleles,
             predictor_other_alleles=predictor_other_alleles,
+            prs_positions=prs_positions,
+            prs_effect_alleles=prs_effect_alleles,
+            prs_other_alleles=prs_other_alleles,
         )
 
         return (region_id, model, result.cv_predictions, result.is_intercept_only)

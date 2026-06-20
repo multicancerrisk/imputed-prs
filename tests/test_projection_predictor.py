@@ -59,6 +59,9 @@ def _make_region_model(
     predictor_positions=None,
     predictor_counted_alleles=None,
     predictor_other_alleles=None,
+    prs_positions=None,
+    prs_effect_alleles=None,
+    prs_other_alleles=None,
 ):
     """Helper to create a ProjectionRegionModel with sensible defaults.
 
@@ -85,6 +88,13 @@ def _make_region_model(
         predictor_counted_alleles = ["A"] * n
     if predictor_other_alleles is None:
         predictor_other_alleles = ["G"] * n
+    m = len(prs_variant_ids)
+    if prs_positions is None:
+        prs_positions = [start + 1_000_000 * (i + 1) for i in range(m)]
+    if prs_effect_alleles is None:
+        prs_effect_alleles = ["A"] * m
+    if prs_other_alleles is None:
+        prs_other_alleles = ["G"] * m
     return ProjectionRegionModel(
         region_id=region_id,
         chromosome=chromosome,
@@ -104,6 +114,9 @@ def _make_region_model(
         predictor_positions=predictor_positions,
         predictor_counted_alleles=predictor_counted_alleles,
         predictor_other_alleles=predictor_other_alleles,
+        prs_positions=prs_positions,
+        prs_effect_alleles=prs_effect_alleles,
+        prs_other_alleles=prs_other_alleles,
     )
 
 

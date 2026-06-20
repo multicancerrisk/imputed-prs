@@ -466,6 +466,15 @@ class ProjectionRegionModel:
             (= REF of the reference row). Index-aligned. Together with
             chromosome/position this identifies the exact reference row, which
             disambiguates multiallelic loci.
+        prs_positions: Genomic position of each PRS variant. Index-aligned with
+            prs_variant_ids/betas. The chromosome is the region's `chromosome`
+            (regions are single-chromosome by construction).
+        prs_effect_alleles: Effect allele of each PRS variant (the allele `beta`
+            is oriented to). Index-aligned with prs_variant_ids/betas.
+        prs_other_alleles: Non-effect allele of each PRS variant (may be None).
+            Index-aligned. Together with position these let a standalone scorer
+            orient the true PRS via match_oriented_dosage instead of assuming
+            effect==ALT at the first reference row.
     """
 
     region_id: str
@@ -486,6 +495,9 @@ class ProjectionRegionModel:
     predictor_positions: List[int] = field(default_factory=list)
     predictor_counted_alleles: List[str] = field(default_factory=list)
     predictor_other_alleles: List[str] = field(default_factory=list)
+    prs_positions: List[int] = field(default_factory=list)
+    prs_effect_alleles: List[str] = field(default_factory=list)
+    prs_other_alleles: List[Optional[str]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert to dictionary, handling numpy arrays.

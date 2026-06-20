@@ -6,7 +6,11 @@ import pytest
 
 from imputed_prs import LinearProjectionPRS
 from imputed_prs.core.exceptions import ModelNotFittedError
-from imputed_prs.core.types import EvaluationMetrics, GenotypeData
+from imputed_prs.core.types import (
+    EvaluationMetrics,
+    GenotypeData,
+    ProjectionRegionModel,
+)
 from imputed_prs.evaluation._scoring import is_hard_called
 from imputed_prs.evaluation.projection_evaluator import ProjectionEvaluator
 
@@ -43,6 +47,24 @@ def synthetic_prs_df():
         "position": [100000, 100500, 101000, 101500, 102000],
         "effect_allele": ["G", "T", "A", "C", "T"],
         "other_allele": ["A", "C", "G", "T", "A"],
+        "beta": [0.1, -0.05, 0.2, 0.15, -0.1],
+    })
+
+
+@pytest.fixture
+def effect_ref_prs_df():
+    """PRS where the missing variant rs5 has effect_allele == reference REF.
+
+    rs5 is A>T in the reference; setting its effect allele to "A" (the REF) forces
+    the true-PRS scorer to flip to (2 - alt_dosage). rs5 is absent from the platform
+    (see platform_variants_partial) so it is scored through the region path.
+    """
+    return pd.DataFrame({
+        "variant_id": ["rs1", "rs2", "rs3", "rs4", "rs5"],
+        "chromosome": ["1", "1", "1", "1", "1"],
+        "position": [100000, 100500, 101000, 101500, 102000],
+        "effect_allele": ["G", "T", "A", "C", "A"],
+        "other_allele": ["A", "C", "G", "T", "T"],
         "beta": [0.1, -0.05, 0.2, 0.15, -0.1],
     })
 
@@ -175,6 +197,123 @@ class TestProjectionEvaluator:
                 expected += dosage * betas[var_id]
 
         assert true_prs[0] == pytest.approx(expected, abs=1e-6)
+
+    def test_true_prs_effect_ref_oriented_and_parity(
+        self, synthetic_vcf_file, effect_ref_prs_df,
+        platform_variants_partial, synthetic_genotype_data,
+    ):
+        """A missing variant with effect==REF is flipped to (2 - alt_dosage)*beta,
+        matching a hand calculation and the imputation evaluator (P2.3 Done-when)."""
+        pytest.importorskip("cyvcf2")
+        from imputed_prs import LinearImputationPRS
+        from imputed_prs.evaluation.evaluator import ImputationEvaluator
+
+        fit_kwargs = dict(
+            reference_genotypes=synthetic_vcf_file,
+            prs_definition=effect_ref_prs_df,
+            platform_variants=platform_variants_partial,
+        )
+        proj = LinearProjectionPRS(
+            window_size=500_000, cv_folds=3, verbose=0, random_state=42
+        )
+        proj.fit(**fit_kwargs)
+        imp = LinearImputationPRS(
+            window_size=500_000, cv_folds=3, verbose=0, random_state=42
+        )
+        imp.fit(**fit_kwargs)
+
+        proj_true = ProjectionEvaluator(proj, verbose=0)._compute_true_prs(
+            synthetic_genotype_data
+        )
+        imp_true = ImputationEvaluator(imp, verbose=0)._compute_true_prs(
+            synthetic_genotype_data
+        )
+
+        # rs5 (effect==REF) must be missing and scored through the region path.
+        assert any("rs5" in rm.prs_variant_ids for rm in proj.region_models)
+        # No variant was dropped, so a hand calc over all 5 is valid below.
+        placed = {v.variant_id for v in proj.observed_variants}
+        for rm in proj.region_models:
+            placed.update(rm.prs_variant_ids)
+        assert placed == set(effect_ref_prs_df["variant_id"])
+
+        # Parity with the allele-correct imputation evaluator.
+        np.testing.assert_allclose(proj_true, imp_true, rtol=0, atol=1e-12)
+
+        # Hand calculation, orienting each variant (effect==REF -> 2 - alt_dosage).
+        vinfo = synthetic_genotype_data.variant_info
+        dm = synthetic_genotype_data.dosage_matrix
+        pos_to_col = {int(p): j for j, p in enumerate(vinfo["position"])}
+        expected = np.zeros(synthetic_genotype_data.n_samples)
+        for _, r in effect_ref_prs_df.iterrows():
+            j = pos_to_col[int(r["position"])]
+            alt_dosage = dm[:, j]
+            oriented = (
+                2.0 - alt_dosage
+                if r["effect_allele"] == vinfo.iloc[j]["ref_allele"]
+                else alt_dosage
+            )
+            expected += oriented * r["beta"]
+        np.testing.assert_allclose(proj_true, expected, rtol=0, atol=1e-12)
+
+        # rs5's flip is observable (raw != flipped for some sample), so the old
+        # un-oriented region path would have produced a different score.
+        assert not np.allclose(dm[:, pos_to_col[102000]], 2.0 - dm[:, pos_to_col[102000]])
+
+    def test_true_prs_multiallelic_selects_correct_alt(self):
+        """At a multiallelic locus the missing variant's effect allele selects the
+        matching ALT row, not the first reference row at that position."""
+        # Two reference rows at locus 1:200000 -> A>G (col 0) and A>T (col 1).
+        dosage_matrix = np.array([
+            [0.0, 2.0],
+            [2.0, 0.0],
+            [1.0, 1.0],
+        ])
+        variant_info = pd.DataFrame({
+            "variant_id": ["1:200000:A:G", "1:200000:A:T"],
+            "chromosome": ["1", "1"],
+            "position": [200000, 200000],
+            "ref_allele": ["A", "A"],
+            "alt_allele": ["G", "T"],
+        })
+        gd = GenotypeData(
+            dosage_matrix=dosage_matrix,
+            variant_info=variant_info,
+            sample_ids=["S0", "S1", "S2"],
+        )
+        # Missing PRS variant targets the SECOND ALT (T) with beta=0.5.
+        region_model = ProjectionRegionModel(
+            region_id="chr1:200000-200000",
+            chromosome="1",
+            start=200000,
+            end=200000,
+            prs_variant_ids=["rs_multi"],
+            betas=np.array([0.5]),
+            predictor_variant_ids=[],
+            coefficients=np.array([]),
+            intercept=0.0,
+            cv_mse=0.0,
+            cv_r2=0.0,
+            is_intercept_only=True,
+            mean_prs_contribution=0.0,
+            predictor_allele_frequencies=np.array([]),
+            prs_positions=[200000],
+            prs_effect_alleles=["T"],
+            prs_other_alleles=["A"],
+        )
+        model = LinearProjectionPRS()
+        model._is_fitted = True
+        model._observed_variants = []
+        model._region_models = [region_model]
+
+        true_prs = ProjectionEvaluator(model, verbose=0)._compute_true_prs(gd)
+
+        # Effect allele T -> A>T row (col 1) dosage [2, 0, 1] * 0.5.
+        np.testing.assert_allclose(
+            true_prs, np.array([1.0, 0.0, 0.5]), rtol=0, atol=1e-12
+        )
+        # The first row (A>G, col 0) would have given [0, 1, 0.5] -> different.
+        assert not np.allclose(true_prs, dosage_matrix[:, 0] * 0.5)
 
     def test_projected_prs_batch_shape(self, fitted_model, synthetic_genotype_data):
         """_compute_projected_prs_batch returns array of shape (n_samples,)."""

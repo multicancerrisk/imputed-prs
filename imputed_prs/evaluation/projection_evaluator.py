@@ -1,7 +1,7 @@
 """ProjectionEvaluator class for evaluating fitted LinearProjectionPRS models."""
 
 from pathlib import Path
-from typing import Dict, List, Set, Union
+from typing import List, Set, Union
 
 import numpy as np
 
@@ -153,27 +153,24 @@ class ProjectionEvaluator:
             valid_mask = ~np.isnan(dosages)
             true_prs[valid_mask] += dosages[valid_mask] * var.beta
 
-        # Region (missing) variant contributions. Region models do not store
-        # per-variant alleles, so these use the first reference row at each locus
-        # (correct for the common effect==ALT biallelic case). The analysis
-        # pipeline avoids this path by scoring the true PRS via the imputation
-        # evaluator, which has full allele information.
-        var_to_idx: Dict[str, int] = {}
-        for idx, row in genotype_data.variant_info.iterrows():
-            var_to_idx.setdefault(row["variant_id"], idx)
-            chrom = str(row["chromosome"]).upper()
-            if chrom.startswith("CHR"):
-                chrom = chrom[3:]
-            var_to_idx.setdefault(f"{chrom}:{int(row['position'])}", idx)
-
+        # Region (missing) variant contributions, effect-allele-oriented per the
+        # stored locus + alleles so effect==REF, strand-flipped, and multiallelic
+        # loci score correctly (parity with the imputation evaluator).
         for region_model in self.model.region_models:
-            for i, var_id in enumerate(region_model.prs_variant_ids):
-                beta = float(region_model.betas[i])
-                idx = var_to_idx.get(var_id)
-                if idx is not None:
-                    dosages = genotype_data.dosage_matrix[:, idx]
-                    valid_mask = ~np.isnan(dosages)
-                    true_prs[valid_mask] += dosages[valid_mask] * beta
+            for i, beta in enumerate(region_model.betas):
+                match = match_oriented_dosage(
+                    region_model.chromosome,
+                    int(region_model.prs_positions[i]),
+                    region_model.prs_effect_alleles[i],
+                    region_model.prs_other_alleles[i],
+                    genotype_data.variant_info, genotype_data.dosage_matrix,
+                    reference_index,
+                )
+                if match is None:
+                    continue
+                dosages = match[1]
+                valid_mask = ~np.isnan(dosages)
+                true_prs[valid_mask] += dosages[valid_mask] * float(beta)
 
         return true_prs
 
