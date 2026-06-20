@@ -29,12 +29,15 @@ def _write_metadata(
     model_name: Optional[str],
     include_variance_scaling: bool,
     training_summary: Optional[Dict[str, Any]],
+    reference_panel_id: Optional[str],
+    training_ancestry: Optional[str],
+    ambiguous_policy: Optional[str],
 ) -> None:
     """Write metadata to HDF5 file."""
     meta = f.create_group("metadata")
 
     # Scalar attributes
-    meta.attrs["format_version"] = "1.0"
+    meta.attrs["format_version"] = "2.0"
     meta.attrs["created_at"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     meta.attrs["n_observed_variants"] = len(observed_variants)
     meta.attrs["n_imputed_variants"] = len(imputed_models)
@@ -46,6 +49,12 @@ def _write_metadata(
     meta.attrs["prs_id"] = prs_id or ""
     meta.attrs["platform_name"] = platform_name or ""
     meta.attrs["genome_build"] = genome_build or ""
+
+    # Provenance scalars (v2). `centering_scaling` is the calibration object,
+    # already stored as `calibration_params_json` below.
+    meta.attrs["reference_panel_id"] = reference_panel_id or ""
+    meta.attrs["training_ancestry"] = training_ancestry or ""
+    meta.attrs["ambiguous_policy"] = ambiguous_policy or ""
 
     # Complex objects stored as JSON datasets
     str_dtype = h5py.string_dtype(encoding='utf-8')
@@ -148,7 +157,13 @@ def _write_coefficients(
     f: h5py.File,
     imputed_models: List[ImputedVariantModel],
 ) -> None:
-    """Write sparse coefficients to HDF5 file."""
+    """Write sparse coefficients to HDF5 file.
+
+    One row per (target, predictor) pair. Each row also carries the predictor's
+    allele metadata (counted/other allele, locus, allele frequency) so a reloaded
+    model can orient raw genotypes (schema v2). Missing metadata is written as
+    ``""`` / ``NaN`` and reconstructed as absent on load.
+    """
     grp = f.create_group("coefficients")
     str_dtype = h5py.string_dtype(encoding='utf-8')
 
@@ -156,23 +171,68 @@ def _write_coefficients(
     target_variant_ids = []
     predictor_variant_ids = []
     coefficients = []
+    predictor_chromosomes = []
+    predictor_positions = []
+    predictor_counted_alleles = []
+    predictor_other_alleles = []
+    predictor_allele_frequencies = []
 
     for model in imputed_models:
-        for pred_id, coef in zip(model.predictor_variant_ids, model.coefficients.tolist()):
+        for i, (pred_id, coef) in enumerate(
+            zip(model.predictor_variant_ids, model.coefficients.tolist())
+        ):
             target_variant_ids.append(model.variant_id)
             predictor_variant_ids.append(pred_id)
             coefficients.append(coef)
+            predictor_chromosomes.append(
+                model.predictor_chromosomes[i]
+                if i < len(model.predictor_chromosomes)
+                else ""
+            )
+            predictor_positions.append(
+                int(model.predictor_positions[i])
+                if i < len(model.predictor_positions)
+                else 0
+            )
+            predictor_counted_alleles.append(
+                model.predictor_counted_alleles[i]
+                if i < len(model.predictor_counted_alleles)
+                else ""
+            )
+            predictor_other_alleles.append(
+                model.predictor_other_alleles[i]
+                if i < len(model.predictor_other_alleles)
+                else ""
+            )
+            predictor_allele_frequencies.append(
+                float(model.predictor_allele_frequencies[i])
+                if i < len(model.predictor_allele_frequencies)
+                else np.nan
+            )
 
     n = len(target_variant_ids)
     if n == 0:
         grp.create_dataset("target_variant_id", shape=(0,), dtype=str_dtype)
         grp.create_dataset("predictor_variant_id", shape=(0,), dtype=str_dtype)
         grp.create_dataset("coefficient", shape=(0,), dtype=np.float64)
+        grp.create_dataset("predictor_chromosome", shape=(0,), dtype=str_dtype)
+        grp.create_dataset("predictor_position", shape=(0,), dtype=np.int64)
+        grp.create_dataset("predictor_counted_allele", shape=(0,), dtype=str_dtype)
+        grp.create_dataset("predictor_other_allele", shape=(0,), dtype=str_dtype)
+        grp.create_dataset("predictor_allele_frequency", shape=(0,), dtype=np.float64)
         return
 
     grp.create_dataset("target_variant_id", data=target_variant_ids, dtype=str_dtype)
     grp.create_dataset("predictor_variant_id", data=predictor_variant_ids, dtype=str_dtype)
     grp.create_dataset("coefficient", data=np.array(coefficients, dtype=np.float64))
+    grp.create_dataset("predictor_chromosome", data=predictor_chromosomes, dtype=str_dtype)
+    grp.create_dataset("predictor_position", data=np.array(predictor_positions, dtype=np.int64))
+    grp.create_dataset("predictor_counted_allele", data=predictor_counted_alleles, dtype=str_dtype)
+    grp.create_dataset("predictor_other_allele", data=predictor_other_alleles, dtype=str_dtype)
+    grp.create_dataset(
+        "predictor_allele_frequency",
+        data=np.array(predictor_allele_frequencies, dtype=np.float64),
+    )
 
 
 def export_to_hdf5(
@@ -187,13 +247,17 @@ def export_to_hdf5(
     model_name: Optional[str] = None,
     include_variance_scaling: bool = True,
     training_summary: Optional[Dict[str, Any]] = None,
+    reference_panel_id: Optional[str] = None,
+    training_ancestry: Optional[str] = None,
+    ambiguous_policy: Optional[str] = None,
     compression: Optional[str] = "gzip",
     compression_opts: Optional[int] = 4,
 ) -> Path:
-    """Export trained imputation model to HDF5 format.
+    """Export trained imputation model to HDF5 format (schema v2.0).
 
-    Creates a single HDF5 file with hierarchical structure for
-    efficient storage and fast Python reloading.
+    Creates a single HDF5 file with hierarchical structure for efficient storage
+    and fast Python reloading. The sparse ``coefficients`` group carries per-predictor
+    allele metadata so a reloaded model can orient raw genotypes.
 
     Args:
         output_path: Path for output HDF5 file.
@@ -207,6 +271,9 @@ def export_to_hdf5(
         model_name: Human-readable model name.
         include_variance_scaling: Whether to include variance/SE components.
         training_summary: Optional summary statistics from training.
+        reference_panel_id: Provenance — reference panel used for training.
+        training_ancestry: Provenance — ancestry of the training cohort.
+        ambiguous_policy: Provenance — palindromic-SNP handling policy.
         compression: Compression filter ("gzip", "lzf", or None).
         compression_opts: Compression level for gzip (0-9).
 
@@ -221,6 +288,7 @@ def export_to_hdf5(
             f, observed_variants, imputed_models, calibration_params,
             evaluation_metrics, platform_name, prs_id, genome_build,
             model_name, include_variance_scaling, training_summary,
+            reference_panel_id, training_ancestry, ambiguous_policy,
         )
         _write_observed_variants(f, observed_variants)
         _write_imputed_variants(f, imputed_models, include_variance_scaling)

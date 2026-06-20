@@ -47,6 +47,11 @@ def sample_imputed_models():
             predictor_variant_ids=["rs1", "rs2"],
             coefficients=np.array([0.3, 0.2]),
             is_intercept_only=False,
+            predictor_chromosomes=["1", "1"],
+            predictor_positions=[100, 200],
+            predictor_counted_alleles=["G", "T"],
+            predictor_other_alleles=["A", "C"],
+            predictor_allele_frequencies=np.array([0.4, 0.3]),
         ),
         ImputedVariantModel(
             variant_id="rs5",
@@ -625,10 +630,16 @@ class TestTableSchemas:
             )
 
             coef_table = pq.read_table(paths["coefficients"])
+            # v2: coefficients carry per-predictor allele metadata.
             expected_columns = {
                 "target_variant_id",
                 "predictor_variant_id",
                 "coefficient",
+                "predictor_chromosome",
+                "predictor_position",
+                "predictor_counted_allele",
+                "predictor_other_allele",
+                "predictor_allele_frequency",
             }
             assert set(coef_table.column_names) == expected_columns
 
@@ -652,6 +663,9 @@ class TestTableSchemas:
                 "prs_id",
                 "platform_name",
                 "genome_build",
+                "reference_panel_id",
+                "training_ancestry",
+                "ambiguous_policy",
                 "n_observed_variants",
                 "n_imputed_variants",
                 "n_intercept_only",
@@ -661,6 +675,32 @@ class TestTableSchemas:
                 "training_summary_json",
             }
             assert set(metadata_table.column_names) == expected_columns
+
+    def test_coefficients_predictor_metadata_values(self, sample_imputed_models):
+        """v2 coefficients store per-predictor allele metadata, index-aligned."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "test_model"
+            paths = export_to_parquet(
+                output_path=output_path,
+                observed_variants=[],
+                imputed_models=sample_imputed_models,
+            )
+
+            coef = pq.read_table(paths["coefficients"]).to_pandas()
+            rs4 = coef[coef["target_variant_id"] == "rs4"].reset_index(drop=True)
+            assert list(rs4["predictor_variant_id"]) == ["rs1", "rs2"]
+            assert list(rs4["predictor_counted_allele"]) == ["G", "T"]
+            assert list(rs4["predictor_other_allele"]) == ["A", "C"]
+            assert list(rs4["predictor_chromosome"].astype(str)) == ["1", "1"]
+            assert list(rs4["predictor_position"]) == [100, 200]
+            np.testing.assert_allclose(
+                rs4["predictor_allele_frequency"], [0.4, 0.3], rtol=0, atol=1e-12
+            )
+            np.testing.assert_allclose(
+                rs4["coefficient"], [0.3, 0.2], rtol=0, atol=1e-12
+            )
+            # rs5 is intercept-only -> contributes no coefficient rows.
+            assert "rs5" not in set(coef["target_variant_id"])
 
 
 class TestCoefficientsSparseRepresentation:
@@ -960,7 +1000,7 @@ class TestMetadata:
             )
 
             metadata_df = pq.read_table(paths["metadata"]).to_pandas()
-            assert metadata_df["format_version"].iloc[0] == "1.0"
+            assert metadata_df["format_version"].iloc[0] == "2.0"
 
     def test_created_at_timestamp_present(
         self, sample_observed_variants, sample_imputed_models

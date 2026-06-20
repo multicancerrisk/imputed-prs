@@ -42,7 +42,12 @@ from imputed_prs.io.exporters import (
     export_to_parquet,
     export_variant_table,
 )
-from imputed_prs.io.loaders import load_model_hdf5
+from imputed_prs.io.loaders import (
+    load_model_arrow,
+    load_model_csv,
+    load_model_hdf5,
+    load_model_parquet,
+)
 from imputed_prs.io.prs_loader import load_prs_from_dataframe, load_prs_from_file
 from imputed_prs.io.user_genotypes import (
     load_raw_user_genotypes,
@@ -884,6 +889,11 @@ class LinearImputationPRS:
             "model_name": effective_model_name,
             "include_variance_scaling": include_variance_scaling,
             "training_summary": training_summary,
+            # Provenance is consumed by the JSON/HDF5/Arrow/Parquet exporters (the
+            # flat CSV per-variant table is written separately and carries none).
+            "reference_panel_id": self._reference_panel_id,
+            "training_ancestry": self._training_ancestry,
+            "ambiguous_policy": self._ambiguous_policy,
         }
 
         # Valid formats
@@ -901,16 +911,7 @@ class LinearImputationPRS:
         for fmt in formats:
             if fmt == "json":
                 output_path = output_dir / f"{effective_model_name}.json"
-                # Provenance params are JSON-only (v2); the shared common_kwargs is
-                # also consumed by the HDF5/Arrow/CSV exporters, which do not accept
-                # them yet (P1.5b).
-                export_to_json(
-                    output_path=output_path,
-                    reference_panel_id=self._reference_panel_id,
-                    training_ancestry=self._training_ancestry,
-                    ambiguous_policy=self._ambiguous_policy,
-                    **common_kwargs,
-                )
+                export_to_json(output_path=output_path, **common_kwargs)
                 output_paths["json"] = output_path
 
             elif fmt == "arrow":
@@ -946,7 +947,8 @@ class LinearImputationPRS:
         """Load a trained model from file.
 
         Args:
-            path: Path to saved model file (HDF5 or JSON format).
+            path: Path to a saved model — an ``.h5``/``.hdf5``, ``.json``, ``.arrow``
+                or ``*_variants.csv`` file, or a Parquet export directory.
 
         Returns:
             Loaded LinearImputationPRS instance ready for prediction.
@@ -959,6 +961,10 @@ class LinearImputationPRS:
         if not path.exists():
             raise DataLoadError(f"Model file not found: {path}")
 
+        # A Parquet export is a directory of per-table .parquet files.
+        if path.is_dir():
+            return cls._load_from_parquet(path)
+
         # Detect format by extension
         suffix = path.suffix.lower()
 
@@ -966,47 +972,91 @@ class LinearImputationPRS:
             return cls._load_from_hdf5(path)
         elif suffix == ".json":
             return cls._load_from_json(path)
+        elif suffix == ".arrow":
+            return cls._load_from_arrow(path)
+        elif suffix == ".csv":
+            return cls._load_from_csv(path)
         else:
             raise DataLoadError(
-                f"Unsupported model file format: {suffix}. "
-                "Supported formats: .h5, .hdf5, .json"
+                f"Unsupported model file format: {suffix}. Supported formats: "
+                ".h5, .hdf5, .json, .arrow, .csv, or a Parquet export directory."
             )
 
     @classmethod
-    def _load_from_hdf5(cls, path: Path) -> "LinearImputationPRS":
-        """Load model from HDF5 file."""
-        try:
-            observed, imputed, calib, metrics, metadata = load_model_hdf5(path)
-        except Exception as e:
-            raise DataLoadError(f"Failed to load HDF5 model: {e}") from e
+    def _from_components(
+        cls,
+        observed: List[VariantInfo],
+        imputed: List[ImputedVariantModel],
+        calib: Optional[CalibrationParams],
+        metrics: Optional[EvaluationMetrics],
+        metadata: Dict[str, Any],
+    ) -> "LinearImputationPRS":
+        """Build a fitted instance from loaded components + identity/provenance.
 
-        # Create instance with default parameters
+        Shared by the HDF5/Arrow/Parquet/CSV load paths. Normalizes empty-string
+        metadata (HDF5 stores ``""`` for absent optional strings) to ``None`` and
+        restores the provenance fields when present.
+        """
+
+        def _clean(value: Any) -> Optional[str]:
+            if value is None or value == "":
+                return None
+            return value
+
         instance = cls()
-
-        # Populate fitted state
         instance._is_fitted = True
         instance._observed_variants = observed
         instance._imputed_models = imputed
         instance._calibration_params = calib
         instance._evaluation_metrics = metrics
 
-        # Populate metadata from loaded file
-        instance._prs_id = metadata.get("prs_id") or None
-        instance._platform_name = metadata.get("platform_name") or None
-        instance._genome_build = metadata.get("genome_build") or None
-        instance._model_name = metadata.get("model_name") or None
-
-        # Handle empty string values from HDF5
-        if instance._prs_id == "":
-            instance._prs_id = None
-        if instance._platform_name == "":
-            instance._platform_name = None
-        if instance._genome_build == "":
-            instance._genome_build = None
-        if instance._model_name == "":
-            instance._model_name = None
+        instance._prs_id = _clean(metadata.get("prs_id"))
+        instance._platform_name = _clean(metadata.get("platform_name"))
+        instance._genome_build = _clean(metadata.get("genome_build"))
+        instance._model_name = _clean(metadata.get("model_name"))
+        instance._reference_panel_id = _clean(metadata.get("reference_panel_id"))
+        instance._training_ancestry = _clean(metadata.get("training_ancestry"))
+        ambiguous_policy = _clean(metadata.get("ambiguous_policy"))
+        if ambiguous_policy:
+            instance._ambiguous_policy = ambiguous_policy
 
         return instance
+
+    @classmethod
+    def _load_from_hdf5(cls, path: Path) -> "LinearImputationPRS":
+        """Load model from HDF5 file."""
+        try:
+            components = load_model_hdf5(path)
+        except Exception as e:
+            raise DataLoadError(f"Failed to load HDF5 model: {e}") from e
+        return cls._from_components(*components)
+
+    @classmethod
+    def _load_from_arrow(cls, path: Path) -> "LinearImputationPRS":
+        """Load model from Arrow IPC file."""
+        try:
+            components = load_model_arrow(path)
+        except Exception as e:
+            raise DataLoadError(f"Failed to load Arrow model: {e}") from e
+        return cls._from_components(*components)
+
+    @classmethod
+    def _load_from_parquet(cls, path: Path) -> "LinearImputationPRS":
+        """Load model from a Parquet export directory."""
+        try:
+            components = load_model_parquet(path)
+        except Exception as e:
+            raise DataLoadError(f"Failed to load Parquet model: {e}") from e
+        return cls._from_components(*components)
+
+    @classmethod
+    def _load_from_csv(cls, path: Path) -> "LinearImputationPRS":
+        """Load model from the CSV per-variant table + companion coefficients."""
+        try:
+            components = load_model_csv(path)
+        except Exception as e:
+            raise DataLoadError(f"Failed to load CSV model: {e}") from e
+        return cls._from_components(*components)
 
     @classmethod
     def _load_from_json(cls, path: Path) -> "LinearImputationPRS":

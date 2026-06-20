@@ -28,15 +28,21 @@ def _build_metadata_table(
     model_name: Optional[str],
     include_variance_scaling: bool,
     training_summary: Optional[Dict[str, Any]],
+    reference_panel_id: Optional[str],
+    training_ancestry: Optional[str],
+    ambiguous_policy: Optional[str],
 ) -> pa.Table:
     """Build metadata as a single-row table."""
     data = {
-        "format_version": ["1.0"],
+        "format_version": ["2.0"],
         "created_at": [datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")],
         "model_name": [model_name],
         "prs_id": [prs_id],
         "platform_name": [platform_name],
         "genome_build": [genome_build],
+        "reference_panel_id": [reference_panel_id],
+        "training_ancestry": [training_ancestry],
+        "ambiguous_policy": [ambiguous_policy],
         "n_observed_variants": [len(observed_variants)],
         "n_imputed_variants": [len(imputed_models)],
         "n_intercept_only": [sum(1 for m in imputed_models if m.is_intercept_only)],
@@ -130,27 +136,67 @@ def _build_imputed_variants_table(
 def _build_coefficients_table(
     imputed_models: List[ImputedVariantModel],
 ) -> pa.Table:
-    """Build sparse coefficients table (one row per predictor-target pair)."""
+    """Build sparse coefficients table (one row per predictor-target pair).
+
+    Each row carries the predictor's allele metadata (counted/other allele, locus,
+    allele frequency) so a reloaded model can orient raw genotypes (schema v2).
+    Missing metadata is written as ""/NaN and reconstructed as absent on load.
+    """
     target_variant_ids = []
     predictor_variant_ids = []
     coefficients = []
+    predictor_chromosomes = []
+    predictor_positions = []
+    predictor_counted_alleles = []
+    predictor_other_alleles = []
+    predictor_allele_frequencies = []
 
     for model in imputed_models:
-        for pred_id, coef in zip(
-            model.predictor_variant_ids, model.coefficients.tolist()
+        for i, (pred_id, coef) in enumerate(
+            zip(model.predictor_variant_ids, model.coefficients.tolist())
         ):
             target_variant_ids.append(model.variant_id)
             predictor_variant_ids.append(pred_id)
             coefficients.append(coef)
+            predictor_chromosomes.append(
+                model.predictor_chromosomes[i]
+                if i < len(model.predictor_chromosomes)
+                else ""
+            )
+            predictor_positions.append(
+                int(model.predictor_positions[i])
+                if i < len(model.predictor_positions)
+                else 0
+            )
+            predictor_counted_alleles.append(
+                model.predictor_counted_alleles[i]
+                if i < len(model.predictor_counted_alleles)
+                else ""
+            )
+            predictor_other_alleles.append(
+                model.predictor_other_alleles[i]
+                if i < len(model.predictor_other_alleles)
+                else ""
+            )
+            predictor_allele_frequencies.append(
+                float(model.predictor_allele_frequencies[i])
+                if i < len(model.predictor_allele_frequencies)
+                else float("nan")
+            )
 
     if not target_variant_ids:
         schema = pa.schema([
             ("target_variant_id", pa.string()),
             ("predictor_variant_id", pa.string()),
             ("coefficient", pa.float64()),
+            ("predictor_chromosome", pa.string()),
+            ("predictor_position", pa.int64()),
+            ("predictor_counted_allele", pa.string()),
+            ("predictor_other_allele", pa.string()),
+            ("predictor_allele_frequency", pa.float64()),
         ])
         return pa.Table.from_pydict(
-            {"target_variant_id": [], "predictor_variant_id": [], "coefficient": []},
+            {f.name: [] for f in schema},
             schema=schema,
         )
 
@@ -158,6 +204,11 @@ def _build_coefficients_table(
         "target_variant_id": target_variant_ids,
         "predictor_variant_id": predictor_variant_ids,
         "coefficient": coefficients,
+        "predictor_chromosome": predictor_chromosomes,
+        "predictor_position": predictor_positions,
+        "predictor_counted_allele": predictor_counted_alleles,
+        "predictor_other_allele": predictor_other_alleles,
+        "predictor_allele_frequency": predictor_allele_frequencies,
     })
 
 
@@ -173,11 +224,15 @@ def export_to_arrow(
     model_name: Optional[str] = None,
     include_variance_scaling: bool = True,
     training_summary: Optional[Dict[str, Any]] = None,
+    reference_panel_id: Optional[str] = None,
+    training_ancestry: Optional[str] = None,
+    ambiguous_policy: Optional[str] = None,
 ) -> Path:
-    """Export trained imputation model to Arrow IPC format.
+    """Export trained imputation model to Arrow IPC format (schema v2.0).
 
-    Creates an Arrow IPC file containing multiple record batches for
-    efficient in-memory access and inter-process communication.
+    Creates an Arrow IPC file containing multiple record batches for efficient
+    in-memory access and inter-process communication. The sparse ``coefficients``
+    table carries per-predictor allele metadata for allele-aware reloading.
 
     Args:
         output_path: Path for output Arrow file.
@@ -191,6 +246,9 @@ def export_to_arrow(
         model_name: Human-readable model name.
         include_variance_scaling: Whether to include variance/SE components.
         training_summary: Optional summary statistics from training.
+        reference_panel_id: Provenance — reference panel used for training.
+        training_ancestry: Provenance — ancestry of the training cohort.
+        ambiguous_policy: Provenance — palindromic-SNP handling policy.
 
     Returns:
         Path to the created Arrow file.
@@ -210,6 +268,9 @@ def export_to_arrow(
         model_name,
         include_variance_scaling,
         training_summary,
+        reference_panel_id,
+        training_ancestry,
+        ambiguous_policy,
     )
     observed_table = _build_observed_variants_table(observed_variants)
     imputed_table = _build_imputed_variants_table(
@@ -256,12 +317,16 @@ def export_to_parquet(
     model_name: Optional[str] = None,
     include_variance_scaling: bool = True,
     training_summary: Optional[Dict[str, Any]] = None,
+    reference_panel_id: Optional[str] = None,
+    training_ancestry: Optional[str] = None,
+    ambiguous_policy: Optional[str] = None,
     compression: str = "snappy",
 ) -> Dict[str, Path]:
-    """Export trained imputation model to Parquet format.
+    """Export trained imputation model to Parquet format (schema v2.0).
 
-    Creates multiple Parquet files (one per table) for efficient
-    columnar storage with compression.
+    Creates multiple Parquet files (one per table) for efficient columnar storage
+    with compression. The sparse ``coefficients`` table carries per-predictor allele
+    metadata for allele-aware reloading.
 
     Args:
         output_path: Base path for output (directory will be created).
@@ -275,6 +340,9 @@ def export_to_parquet(
         model_name: Human-readable model name.
         include_variance_scaling: Whether to include variance/SE components.
         training_summary: Optional summary statistics from training.
+        reference_panel_id: Provenance — reference panel used for training.
+        training_ancestry: Provenance — ancestry of the training cohort.
+        ambiguous_policy: Provenance — palindromic-SNP handling policy.
         compression: Compression codec ("snappy", "gzip", "zstd", "none").
 
     Returns:
@@ -295,6 +363,9 @@ def export_to_parquet(
         model_name,
         include_variance_scaling,
         training_summary,
+        reference_panel_id,
+        training_ancestry,
+        ambiguous_policy,
     )
     observed_table = _build_observed_variants_table(observed_variants)
     imputed_table = _build_imputed_variants_table(

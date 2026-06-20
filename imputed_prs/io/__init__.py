@@ -38,7 +38,13 @@ from imputed_prs.io.exporters.json_export import export_to_json
 from imputed_prs.io.exporters.arrow_export import export_to_arrow, export_to_parquet
 from imputed_prs.io.exporters.hdf5_export import export_to_hdf5
 from imputed_prs.io.exporters.csv_export import export_variant_table
-from imputed_prs.io.loaders import load_model_hdf5, load_model_json
+from imputed_prs.io.loaders import (
+    load_model_hdf5,
+    load_model_json,
+    load_model_arrow,
+    load_model_parquet,
+    load_model_csv,
+)
 
 __all__ = [
     # PRS loader
@@ -79,4 +85,7 @@ __all__ = [
     # Loaders
     "load_model_hdf5",
     "load_model_json",
+    "load_model_arrow",
+    "load_model_parquet",
+    "load_model_csv",
 ]

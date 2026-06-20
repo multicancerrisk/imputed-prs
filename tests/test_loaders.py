@@ -16,6 +16,11 @@ from imputed_prs.core.types import (
     ImputedVariantModel,
     VariantInfo,
 )
+from imputed_prs.io.exporters.arrow_export import (
+    export_to_arrow,
+    export_to_parquet,
+)
+from imputed_prs.io.exporters.csv_export import export_variant_table
 from imputed_prs.io.exporters.hdf5_export import export_to_hdf5
 from imputed_prs.io.exporters.json_export import export_to_json
 from imputed_prs.io.loaders import load_model_hdf5, load_model_json
@@ -728,7 +733,7 @@ class TestMetadataLoading:
 
             _, _, _, _, meta = load_model_hdf5(hdf5_path)
 
-            assert meta["format_version"] == "1.0"
+            assert meta["format_version"] == "2.0"
             assert meta["platform_name"] == "test_platform"
             assert meta["prs_id"] == "PGS000001"
             assert meta["genome_build"] == "GRCh38"
@@ -901,3 +906,186 @@ class TestJSONv2RoundTrip:
         assert loaded._platform_name == "23andme_v5"
         assert loaded._reference_panel_id is None
         assert loaded._training_ancestry is None
+
+
+class TestV2FormatRoundTrip:
+    """Export -> ``load()`` -> oriented-score round trip for the non-JSON v2 formats.
+
+    Mirrors ``TestJSONv2RoundTrip.test_json_round_trip_via_predict`` for HDF5, Arrow,
+    Parquet and CSV: the teeth is score-equivalence on ``compute_imputed_prs_oriented``,
+    which indexes the predictor allele metadata, so a loader that dropped it would
+    mis-score or ``IndexError``.
+    """
+
+    @staticmethod
+    def _model():
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.1)]
+        imputed = [
+            ImputedVariantModel(
+                variant_id="rs4", chromosome="1", position=150,
+                effect_allele="A", other_allele="G", beta=0.05,
+                allele_frequency=0.3, imputation_r2=0.8, residual_variance=0.1,
+                intercept=0.6, predictor_variant_ids=["rs1", "rs2"],
+                coefficients=np.array([0.3, 0.2]), is_intercept_only=False,
+                predictor_chromosomes=["1", "1"], predictor_positions=[100, 200],
+                predictor_counted_alleles=["G", "T"],
+                predictor_other_alleles=["A", "C"],
+                predictor_allele_frequencies=np.array([0.4, 0.3]),
+            ),
+            ImputedVariantModel(
+                variant_id="rs5", chromosome="2", position=400,
+                effect_allele="T", other_allele="C", beta=0.02,
+                allele_frequency=0.5, imputation_r2=0.0, residual_variance=0.5,
+                intercept=1.0, predictor_variant_ids=[],
+                coefficients=np.array([]), is_intercept_only=True,
+            ),
+        ]
+        return observed, imputed
+
+    @staticmethod
+    def _export(fmt, tmpdir, observed, imputed):
+        prov = dict(
+            platform_name="23andme_v5", prs_id="PGS000004", genome_build="GRCh37",
+            reference_panel_id="1000G_phase3_EUR", training_ancestry="EUR",
+            ambiguous_policy="exclude_unless_platform_strand_known",
+        )
+        d = Path(tmpdir)
+        if fmt == "hdf5":
+            path = d / "model.h5"
+            export_to_hdf5(path, observed_variants=observed,
+                           imputed_models=imputed, **prov)
+        elif fmt == "arrow":
+            path = d / "model.arrow"
+            export_to_arrow(path, observed_variants=observed,
+                            imputed_models=imputed, **prov)
+        elif fmt == "parquet":
+            path = d / "model_parquet"  # parquet export is a directory
+            export_to_parquet(path, observed_variants=observed,
+                              imputed_models=imputed, **prov)
+        elif fmt == "csv":
+            path = d / "model_variants.csv"  # CSV carries no provenance by design
+            export_variant_table(path, observed_variants=observed,
+                                 imputed_models=imputed)
+        else:  # pragma: no cover
+            raise ValueError(fmt)
+        return path
+
+    @pytest.mark.parametrize("fmt", ["hdf5", "arrow", "parquet", "csv"])
+    def test_round_trip_via_predict(self, fmt):
+        observed, imputed = self._model()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._export(fmt, tmpdir, observed, imputed)
+            loaded = LinearImputationPRS.load(path)
+
+        loaded_rs4 = next(
+            m for m in loaded._imputed_models if m.variant_id == "rs4"
+        )
+        orig_rs4 = imputed[0]
+
+        # Exact reconstruction of ids / alleles / structure.
+        assert loaded_rs4.predictor_variant_ids == orig_rs4.predictor_variant_ids
+        assert loaded_rs4.predictor_chromosomes == orig_rs4.predictor_chromosomes
+        assert loaded_rs4.predictor_positions == orig_rs4.predictor_positions
+        assert (
+            loaded_rs4.predictor_counted_alleles
+            == orig_rs4.predictor_counted_alleles
+        )
+        assert (
+            loaded_rs4.predictor_other_alleles == orig_rs4.predictor_other_alleles
+        )
+        assert loaded_rs4.is_intercept_only == orig_rs4.is_intercept_only
+
+        # Allclose for floats.
+        np.testing.assert_allclose(
+            loaded_rs4.coefficients, orig_rs4.coefficients, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            loaded_rs4.predictor_allele_frequencies,
+            orig_rs4.predictor_allele_frequencies, rtol=0, atol=1e-12,
+        )
+
+        # Intercept-only model reconstructs with empty predictor metadata.
+        loaded_rs5 = next(
+            m for m in loaded._imputed_models if m.variant_id == "rs5"
+        )
+        assert loaded_rs5.is_intercept_only
+        assert loaded_rs5.predictor_counted_alleles == []
+
+        # Score-equivalence on the oriented (raw-genotype) path.
+        raw = load_raw_user_genotypes(
+            pd.DataFrame(
+                {
+                    "rsid": ["rs1", "rs2"],
+                    "chrom": ["1", "1"],
+                    "pos": [100, 200],
+                    "genotype": ["AG", "TT"],
+                }
+            )
+        )
+        orig_score = compute_imputed_prs_oriented(
+            raw, imputed, allow_ambiguous=True
+        )
+        loaded_score = compute_imputed_prs_oriented(
+            raw, loaded._imputed_models, allow_ambiguous=True
+        )
+        np.testing.assert_allclose(
+            orig_score[0], loaded_score[0], rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            orig_score[1], loaded_score[1], rtol=0, atol=1e-12
+        )
+
+    @pytest.mark.parametrize("fmt", ["hdf5", "arrow", "parquet"])
+    def test_provenance_restored(self, fmt):
+        """HDF5/Arrow/Parquet restore provenance through ``load()``."""
+        observed, imputed = self._model()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._export(fmt, tmpdir, observed, imputed)
+            loaded = LinearImputationPRS.load(path)
+
+        assert loaded._genome_build == "GRCh37"
+        assert loaded._platform_name == "23andme_v5"
+        assert loaded._reference_panel_id == "1000G_phase3_EUR"
+        assert loaded._training_ancestry == "EUR"
+        assert loaded._ambiguous_policy == "exclude_unless_platform_strand_known"
+
+    def test_csv_carries_no_provenance(self):
+        """CSV is a flat variant table: provenance/calibration are not stored."""
+        observed, imputed = self._model()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = self._export("csv", tmpdir, observed, imputed)
+            loaded = LinearImputationPRS.load(path)
+
+        assert loaded._reference_panel_id is None
+        assert loaded._training_ancestry is None
+        assert loaded._calibration_params is None
+
+    def test_v1_hdf5_without_predictor_metadata_loads(self):
+        """A legacy v1 HDF5 (no predictor allele metadata datasets) still loads."""
+        observed, imputed = self._model()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "v1.h5"
+            export_to_hdf5(
+                path, observed_variants=observed, imputed_models=imputed
+            )
+            # Simulate a legacy v1 artifact: drop the v2 predictor metadata datasets.
+            with h5py.File(path, "r+") as f:
+                for name in (
+                    "predictor_chromosome",
+                    "predictor_position",
+                    "predictor_counted_allele",
+                    "predictor_other_allele",
+                    "predictor_allele_frequency",
+                ):
+                    del f["coefficients"][name]
+                f["metadata"].attrs["format_version"] = "1.0"
+            loaded = LinearImputationPRS.load(path)
+
+        rs4 = next(m for m in loaded._imputed_models if m.variant_id == "rs4")
+        # ids/coefficients still restored; predictor allele metadata stays empty.
+        assert rs4.predictor_variant_ids == ["rs1", "rs2"]
+        np.testing.assert_allclose(
+            rs4.coefficients, [0.3, 0.2], rtol=0, atol=1e-12
+        )
+        assert rs4.predictor_counted_alleles == []
+        assert rs4.predictor_allele_frequencies.size == 0

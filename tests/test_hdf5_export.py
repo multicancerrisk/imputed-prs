@@ -45,6 +45,11 @@ def sample_imputed_models():
             predictor_variant_ids=["rs1", "rs2"],
             coefficients=np.array([0.3, 0.2]),
             is_intercept_only=False,
+            predictor_chromosomes=["1", "1"],
+            predictor_positions=[100, 200],
+            predictor_counted_alleles=["G", "T"],
+            predictor_other_alleles=["A", "C"],
+            predictor_allele_frequencies=np.array([0.4, 0.3]),
         ),
         ImputedVariantModel(
             variant_id="rs5",
@@ -382,13 +387,56 @@ class TestGroupStructure:
             )
 
             with h5py.File(output_path, "r") as f:
+                # v2: coefficients carry per-predictor allele metadata.
                 expected_datasets = {
                     "target_variant_id",
                     "predictor_variant_id",
                     "coefficient",
+                    "predictor_chromosome",
+                    "predictor_position",
+                    "predictor_counted_allele",
+                    "predictor_other_allele",
+                    "predictor_allele_frequency",
                 }
                 actual_datasets = set(f["coefficients"].keys())
                 assert actual_datasets == expected_datasets
+
+    def test_coefficients_predictor_metadata_values(
+        self, sample_observed_variants, sample_imputed_models
+    ):
+        """v2 coefficients store per-predictor allele metadata, index-aligned."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "test_model.h5"
+            export_to_hdf5(
+                output_path=output_path,
+                observed_variants=sample_observed_variants,
+                imputed_models=sample_imputed_models,
+            )
+
+            with h5py.File(output_path, "r") as f:
+                grp = f["coefficients"]
+                targets = [v.decode("utf-8") for v in grp["target_variant_id"][:]]
+                preds = [v.decode("utf-8") for v in grp["predictor_variant_id"][:]]
+                counted = [
+                    v.decode("utf-8") for v in grp["predictor_counted_allele"][:]
+                ]
+                other = [
+                    v.decode("utf-8") for v in grp["predictor_other_allele"][:]
+                ]
+                chroms = [
+                    v.decode("utf-8") for v in grp["predictor_chromosome"][:]
+                ]
+                positions = grp["predictor_position"][:].tolist()
+                afs = grp["predictor_allele_frequency"][:]
+
+            # Only rs4 has predictors: rs1 (G/A) and rs2 (T/C); rs5 is intercept-only.
+            assert targets == ["rs4", "rs4"]
+            assert preds == ["rs1", "rs2"]
+            assert counted == ["G", "T"]
+            assert other == ["A", "C"]
+            assert chroms == ["1", "1"]
+            assert positions == [100, 200]
+            np.testing.assert_allclose(afs, [0.4, 0.3], rtol=0, atol=1e-12)
 
 
 class TestRoundTrip:
@@ -564,7 +612,7 @@ class TestMetadataAttributes:
 
             with h5py.File(output_path, "r") as f:
                 meta = f["metadata"]
-                assert meta.attrs["format_version"] == "1.0"
+                assert meta.attrs["format_version"] == "2.0"
                 assert meta.attrs["n_observed_variants"] == 3
                 assert meta.attrs["n_imputed_variants"] == 2
                 assert meta.attrs["n_intercept_only"] == 1
@@ -573,6 +621,10 @@ class TestMetadataAttributes:
                 assert meta.attrs["prs_id"] == "PGS000004"
                 assert meta.attrs["genome_build"] == "GRCh37"
                 assert meta.attrs["model_name"] == "Test Model"
+                # v2 provenance attrs exist (empty when not supplied).
+                assert meta.attrs["reference_panel_id"] == ""
+                assert meta.attrs["training_ancestry"] == ""
+                assert meta.attrs["ambiguous_policy"] == ""
 
     def test_format_version_present(
         self, sample_observed_variants, sample_imputed_models
@@ -587,7 +639,7 @@ class TestMetadataAttributes:
             )
 
             with h5py.File(output_path, "r") as f:
-                assert f["metadata"].attrs["format_version"] == "1.0"
+                assert f["metadata"].attrs["format_version"] == "2.0"
 
     def test_created_at_timestamp_present(
         self, sample_observed_variants, sample_imputed_models

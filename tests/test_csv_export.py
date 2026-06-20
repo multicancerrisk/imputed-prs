@@ -11,7 +11,11 @@ from imputed_prs.core.types import (
     ImputedVariantModel,
     VariantInfo,
 )
-from imputed_prs.io.exporters.csv_export import export_variant_table
+from imputed_prs.io.exporters.csv_export import (
+    COEFFICIENTS_COLUMNS,
+    coefficients_path_for,
+    export_variant_table,
+)
 
 
 @pytest.fixture
@@ -42,6 +46,11 @@ def sample_imputed_models():
             predictor_variant_ids=["rs1", "rs2"],
             coefficients=np.array([0.3, 0.2]),
             is_intercept_only=False,
+            predictor_chromosomes=["1", "1"],
+            predictor_positions=[100, 200],
+            predictor_counted_alleles=["G", "T"],
+            predictor_other_alleles=["A", "C"],
+            predictor_allele_frequencies=np.array([0.4, 0.3]),
         ),
         ImputedVariantModel(
             variant_id="rs5",
@@ -551,3 +560,57 @@ class TestColumnOrder:
                 "predictor_variant_ids",
             ]
             assert list(df.columns) == expected_order
+
+
+class TestCompanionCoefficients:
+    """Tests for the companion long-format coefficients CSV (schema v2)."""
+
+    def test_companion_file_written_with_predictor_metadata(
+        self, sample_observed_variants, sample_imputed_models
+    ):
+        """The companion *_coefficients.csv carries per-predictor allele metadata."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "model_variants.csv"
+            export_variant_table(
+                output_path=output_path,
+                observed_variants=sample_observed_variants,
+                imputed_models=sample_imputed_models,
+            )
+
+            coef_path = coefficients_path_for(output_path)
+            assert coef_path.name == "model_coefficients.csv"
+            assert coef_path.exists()
+
+            coef = pd.read_csv(coef_path)
+            assert list(coef.columns) == COEFFICIENTS_COLUMNS
+
+            # rs4 has predictors rs1 (G/A) and rs2 (T/C); rs5 is intercept-only.
+            rs4 = coef[coef["target_variant_id"] == "rs4"].reset_index(drop=True)
+            assert list(rs4["predictor_variant_id"]) == ["rs1", "rs2"]
+            assert list(rs4["predictor_counted_allele"]) == ["G", "T"]
+            assert list(rs4["predictor_other_allele"]) == ["A", "C"]
+            assert list(rs4["predictor_chromosome"].astype(str)) == ["1", "1"]
+            assert list(rs4["predictor_position"]) == [100, 200]
+            np.testing.assert_allclose(
+                rs4["predictor_allele_frequency"], [0.4, 0.3], rtol=0, atol=1e-12
+            )
+            np.testing.assert_allclose(
+                rs4["coefficient"], [0.3, 0.2], rtol=0, atol=1e-12
+            )
+            assert "rs5" not in set(coef["target_variant_id"])
+
+    def test_companion_file_header_only_without_predictors(
+        self, sample_observed_variants
+    ):
+        """With no imputed predictors the companion is a header-only table."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "model_variants.csv"
+            export_variant_table(
+                output_path=output_path,
+                observed_variants=sample_observed_variants,
+                imputed_models=[],
+            )
+
+            coef = pd.read_csv(coefficients_path_for(output_path))
+            assert list(coef.columns) == COEFFICIENTS_COLUMNS
+            assert len(coef) == 0
