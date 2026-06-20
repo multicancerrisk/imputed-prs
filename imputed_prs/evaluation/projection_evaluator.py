@@ -1,7 +1,7 @@
 """ProjectionEvaluator class for evaluating fitted LinearProjectionPRS models."""
 
 from pathlib import Path
-from typing import Dict, Optional, Set, Union
+from typing import Dict, List, Set, Union
 
 import numpy as np
 
@@ -9,6 +9,13 @@ from imputed_prs.core.exceptions import ModelNotFittedError
 from imputed_prs.core.types import (
     EvaluationMetrics,
     GenotypeData,
+)
+from imputed_prs.evaluation._scoring import (
+    NeededVariant,
+    is_hard_called,
+    iter_sample_collections,
+    observed_component_numeric,
+    oriented_predictor_matrix,
 )
 from imputed_prs.evaluation.metrics import compute_prs_metrics
 from imputed_prs.io.genotype_loader import load_genotypes
@@ -171,75 +178,107 @@ class ProjectionEvaluator:
         return true_prs
 
     def _compute_projected_prs_batch(self, genotype_data: GenotypeData) -> np.ndarray:
-        """Compute projected PRS for all samples using ProjectionPredictor.
+        """Compute predicted (observed + projected) PRS for all samples.
 
-        For each sample, extracts platform dosages and computes the
-        projected PRS using the model's predictor.
+        Routes through the same allele-oriented semantics as the browser/upload
+        path so train/eval and browser cannot diverge (P1.6):
+
+        - **hard-called** integer dosages → render genotype strings per sample and
+          replay ``ProjectionPredictor.predict`` (the literal upload path);
+        - **continuous** DS/GP dosages → a role-aware numeric scorer that orients
+          each predictor via ``match_oriented_dosage`` from the stored P1.3 allele
+          metadata.
+
+        The two paths agree on integer biallelic data (golden test in
+        ``tests/test_round_trip.py``).
 
         Args:
             genotype_data: GenotypeData containing all samples.
 
         Returns:
-            Array of projected PRS values (n_samples,).
+            Array of predicted PRS values (n_samples,).
         """
-        from imputed_prs.core.harmonizer import (
-            build_reference_allele_index,
-            match_oriented_dosage,
-        )
+        if is_hard_called(genotype_data.dosage_matrix):
+            return self._predicted_prs_via_strings(genotype_data)
+        return self._predicted_prs_numeric(genotype_data)
 
+    def _needed_for_render(self) -> List[NeededVariant]:
+        """Variants the string scorer must resolve: observed terms (effect/other)
+        plus every region predictor (counted/other from P1.3 metadata). The PRS
+        target variants are predicted from the predictors, not read as inputs."""
+        needed: List[NeededVariant] = []
+        for var in self.model.observed_variants:
+            needed.append(
+                (
+                    var.variant_id,
+                    var.chromosome,
+                    var.position,
+                    var.effect_allele,
+                    var.other_allele,
+                )
+            )
+        for model in self.model.region_models:
+            if model.is_intercept_only:
+                continue
+            for i, pred_id in enumerate(model.predictor_variant_ids):
+                needed.append(
+                    (
+                        pred_id,
+                        model.predictor_chromosomes[i],
+                        model.predictor_positions[i],
+                        model.predictor_counted_alleles[i],
+                        model.predictor_other_alleles[i],
+                    )
+                )
+        return needed
+
+    def _predicted_prs_via_strings(self, genotype_data: GenotypeData) -> np.ndarray:
+        """Hard-call path: render genotype strings per sample and replay the
+        browser scorer (observed + projected in one oriented ``predict`` call)."""
+        needed = self._needed_for_render()
+        predictor = ProjectionPredictor(
+            observed_variants=self.model.observed_variants,
+            region_models=self.model.region_models,
+            calibration_params=None,  # evaluation scores the raw, uncalibrated model
+        )
+        predicted = np.zeros(genotype_data.n_samples)
+        for sample_idx, collection in enumerate(
+            iter_sample_collections(genotype_data, needed)
+        ):
+            result = predictor.predict(
+                {}, apply_calibration=False, raw_genotypes=collection
+            )
+            predicted[sample_idx] = result.prs
+        return predicted
+
+    def _predicted_prs_numeric(self, genotype_data: GenotypeData) -> np.ndarray:
+        """Continuous path: orient observed and predictor dosages numerically via
+        ``match_oriented_dosage`` and run the region regression (no clipping — the
+        projection target is a PRS contribution, not a dosage)."""
+        from imputed_prs.core.harmonizer import build_reference_allele_index
+
+        reference_index = build_reference_allele_index(genotype_data.variant_info)
         n_samples = genotype_data.n_samples
 
-        # Observed component: effect-allele-oriented dosages (consistent with the
-        # oriented true PRS used in evaluation and with the oriented projection
-        # targets the region models were trained on).
-        reference_index = build_reference_allele_index(genotype_data.variant_info)
-        observed_prs = np.zeros(n_samples)
-        for var in self.model.observed_variants:
-            match = match_oriented_dosage(
-                var.chromosome, var.position, var.effect_allele, var.other_allele,
-                genotype_data.variant_info, genotype_data.dosage_matrix,
-                reference_index,
-            )
-            if match is None:
-                continue
-            dosages = match[1]
-            valid_mask = ~np.isnan(dosages)
-            observed_prs[valid_mask] += dosages[valid_mask] * var.beta
-
-        # Projected component: predict each region's S_R from raw platform
-        # dosages (predictors kept raw, matching how the models were trained).
-        var_to_idx: Dict[str, int] = {}
-        for idx, row in genotype_data.variant_info.iterrows():
-            var_to_idx.setdefault(row["variant_id"], idx)
-            chrom = str(row["chromosome"]).upper()
-            if chrom.startswith("CHR"):
-                chrom = chrom[3:]
-            var_to_idx.setdefault(f"{chrom}:{int(row['position'])}", idx)
-
-        predictor_ids: Set[str] = set()
-        for region_model in self.model.region_models:
-            predictor_ids.update(region_model.predictor_variant_ids)
-
-        # Observed variants are scored above (oriented); the predictor only
-        # contributes the projected component here.
-        predictor = ProjectionPredictor(
-            observed_variants=[],
-            region_models=self.model.region_models,
-            calibration_params=None,
+        predicted = observed_component_numeric(
+            genotype_data, reference_index, self.model.observed_variants
         )
 
-        projected_component = np.zeros(n_samples)
-        for sample_idx in range(n_samples):
-            user_dosages: Dict[str, Optional[float]] = {}
-            for var_id in predictor_ids:
-                geno_idx = var_to_idx.get(var_id)
-                if geno_idx is not None:
-                    dosage = genotype_data.dosage_matrix[sample_idx, geno_idx]
-                    user_dosages[var_id] = None if np.isnan(dosage) else float(dosage)
-                else:
-                    user_dosages[var_id] = None
+        for model in self.model.region_models:
+            if model.is_intercept_only or not model.predictor_variant_ids:
+                predicted += float(model.intercept)
+            else:
+                z = oriented_predictor_matrix(
+                    genotype_data,
+                    reference_index,
+                    model.predictor_chromosomes,
+                    model.predictor_positions,
+                    model.predictor_counted_alleles,
+                    model.predictor_other_alleles,
+                    model.predictor_allele_frequencies,
+                )
+                predicted += z @ np.asarray(model.coefficients, dtype=np.float64) + float(
+                    model.intercept
+                )
 
-            result = predictor.predict(user_dosages, apply_calibration=False)
-            projected_component[sample_idx] = result.prs
-
-        return observed_prs + projected_component
+        return predicted

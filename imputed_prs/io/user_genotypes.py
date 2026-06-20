@@ -234,6 +234,57 @@ def count_allele(
     return None
 
 
+def render_genotype_string(
+    ref_allele: object,
+    alt_allele: object,
+    dosage: object,
+    *,
+    tol: float = 1e-9,
+) -> Optional[str]:
+    """Render a diploid genotype string from a biallelic locus and an ALT dosage.
+
+    The inverse of :func:`count_allele` for hard-called (integer) dosages: given a
+    reference row's ``ref``/``alt`` alleles and an ALT-allele count ``dosage`` in
+    ``{0, 1, 2}``, return the two-allele genotype string (``ref+ref`` / ``ref+alt``
+    / ``alt+alt``). It lets the evaluators replay the browser string scorer over a
+    hard-called reference panel (P1.6), so the evaluation path is literally the
+    upload path.
+
+    The rendered string is *raw* (ALT-counted), never effect-oriented: callers
+    count a role-specific allele from it via :func:`count_allele`, which re-orients
+    per role. Rendering an already-oriented dosage would double-orient.
+
+    Args:
+        ref_allele: Reference allele (single A/C/G/T base).
+        alt_allele: Alternate allele (single A/C/G/T base).
+        dosage: ALT-allele count; only an integer 0/1/2 (within ``tol``) renders.
+        tol: Absolute tolerance for treating ``dosage`` as an integer.
+
+    Returns:
+        The genotype string, or ``None`` when the dosage is missing / non-integer /
+        out of ``[0, 2]`` or the alleles are not a clean, distinct A/C/G/T pair.
+    """
+    if dosage is None:
+        return None
+    try:
+        d = float(dosage)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(d):
+        return None
+    n_alt = round(d)
+    if abs(d - n_alt) > tol or n_alt < 0 or n_alt > 2:
+        return None
+
+    ref = str(ref_allele).strip().upper()
+    alt = str(alt_allele).strip().upper()
+    if ref not in _VALID_BASES or alt not in _VALID_BASES or ref == alt:
+        return None
+
+    n_alt = int(n_alt)
+    return ref * (2 - n_alt) + alt * n_alt
+
+
 def detect_genome_build(input_data: Union[str, Path, "SNPs"]) -> Optional[int]:
     """Detect genome build from user genotype data.
 

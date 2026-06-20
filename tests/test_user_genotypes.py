@@ -17,6 +17,7 @@ from imputed_prs.io.user_genotypes import (
     load_raw_user_genotypes,
     load_user_genotype_strings,
     load_user_genotypes,
+    render_genotype_string,
 )
 
 
@@ -519,6 +520,49 @@ class TestCountAllele:
 
     def test_numeric_cell_unresolved(self):
         assert count_allele(12.0, "A", "G", allow_ambiguous=False, allow_strand_flip=False) is None
+
+
+class TestRenderGenotypeString:
+    """render_genotype_string is the inverse of count_allele for integer dosages."""
+
+    def test_renders_homozygous_and_het(self):
+        # dosage counts ALT: 0 -> ref/ref, 1 -> ref/alt, 2 -> alt/alt.
+        assert render_genotype_string("A", "G", 0) == "AA"
+        assert render_genotype_string("A", "G", 1) == "AG"
+        assert render_genotype_string("A", "G", 2) == "GG"
+
+    def test_round_trips_with_count_allele(self):
+        # Rendering then counting the ALT allele recovers the dosage; counting the
+        # REF allele recovers 2 - dosage. This is the train/eval == browser bridge.
+        for ref, alt in [("A", "G"), ("G", "A"), ("C", "T"), ("A", "T")]:
+            for d in (0, 1, 2):
+                geno = render_genotype_string(ref, alt, d)
+                assert geno is not None
+                assert count_allele(
+                    geno, alt, ref, allow_ambiguous=True, allow_strand_flip=True
+                ) == float(d)
+                assert count_allele(
+                    geno, ref, alt, allow_ambiguous=True, allow_strand_flip=True
+                ) == float(2 - d)
+
+    def test_accepts_float_and_numpy_dosage(self):
+        assert render_genotype_string("A", "G", 1.0) == "AG"
+        assert render_genotype_string("A", "G", np.float32(2.0)) == "GG"
+        assert render_genotype_string("a", "g", 1) == "AG"  # alleles upper-cased
+
+    def test_missing_or_noninteger_dosage_is_none(self):
+        assert render_genotype_string("A", "G", np.nan) is None
+        assert render_genotype_string("A", "G", None) is None
+        assert render_genotype_string("A", "G", 0.7) is None  # continuous -> no string
+        assert render_genotype_string("A", "G", 1.3) is None
+        assert render_genotype_string("A", "G", -1) is None
+        assert render_genotype_string("A", "G", 3) is None
+
+    def test_invalid_alleles_is_none(self):
+        assert render_genotype_string("A", "A", 1) is None  # degenerate pair
+        assert render_genotype_string("A", "I", 1) is None  # indel/non-base
+        assert render_genotype_string("", "G", 0) is None
+        assert render_genotype_string("AG", "C", 1) is None  # multi-base allele
 
 
 class TestLoadUserGenotypeStrings:

@@ -7,6 +7,7 @@ import pytest
 from imputed_prs import LinearProjectionPRS
 from imputed_prs.core.exceptions import ModelNotFittedError
 from imputed_prs.core.types import EvaluationMetrics, GenotypeData
+from imputed_prs.evaluation._scoring import is_hard_called
 from imputed_prs.evaluation.projection_evaluator import ProjectionEvaluator
 
 
@@ -93,6 +94,46 @@ def synthetic_genotype_data():
         variant_info=variant_info,
         sample_ids=sample_ids,
     )
+
+
+@pytest.fixture
+def continuous_genotype_data():
+    """GenotypeData with continuous (DS-style) dosages -> the numeric scorer path."""
+    dosage_matrix = np.random.default_rng(123).uniform(0.0, 2.0, size=(20, 5))
+    variant_info = pd.DataFrame({
+        "variant_id": ["rs1", "rs2", "rs3", "rs4", "rs5"],
+        "chromosome": ["1", "1", "1", "1", "1"],
+        "position": [100000, 100500, 101000, 101500, 102000],
+        "ref_allele": ["A", "C", "G", "T", "A"],
+        "alt_allele": ["G", "T", "A", "C", "T"],
+    })
+    return GenotypeData(
+        dosage_matrix=dosage_matrix,
+        variant_info=variant_info,
+        sample_ids=[f"SAMPLE{i+1}" for i in range(20)],
+    )
+
+
+class TestProjectionEvaluatorDosageModes:
+    """evaluate() works for both hard-called and continuous reference dosages."""
+
+    def test_evaluate_continuous_dosages(self, fitted_model, continuous_genotype_data):
+        # Continuous dosages cannot be rendered to strings -> numeric scorer path.
+        assert not is_hard_called(continuous_genotype_data.dosage_matrix)
+        metrics = ProjectionEvaluator(fitted_model, verbose=0).evaluate(
+            continuous_genotype_data
+        )
+        assert isinstance(metrics, EvaluationMetrics)
+        assert np.isfinite(metrics.mae) and metrics.mae >= 0
+        assert np.isfinite(metrics.rmse) and metrics.rmse >= 0
+
+    def test_evaluate_hardcalled_dosages(self, fitted_model, synthetic_genotype_data):
+        # Integer dosages -> string-render replay of the browser scorer.
+        assert is_hard_called(synthetic_genotype_data.dosage_matrix)
+        metrics = ProjectionEvaluator(fitted_model, verbose=0).evaluate(
+            synthetic_genotype_data
+        )
+        assert isinstance(metrics, EvaluationMetrics)
 
 
 # =============================================================================
