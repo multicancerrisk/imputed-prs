@@ -109,6 +109,12 @@ class TestImputedVariantModel:
         assert model.predictor_variant_ids == []
         assert len(model.coefficients) == 0
         assert model.is_intercept_only is False
+        # Predictor allele metadata defaults to empty, index-aligned arrays.
+        assert model.predictor_chromosomes == []
+        assert model.predictor_positions == []
+        assert model.predictor_counted_alleles == []
+        assert model.predictor_other_alleles == []
+        assert len(model.predictor_allele_frequencies) == 0
 
     def test_to_dict_serialization(self):
         """Test that to_dict converts numpy arrays to lists."""
@@ -126,10 +132,22 @@ class TestImputedVariantModel:
             predictor_variant_ids=["rs100"],
             coefficients=np.array([0.2, 0.3, 0.4]),
             is_intercept_only=False,
+            predictor_chromosomes=["1"],
+            predictor_positions=[11000],
+            predictor_counted_alleles=["T"],
+            predictor_other_alleles=["C"],
+            predictor_allele_frequencies=np.array([0.25]),
         )
         d = model.to_dict()
         assert d["coefficients"] == [0.2, 0.3, 0.4]
         assert isinstance(d["coefficients"], list)
+        # Predictor allele metadata round-trips; the AF array becomes a list.
+        assert d["predictor_chromosomes"] == ["1"]
+        assert d["predictor_positions"] == [11000]
+        assert d["predictor_counted_alleles"] == ["T"]
+        assert d["predictor_other_alleles"] == ["C"]
+        assert d["predictor_allele_frequencies"] == [0.25]
+        assert isinstance(d["predictor_allele_frequencies"], list)
 
     def test_intercept_only_model(self):
         """Test intercept-only model configuration."""

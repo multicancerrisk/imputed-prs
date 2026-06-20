@@ -36,6 +36,8 @@ def create_test_data(
         "variant_id": [f"rs{1000 + i}" for i in range(n_platform_variants)],
         "chromosome": ["1"] * n_platform_variants,
         "position": [10000 + i * 1000 for i in range(n_platform_variants)],
+        "ref_allele": ["ACGT"[i % 4] for i in range(n_platform_variants)],
+        "alt_allele": ["ACGT"[(i + 1) % 4] for i in range(n_platform_variants)],
     })
 
     # Create missing variants (targets) with some relationship to predictors
@@ -123,6 +125,44 @@ class TestImputationModelTrainer:
             # beta should match input
             prs_row = prs_variants[prs_variants["variant_id"] == var_id].iloc[0]
             assert model.beta == prs_row["beta"]
+
+    def test_predictor_allele_metadata(self):
+        """Trained models expose index-aligned predictor allele metadata."""
+        Z, X, prs_variants, platform_variant_info = create_test_data(
+            n_samples=200,
+            n_platform_variants=50,
+            n_missing_variants=5,
+        )
+
+        trainer = ImputationModelTrainer(window_size=100_000, random_state=42)
+        result = trainer.fit_all_variants(Z, X, prs_variants, platform_variant_info)
+
+        # Expected per-id allele/locus lookup from the reference rows.
+        info_by_id = platform_variant_info.set_index("variant_id")
+
+        n_with_predictors = 0
+        for model in result.models.values():
+            n_pred = len(model.predictor_variant_ids)
+            # All predictor metadata is index-aligned with predictor_variant_ids.
+            assert len(model.predictor_chromosomes) == n_pred
+            assert len(model.predictor_positions) == n_pred
+            assert len(model.predictor_counted_alleles) == n_pred
+            assert len(model.predictor_other_alleles) == n_pred
+            assert len(model.predictor_allele_frequencies) == n_pred
+
+            if n_pred > 0:
+                n_with_predictors += 1
+            for i, pred_id in enumerate(model.predictor_variant_ids):
+                row = info_by_id.loc[pred_id]
+                # Z counts ALT: counted == alt_allele, other == ref_allele.
+                assert model.predictor_counted_alleles[i] == row["alt_allele"]
+                assert model.predictor_other_alleles[i] == row["ref_allele"]
+                assert model.predictor_chromosomes[i] == str(row["chromosome"])
+                assert model.predictor_positions[i] == int(row["position"])
+                assert 0.0 <= model.predictor_allele_frequencies[i] <= 1.0
+
+        # The fixture is built so at least some variants have predictors.
+        assert n_with_predictors > 0
 
     def test_cv_predictions_shape(self):
         """Test that CV predictions have correct shape."""
@@ -225,6 +265,8 @@ class TestEdgeCases:
             "variant_id": [f"rs{i}" for i in range(10)],
             "chromosome": ["1"] * 10,
             "position": [1_000_000 + i * 1000 for i in range(10)],  # Far away
+            "ref_allele": ["A"] * 10,
+            "alt_allele": ["G"] * 10,
         })
 
         # Missing variant at position 100
@@ -259,6 +301,8 @@ class TestEdgeCases:
             "variant_id": [f"rs{i}" for i in range(10)],
             "chromosome": ["1"] * 10,
             "position": list(range(10)),
+            "ref_allele": ["A"] * 10,
+            "alt_allele": ["G"] * 10,
         })
 
         trainer = ImputationModelTrainer()
@@ -278,6 +322,8 @@ class TestEdgeCases:
             "variant_id": [f"rs{i}" for i in range(20)],
             "chromosome": ["1"] * 20,
             "position": [1000 + i * 100 for i in range(20)],
+            "ref_allele": ["A"] * 20,
+            "alt_allele": ["G"] * 20,
         })
 
         # Target with all NaN
@@ -323,6 +369,8 @@ class TestInputValidation:
             "variant_id": [f"rs{i}" for i in range(10)],
             "chromosome": ["1"] * 10,
             "position": list(range(10)),
+            "ref_allele": ["A"] * 10,
+            "alt_allele": ["G"] * 10,
         })
 
         trainer = ImputationModelTrainer()
@@ -370,6 +418,8 @@ class TestInputValidation:
             "variant_id": [f"rs{i}" for i in range(10)],
             "chromosome": ["1"] * 10,
             "position": list(range(10)),
+            "ref_allele": ["A"] * 10,
+            "alt_allele": ["G"] * 10,
         })
 
         trainer = ImputationModelTrainer()
@@ -394,6 +444,8 @@ class TestInputValidation:
             "variant_id": [f"rs{i}" for i in range(10)],
             "chromosome": ["1"] * 10,
             "position": list(range(10)),
+            "ref_allele": ["A"] * 10,
+            "alt_allele": ["G"] * 10,
         })
 
         trainer = ImputationModelTrainer()
@@ -418,6 +470,8 @@ class TestInputValidation:
             "variant_id": [f"rs{i}" for i in range(5)],
             "chromosome": ["1"] * 5,
             "position": list(range(5)),
+            "ref_allele": ["A"] * 5,
+            "alt_allele": ["G"] * 5,
         })
 
         trainer = ImputationModelTrainer()
@@ -462,6 +516,8 @@ class TestComputations:
             "variant_id": [f"rs{i}" for i in range(20)],
             "chromosome": ["1"] * 20,
             "position": [1000 + i * 100 for i in range(20)],
+            "ref_allele": ["A"] * 20,
+            "alt_allele": ["G"] * 20,
         })
 
         prs_variants = pd.DataFrame({
@@ -553,8 +609,20 @@ class TestConvertToImputedModel:
 
         target_dosages = np.array([0.0, 1.0, 2.0])  # Mean = 1.0, AF = 0.5
         predictor_ids = ["rs1", "rs2"]
+        predictor_rows = pd.DataFrame({
+            "variant_id": ["rs1", "rs2"],
+            "chromosome": ["1", "1"],
+            "position": [900, 1100],
+            "ref_allele": ["A", "C"],
+            "alt_allele": ["G", "T"],
+        })
+        # Column means: rs1 -> 1.0 (AF 0.5), rs2 -> 2/3 (AF 1/3)
+        predictor_dosages = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 2.0]])
 
-        model = _convert_to_imputed_model(variant_row, result, predictor_ids, target_dosages)
+        model = _convert_to_imputed_model(
+            variant_row, result, predictor_ids, target_dosages,
+            predictor_rows, predictor_dosages,
+        )
 
         assert model.variant_id == "rs123"
         assert model.chromosome == "1"
@@ -568,6 +636,12 @@ class TestConvertToImputedModel:
         assert model.predictor_variant_ids == ["rs1", "rs2"]
         assert np.allclose(model.coefficients, [0.1, 0.2])
         assert model.is_intercept_only is False
+        # Predictor allele metadata: Z counts ALT, so counted=alt, other=ref.
+        assert model.predictor_chromosomes == ["1", "1"]
+        assert model.predictor_positions == [900, 1100]
+        assert model.predictor_counted_alleles == ["G", "T"]
+        assert model.predictor_other_alleles == ["A", "C"]
+        assert np.allclose(model.predictor_allele_frequencies, [0.5, 1.0 / 3.0])
 
     def test_convert_with_none_other_allele(self):
         """Test conversion when other_allele is None."""
@@ -595,11 +669,24 @@ class TestConvertToImputedModel:
 
         target_dosages = np.array([0.0, 1.0, 2.0])
         predictor_ids = []
+        predictor_rows = pd.DataFrame(
+            columns=["variant_id", "chromosome", "position", "ref_allele", "alt_allele"]
+        )
+        predictor_dosages = np.empty((3, 0))
 
-        model = _convert_to_imputed_model(variant_row, result, predictor_ids, target_dosages)
+        model = _convert_to_imputed_model(
+            variant_row, result, predictor_ids, target_dosages,
+            predictor_rows, predictor_dosages,
+        )
 
         assert model.other_allele is None
         assert model.is_intercept_only is True
+        # Intercept-only model: predictor metadata arrays are all empty.
+        assert model.predictor_chromosomes == []
+        assert model.predictor_positions == []
+        assert model.predictor_counted_alleles == []
+        assert model.predictor_other_alleles == []
+        assert len(model.predictor_allele_frequencies) == 0
 
 
 class TestMaxPredictors:

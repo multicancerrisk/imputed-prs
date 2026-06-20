@@ -244,6 +244,10 @@ class TestProjectionRegionModel:
             is_intercept_only=False,
             mean_prs_contribution=0.42,
             predictor_allele_frequencies=np.array([0.3, 0.4, 0.25]),
+            predictor_chromosomes=["1", "1", "1"],
+            predictor_positions=[1_500_000, 2_000_000, 2_500_000],
+            predictor_counted_alleles=["A", "C", "G"],
+            predictor_other_alleles=["G", "T", "A"],
         )
         d = model.to_dict()
 
@@ -255,6 +259,11 @@ class TestProjectionRegionModel:
         assert d["predictor_allele_frequencies"] == pytest.approx([0.3, 0.4, 0.25])
         assert d["region_id"] == "chr1:1000000-3000000"
         assert d["is_intercept_only"] is False
+        # Predictor allele metadata (index-aligned with coefficients) round-trips.
+        assert d["predictor_chromosomes"] == ["1", "1", "1"]
+        assert d["predictor_positions"] == [1_500_000, 2_000_000, 2_500_000]
+        assert d["predictor_counted_alleles"] == ["A", "C", "G"]
+        assert d["predictor_other_alleles"] == ["G", "T", "A"]
 
     def test_region_id_format(self):
         """region_id follows 'chr{chrom}:{start}-{end}' format."""
@@ -275,6 +284,11 @@ class TestProjectionRegionModel:
             predictor_allele_frequencies=np.array([]),
         )
         assert model.region_id == f"chr{model.chromosome}:{model.start}-{model.end}"
+        # New predictor allele metadata defaults to empty lists.
+        assert model.predictor_chromosomes == []
+        assert model.predictor_positions == []
+        assert model.predictor_counted_alleles == []
+        assert model.predictor_other_alleles == []
 
 
 class TestProjectionTrainingResult:

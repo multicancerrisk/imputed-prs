@@ -290,6 +290,8 @@ class LinearProjectionPRS:
                     "variant_id": row["variant_id"],
                     "chromosome": row["chromosome"],
                     "position": row["position"],
+                    "ref_allele": row["ref_allele"],
+                    "alt_allele": row["alt_allele"],
                 })
             elif var_id.lower() in geno_var_to_idx:
                 idx = geno_var_to_idx[var_id.lower()]
@@ -299,6 +301,8 @@ class LinearProjectionPRS:
                     "variant_id": row["variant_id"],
                     "chromosome": row["chromosome"],
                     "position": row["position"],
+                    "ref_allele": row["ref_allele"],
+                    "alt_allele": row["alt_allele"],
                 })
 
         if platform_variant_rows:
@@ -306,7 +310,7 @@ class LinearProjectionPRS:
             Z = genotype_data.dosage_matrix[:, platform_variant_indices]
         else:
             platform_variant_info = pd.DataFrame(
-                columns=["variant_id", "chromosome", "position"]
+                columns=["variant_id", "chromosome", "position", "ref_allele", "alt_allele"]
             )
             Z = np.empty((genotype_data.n_samples, 0))
 

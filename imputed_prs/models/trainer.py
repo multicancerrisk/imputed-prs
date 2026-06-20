@@ -41,14 +41,22 @@ def _convert_to_imputed_model(
     result: SingleVariantModelResult,
     predictor_ids: List[str],
     target_dosages: np.ndarray,
+    predictor_rows: pd.DataFrame,
+    predictor_dosages: np.ndarray,
 ) -> ImputedVariantModel:
     """Convert SingleVariantModelResult to ImputedVariantModel.
 
     Args:
         variant_row: Row from prs_variants DataFrame with variant info.
         result: Result from fit_single_variant_model.
-        predictor_ids: List of predictor variant IDs.
+        predictor_ids: List of predictor variant IDs (index-aligned with
+            predictor_rows / the columns of predictor_dosages).
         target_dosages: Target dosage values for computing allele frequency.
+        predictor_rows: Platform reference rows backing each predictor (the Z
+            columns), with columns chromosome/position/ref_allele/alt_allele.
+            Z counts the ALT allele, so counted=alt_allele, other=ref_allele.
+        predictor_dosages: Predictor dosage columns (n_samples, n_predictors),
+            used to compute the counted-allele frequency of each predictor.
 
     Returns:
         ImputedVariantModel with all fields populated.
@@ -72,6 +80,22 @@ def _convert_to_imputed_model(
     if pd.isna(other_allele):
         other_allele = None
 
+    # Derive index-aligned predictor allele metadata from the reference rows
+    # backing each Z column. Z counts the ALT allele, so counted=alt, other=ref.
+    # The counted-allele frequency is the mean predictor dosage / 2.
+    if len(predictor_ids) > 0:
+        predictor_chromosomes = [str(c) for c in predictor_rows["chromosome"].tolist()]
+        predictor_positions = [int(p) for p in predictor_rows["position"].tolist()]
+        predictor_counted_alleles = [str(a) for a in predictor_rows["alt_allele"].tolist()]
+        predictor_other_alleles = [str(a) for a in predictor_rows["ref_allele"].tolist()]
+        predictor_allele_frequencies = np.nanmean(predictor_dosages, axis=0) / 2.0
+    else:
+        predictor_chromosomes = []
+        predictor_positions = []
+        predictor_counted_alleles = []
+        predictor_other_alleles = []
+        predictor_allele_frequencies = np.array([])
+
     return ImputedVariantModel(
         variant_id=variant_row["variant_id"],
         chromosome=str(variant_row["chromosome"]),
@@ -86,6 +110,11 @@ def _convert_to_imputed_model(
         predictor_variant_ids=predictor_ids,
         coefficients=result.coefficients,
         is_intercept_only=result.is_intercept_only,
+        predictor_chromosomes=predictor_chromosomes,
+        predictor_positions=predictor_positions,
+        predictor_counted_alleles=predictor_counted_alleles,
+        predictor_other_alleles=predictor_other_alleles,
+        predictor_allele_frequencies=predictor_allele_frequencies,
     )
 
 
@@ -175,14 +204,16 @@ def _fit_one_variant(
             max_variants=max_predictors,
         )
 
-        # Extract predictor dosages
+        # Extract predictor dosages and the reference rows backing each Z column
         if window_result.n_variants > 0:
             predictor_dosages = Z[:, window_result.variant_indices]
             predictor_ids = window_result.variant_ids
+            predictor_rows = platform_variant_info.iloc[window_result.variant_indices]
         else:
             # No predictors in window - will result in intercept-only model
             predictor_dosages = np.empty((Z.shape[0], 0))
             predictor_ids = []
+            predictor_rows = platform_variant_info.iloc[[]]
 
         # Fit model
         result = fit_single_variant_model(
@@ -200,6 +231,8 @@ def _fit_one_variant(
             result=result,
             predictor_ids=predictor_ids,
             target_dosages=target_dosages,
+            predictor_rows=predictor_rows,
+            predictor_dosages=predictor_dosages,
         )
 
         return (variant_idx, model, result.cv_predictions, result.is_intercept_only)
@@ -281,7 +314,9 @@ class ImputationModelTrainer:
             )
 
         # Check required columns in platform_variant_info
-        required_platform_cols = ["variant_id", "chromosome", "position"]
+        required_platform_cols = [
+            "variant_id", "chromosome", "position", "ref_allele", "alt_allele"
+        ]
         missing_platform_cols = [
             c for c in required_platform_cols if c not in platform_variant_info.columns
         ]
@@ -327,7 +362,8 @@ class ImputationModelTrainer:
                 variant_id, chromosome, position, effect_allele, beta.
                 Optional: other_allele.
             platform_variant_info: DataFrame with platform variant information.
-                Required columns: variant_id, chromosome, position.
+                Required columns: variant_id, chromosome, position, ref_allele,
+                alt_allele.
 
         Returns:
             TrainingResult containing trained models, CV predictions, and summary.

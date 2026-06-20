@@ -318,6 +318,65 @@ class TestLinearImputationPRSFitWithPlatformVariants:
         not Path("/usr/bin/python3").exists(),
         reason="VCF parsing requires cyvcf2"
     )
+    def test_fit_threads_predictor_allele_metadata(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """fit() threads ALT-counted predictor allele metadata to each model.
+
+        P1.3: every imputed model must expose, per predictor, the reference row
+        backing its Z column (counted=ALT, other=REF) plus chr/pos/AF, index-
+        aligned with the coefficients.
+        """
+        pytest.importorskip("cyvcf2")
+
+        model = LinearImputationPRS(
+            window_size=500_000,
+            cv_folds=3,
+            tuning_scope="none",
+            verbose=0,
+            random_state=42,
+        )
+        model.fit(
+            reference_genotypes=synthetic_vcf_file,
+            prs_definition=synthetic_prs_df,
+            platform_variants=platform_variants_partial,
+        )
+
+        # Reference rows from the synthetic VCF: (chrom, pos, ALT, REF).
+        expected = {
+            "rs1": ("1", 100000, "G", "A"),
+            "rs2": ("1", 100500, "T", "C"),
+            "rs3": ("1", 101000, "A", "G"),
+        }
+
+        n_with_predictors = 0
+        for m in model._imputed_models:
+            n_pred = len(m.predictor_variant_ids)
+            # All predictor metadata is index-aligned with predictor_variant_ids.
+            assert len(m.predictor_chromosomes) == n_pred
+            assert len(m.predictor_positions) == n_pred
+            assert len(m.predictor_counted_alleles) == n_pred
+            assert len(m.predictor_other_alleles) == n_pred
+            assert len(m.predictor_allele_frequencies) == n_pred
+
+            if n_pred > 0:
+                n_with_predictors += 1
+            for i, pred_id in enumerate(m.predictor_variant_ids):
+                chrom, pos, counted, other = expected[pred_id]
+                assert m.predictor_chromosomes[i] == chrom
+                assert m.predictor_positions[i] == pos
+                # Z counts ALT: counted == VCF ALT, other == VCF REF.
+                assert m.predictor_counted_alleles[i] == counted
+                assert m.predictor_other_alleles[i] == other
+                assert 0.0 <= m.predictor_allele_frequencies[i] <= 1.0
+
+        # rs4 and rs5 are imputed and have rs1-rs3 as in-window predictors.
+        assert n_with_predictors > 0
+
+    @pytest.mark.skipif(
+        not Path("/usr/bin/python3").exists(),
+        reason="VCF parsing requires cyvcf2"
+    )
     def test_fit_with_platform_variants_returns_self(
         self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
     ):

@@ -435,6 +435,8 @@ class TestFullPipelineSimulation:
             "variant_id": [f"rs_plat_{i}" for i in range(n_platform)],
             "chromosome": ["1"] * n_platform,
             "position": [i * 1000 for i in range(n_platform)],
+            "ref_allele": ["A"] * n_platform,
+            "alt_allele": ["G"] * n_platform,
         })
 
         missing_info = pd.DataFrame({
@@ -525,6 +527,8 @@ class TestFullPipelineSimulation:
             "variant_id": [f"rs_plat_{i}" for i in range(n_platform)],
             "chromosome": ["1"] * n_platform,
             "position": [i * 1000 for i in range(n_platform)],
+            "ref_allele": ["A"] * n_platform,
+            "alt_allele": ["G"] * n_platform,
         })
 
         missing_info = pd.DataFrame({
@@ -1020,6 +1024,8 @@ class TestRealDataValidation:
             "variant_id": [f"rs_p{i}" for i in range(n_platform)],
             "chromosome": ["1"] * n_platform,
             "position": list(range(0, n_platform * 1000, 1000)),
+            "ref_allele": ["A"] * n_platform,
+            "alt_allele": ["G"] * n_platform,
         })
 
         trainer = ImputationModelTrainer(

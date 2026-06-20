@@ -70,7 +70,8 @@ def _find_platform_variants_in_region(
 
     Args:
         region: The genomic region to search within.
-        platform_variant_info: DataFrame with columns: variant_id, chromosome, position.
+        platform_variant_info: DataFrame with columns: variant_id, chromosome,
+            position, ref_allele, alt_allele.
         max_predictors: Maximum number of predictors. If set, select the closest
             to region center. None means no limit.
 
@@ -165,14 +166,26 @@ def _fit_one_region(
             random_state=random_state,
         )
 
-        # Compute predictor allele frequencies
+        # Compute predictor allele frequencies and the reference-row allele
+        # metadata backing each Z column. Z counts the ALT allele, so the
+        # counted allele is alt_allele and the other allele is ref_allele;
+        # the counted-allele frequency is the mean predictor dosage / 2.
         if len(platform_indices) > 0:
             predictor_afs = np.array([
                 float(np.nanmean(Z[:, idx]) / 2.0)
                 for idx in platform_indices
             ])
+            predictor_rows = platform_variant_info.iloc[platform_indices]
+            predictor_chromosomes = [str(c) for c in predictor_rows["chromosome"].tolist()]
+            predictor_positions = [int(p) for p in predictor_rows["position"].tolist()]
+            predictor_counted_alleles = [str(a) for a in predictor_rows["alt_allele"].tolist()]
+            predictor_other_alleles = [str(a) for a in predictor_rows["ref_allele"].tolist()]
         else:
             predictor_afs = np.array([])
+            predictor_chromosomes = []
+            predictor_positions = []
+            predictor_counted_alleles = []
+            predictor_other_alleles = []
 
         # Wrap into ProjectionRegionModel
         model = ProjectionRegionModel(
@@ -190,6 +203,10 @@ def _fit_one_region(
             is_intercept_only=result.is_intercept_only,
             mean_prs_contribution=float(np.nanmean(target)),
             predictor_allele_frequencies=predictor_afs,
+            predictor_chromosomes=predictor_chromosomes,
+            predictor_positions=predictor_positions,
+            predictor_counted_alleles=predictor_counted_alleles,
+            predictor_other_alleles=predictor_other_alleles,
         )
 
         return (region_id, model, result.cv_predictions, result.is_intercept_only)
@@ -259,7 +276,9 @@ class ProjectionRegionTrainer:
             )
 
         # Check required columns in platform_variant_info
-        required_platform_cols = ["variant_id", "chromosome", "position"]
+        required_platform_cols = [
+            "variant_id", "chromosome", "position", "ref_allele", "alt_allele"
+        ]
         missing_platform_cols = [
             c for c in required_platform_cols if c not in platform_variant_info.columns
         ]
@@ -302,7 +321,7 @@ class ProjectionRegionTrainer:
             prs_variants: DataFrame for missing PRS variants with columns:
                 variant_id, chromosome, position, effect_allele, beta.
             platform_variant_info: DataFrame with columns:
-                variant_id, chromosome, position.
+                variant_id, chromosome, position, ref_allele, alt_allele.
 
         Returns:
             ProjectionTrainingResult with trained region models and CV predictions.

@@ -106,6 +106,18 @@ class ImputedVariantModel:
         predictor_variant_ids: IDs of predictor variants.
         coefficients: Regression coefficients.
         is_intercept_only: True if no predictors (fallback to mean).
+        predictor_chromosomes: Chromosome of each predictor. Index-aligned with
+            predictor_variant_ids/coefficients.
+        predictor_positions: Genomic position of each predictor. Index-aligned.
+        predictor_counted_alleles: Allele each predictor coefficient counts
+            (= ALT of the reference row backing the Z column). Index-aligned.
+        predictor_other_alleles: The non-counted allele of each predictor
+            (= REF of the reference row). Index-aligned. Together with
+            chromosome/position this identifies the exact reference row, which
+            disambiguates multiallelic loci.
+        predictor_allele_frequencies: Frequency of the counted (ALT) allele for
+            each predictor. Shape: (n_predictors,). Used for mean-substitution of
+            missing predictors at inference time (mean dosage = 2*AF).
     """
 
     variant_id: str
@@ -121,6 +133,13 @@ class ImputedVariantModel:
     predictor_variant_ids: List[str] = field(default_factory=list)
     coefficients: np.ndarray = field(default_factory=lambda: np.array([]))
     is_intercept_only: bool = False
+    predictor_chromosomes: List[str] = field(default_factory=list)
+    predictor_positions: List[int] = field(default_factory=list)
+    predictor_counted_alleles: List[str] = field(default_factory=list)
+    predictor_other_alleles: List[str] = field(default_factory=list)
+    predictor_allele_frequencies: np.ndarray = field(
+        default_factory=lambda: np.array([])
+    )
 
     def to_dict(self) -> dict:
         """Convert to dictionary, handling numpy arrays.
@@ -130,6 +149,9 @@ class ImputedVariantModel:
         """
         result = asdict(self)
         result["coefficients"] = self.coefficients.tolist()
+        result["predictor_allele_frequencies"] = (
+            self.predictor_allele_frequencies.tolist()
+        )
         return result
 
 
@@ -406,9 +428,18 @@ class ProjectionRegionModel:
         is_intercept_only: True if no predictors available or all coefficients
             shrunk to zero.
         mean_prs_contribution: Mean of S_R across training samples.
-        predictor_allele_frequencies: Allele frequencies for each predictor
-            variant. Shape: (n_predictors,). Used for mean-substitution of
-            missing predictors at inference time.
+        predictor_allele_frequencies: Frequency of the counted (ALT) allele for
+            each predictor. Shape: (n_predictors,). Used for mean-substitution of
+            missing predictors at inference time (mean dosage = 2*AF).
+        predictor_chromosomes: Chromosome of each predictor. Index-aligned with
+            predictor_variant_ids/coefficients.
+        predictor_positions: Genomic position of each predictor. Index-aligned.
+        predictor_counted_alleles: Allele each predictor coefficient counts
+            (= ALT of the reference row backing the Z column). Index-aligned.
+        predictor_other_alleles: The non-counted allele of each predictor
+            (= REF of the reference row). Index-aligned. Together with
+            chromosome/position this identifies the exact reference row, which
+            disambiguates multiallelic loci.
     """
 
     region_id: str
@@ -425,6 +456,10 @@ class ProjectionRegionModel:
     is_intercept_only: bool
     mean_prs_contribution: float
     predictor_allele_frequencies: np.ndarray
+    predictor_chromosomes: List[str] = field(default_factory=list)
+    predictor_positions: List[int] = field(default_factory=list)
+    predictor_counted_alleles: List[str] = field(default_factory=list)
+    predictor_other_alleles: List[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert to dictionary, handling numpy arrays.

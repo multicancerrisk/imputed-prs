@@ -39,6 +39,8 @@ def create_projection_test_data(
         "variant_id": [f"rs{1000 + i}" for i in range(n_platform_variants)],
         "chromosome": ["1"] * n_platform_variants,
         "position": [10000 + i * 1000 for i in range(n_platform_variants)],
+        "ref_allele": ["ACGT"[i % 4] for i in range(n_platform_variants)],
+        "alt_allele": ["ACGT"[(i + 1) % 4] for i in range(n_platform_variants)],
     })
 
     # Missing variants with synthetic relationships to nearby platform variants
@@ -259,6 +261,38 @@ class TestProjectionRegionTrainer:
         }
         assert set(result.training_summary.keys()) == expected_keys
 
+    def test_predictor_allele_metadata(self):
+        """Region models expose index-aligned predictor allele metadata."""
+        Z, X, prs_variants, platform_info = create_projection_test_data()
+
+        trainer = ProjectionRegionTrainer(window_size=100_000, random_state=42)
+        result = trainer.fit_all_regions(Z, X, prs_variants, platform_info)
+
+        info_by_id = platform_info.set_index("variant_id")
+
+        n_with_predictors = 0
+        for model in result.region_models.values():
+            n_pred = len(model.predictor_variant_ids)
+            # All predictor metadata is index-aligned with predictor_variant_ids.
+            assert len(model.predictor_chromosomes) == n_pred
+            assert len(model.predictor_positions) == n_pred
+            assert len(model.predictor_counted_alleles) == n_pred
+            assert len(model.predictor_other_alleles) == n_pred
+            assert len(model.predictor_allele_frequencies) == n_pred
+
+            if n_pred > 0:
+                n_with_predictors += 1
+            for i, pred_id in enumerate(model.predictor_variant_ids):
+                row = info_by_id.loc[pred_id]
+                # Z counts ALT: counted == alt_allele, other == ref_allele.
+                assert model.predictor_counted_alleles[i] == row["alt_allele"]
+                assert model.predictor_other_alleles[i] == row["ref_allele"]
+                assert model.predictor_chromosomes[i] == str(row["chromosome"])
+                assert model.predictor_positions[i] == int(row["position"])
+
+        # The fixture is built so at least some regions have predictors.
+        assert n_with_predictors > 0
+
     def test_empty_prs_variants(self):
         """No missing variants -> 0 regions, empty result."""
         rng = np.random.default_rng(42)
@@ -271,6 +305,8 @@ class TestProjectionRegionTrainer:
             "variant_id": [f"rs{i}" for i in range(20)],
             "chromosome": ["1"] * 20,
             "position": list(range(20)),
+            "ref_allele": ["A"] * 20,
+            "alt_allele": ["G"] * 20,
         })
 
         trainer = ProjectionRegionTrainer(random_state=42)
