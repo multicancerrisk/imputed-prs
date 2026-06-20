@@ -9,6 +9,7 @@ This document provides the shared statistical foundations for the two PRS comput
 3. [Elastic Net Regularization (Shared)](#elastic-net-regularization-shared)
 4. [Internal Calibration via Cross-Validation (Shared)](#internal-calibration-via-cross-validation-shared)
 5. [Methods](#methods)
+6. [Validation](#validation)
 
 ---
 
@@ -238,6 +239,8 @@ The absolute value $|b|$ ensures the standard error remains non-negative regardl
 
 See `imputed_prs/core/types.py:CalibrationParams` for the full data type definition.
 
+> **Measuring the resulting error.** Internal calibration corrects attenuation against the *same population's* full PRS — it is not external/clinical calibration. For how to *measure* a deployed model's approximation error on a platform-masked (or cross-ancestry) cohort, see [Validation](validation.md).
+
 ---
 
 ## Methods
@@ -253,3 +256,11 @@ See [Linear Imputation](linear-imputation.md) for the full method description.
 Linear projection skips individual dosage prediction and instead learns, for each genomic region, a single regression model that maps platform variant dosages directly to the region's PRS contribution $S_R = X_R \beta_R$. By predicting the weighted sum directly, projection avoids accumulating per-variant imputation errors and can be more efficient when many missing PRS variants cluster in the same LD region.
 
 See [Linear Projection](linear-projection.md) for the full method description.
+
+---
+
+## Validation
+
+Beyond internal cross-validation, the library provides a **masking-validation harness**: it masks a reference panel down to a genotyping platform's variants, scores the masked panel through the deployed prediction path, and compares the estimate to the full computed PRS. It reports correlation, top-decile concordance, empirical approximation error, and interval coverage, plus a raw-parser round-trip and cross-ancestry caveats — and makes explicit that internal calibration is not external calibration.
+
+See [Validation](validation.md) for the methodology and `imputed_prs/evaluation/validation.py:run_masking_validation()` for the implementation.

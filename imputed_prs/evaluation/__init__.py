@@ -17,6 +17,11 @@ from imputed_prs.evaluation.metrics import (
 from imputed_prs.evaluation.quality import (
     summarize_imputation_quality,
 )
+from imputed_prs.evaluation.validation import (
+    MaskingValidationReport,
+    mask_reference_to_platform,
+    run_masking_validation,
+)
 from imputed_prs.evaluation.plotting import (
     plot_calibration,
     plot_imputation_quality,
@@ -34,6 +39,9 @@ __all__ = [
     "ImputationEvaluator",
     "ProjectionEvaluator",
     "SensitivityResult",
+    "MaskingValidationReport",
+    "mask_reference_to_platform",
+    "run_masking_validation",
     "plot_calibration",
     "plot_imputation_quality",
     "plot_variance_contribution",

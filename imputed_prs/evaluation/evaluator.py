@@ -3,7 +3,7 @@
 from dataclasses import dataclass, field
 from itertools import product
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import warnings
 
 import numpy as np
@@ -140,14 +140,37 @@ class ImputationEvaluator:
         if percentile_thresholds is None:
             percentile_thresholds = [1, 5, 10]
 
-        # Step 1: Load evaluation genotypes
+        imputed_prs, true_prs = self.compute_score_arrays(evaluation_genotypes)
+        return compute_prs_metrics(imputed_prs, true_prs)
+
+    def compute_score_arrays(
+        self,
+        evaluation_genotypes: Union[str, Path, GenotypeData],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return ``(s_estimated, s_true)`` PRS arrays for all samples.
+
+        ``s_estimated`` is the library-scored (observed + imputed) PRS routed
+        through the same allele-oriented semantics as the browser/upload path
+        (P1.6); ``s_true`` is the gold-standard PRS summed over all placed variants
+        from the full reference dosages. Both are effect-allele-oriented, raw
+        (uncalibrated), and sample-aligned — the array contract that
+        :func:`compute_prs_metrics`/:func:`compute_percentile_concordance` and the
+        masking-validation harness consume. ``evaluate`` is a thin wrapper over
+        this method.
+
+        Args:
+            evaluation_genotypes: Path to genotype file (VCF/PLINK) or a pre-loaded
+                GenotypeData object.
+
+        Returns:
+            Tuple ``(s_estimated, s_true)`` of shape ``(n_samples,)`` each.
+        """
         if isinstance(evaluation_genotypes, GenotypeData):
             genotype_data = evaluation_genotypes
         else:
-            needed_variants = self._get_all_needed_variant_ids()
             genotype_data = load_genotypes(
                 path=evaluation_genotypes,
-                variant_ids=needed_variants,
+                variant_ids=self._get_all_needed_variant_ids(),
             )
 
         if self.verbose >= 2:
@@ -156,19 +179,9 @@ class ImputationEvaluator:
                 f"{genotype_data.n_variants} variants"
             )
 
-        # Step 2: Compute true PRS
-        true_prs = self._compute_true_prs(genotype_data)
-
-        # Step 3: Compute imputed PRS
-        imputed_prs = self._compute_imputed_prs_batch(genotype_data)
-
-        if self.verbose >= 2:
-            print(f"Computed PRS for {len(true_prs)} samples")
-
-        # Step 4: Compute metrics
-        metrics = compute_prs_metrics(imputed_prs, true_prs)
-
-        return metrics
+        s_true = self._compute_true_prs(genotype_data)
+        s_estimated = self._compute_imputed_prs_batch(genotype_data)
+        return s_estimated, s_true
 
     def cross_validate(
         self,

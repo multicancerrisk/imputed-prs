@@ -1143,3 +1143,370 @@ class TestEmpiricalResidualCoverageUnderLD:
         assert params.raw_empirical_residual_sd == pytest.approx(
             np.std(s_true - s_cv, ddof=1), rel=1e-12
         )
+
+
+# =============================================================================
+# P4.3: Masking-validation harness (mask reference -> platform, compare to full PRS)
+# =============================================================================
+
+import warnings  # noqa: E402
+
+from imputed_prs import LinearImputationPRS, LinearProjectionPRS  # noqa: E402
+from imputed_prs.core.exceptions import ModelNotFittedError, ValidationError  # noqa: E402
+from imputed_prs.core.types import GenotypeData  # noqa: E402
+from imputed_prs.evaluation import (  # noqa: E402
+    MaskingValidationReport,
+    mask_reference_to_platform,
+    run_masking_validation,
+)
+from imputed_prs.evaluation.validation import (  # noqa: E402
+    _CALIBRATION_CAVEAT,
+    _write_synthetic_23andme,
+)
+from imputed_prs.io.user_genotypes import load_user_genotype_strings  # noqa: E402
+
+# 20-sample biallelic reference (effect_allele == ALT), platform is a partial
+# overlap (rs1-rs3 observed; rs4, rs5 imputed/projected). Mirrors test_round_trip.
+_MV_VCF = """##fileformat=VCFv4.2
+##contig=<ID=1,length=249250621>
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\tS2\tS3\tS4\tS5\tS6\tS7\tS8\tS9\tS10\tS11\tS12\tS13\tS14\tS15\tS16\tS17\tS18\tS19\tS20
+1\t100000\trs1\tA\tG\t.\t.\t.\tGT\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1
+1\t100500\trs2\tC\tT\t.\t.\t.\tGT\t0/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0
+1\t101000\trs3\tG\tA\t.\t.\t.\tGT\t1/1\t0/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1\t0/0\t0/1\t1/1
+1\t101500\trs4\tT\tC\t.\t.\t.\tGT\t0/0\t1/1\t0/1\t0/0\t1/1\t0/1\t0/0\t1/1\t0/1\t0/0\t1/1\t0/1\t0/0\t1/1\t0/1\t0/0\t1/1\t0/1\t0/0\t1/1
+1\t102000\trs5\tG\tC\t.\t.\t.\tGT\t0/1\t0/1\t0/1\t0/0\t0/0\t1/1\t1/1\t0/1\t0/0\t0/1\t0/1\t0/1\t0/0\t0/0\t1/1\t1/1\t0/1\t0/0\t0/1\t0/1
+"""
+
+_MV_PRS_DF = pd.DataFrame(
+    {
+        "variant_id": ["rs1", "rs2", "rs3", "rs4", "rs5"],
+        "chromosome": ["1", "1", "1", "1", "1"],
+        "position": [100000, 100500, 101000, 101500, 102000],
+        "effect_allele": ["G", "T", "A", "C", "C"],
+        "other_allele": ["A", "C", "G", "T", "G"],
+        "beta": [0.1, -0.05, 0.2, 0.15, -0.1],
+    }
+)
+
+_MV_PLATFORM = ["rs1", "rs2", "rs3"]
+_MV_REF_ALLELES = ["A", "C", "G", "T", "G"]
+_MV_ALT_ALLELES = ["G", "T", "A", "C", "C"]
+
+
+@pytest.fixture
+def mv_vcf_file(tmp_path):
+    path = tmp_path / "ref.vcf"
+    path.write_text(_MV_VCF)
+    return path
+
+
+@pytest.fixture
+def mv_imputation_model(mv_vcf_file):
+    pytest.importorskip("cyvcf2")
+    model = LinearImputationPRS(
+        window_size=500_000, cv_folds=3, tuning_scope="none", verbose=0, random_state=42
+    )
+    model.fit(
+        reference_genotypes=mv_vcf_file,
+        prs_definition=_MV_PRS_DF,
+        platform_variants=_MV_PLATFORM,
+        genome_build="GRCh37",
+        reference_panel_id="1000G_phase3_EUR",
+        training_ancestry="EUR",
+    )
+    return model
+
+
+@pytest.fixture
+def mv_projection_model(mv_vcf_file):
+    pytest.importorskip("cyvcf2")
+    model = LinearProjectionPRS(
+        window_size=500_000, cv_folds=3, verbose=0, random_state=42
+    )
+    model.fit(
+        reference_genotypes=mv_vcf_file,
+        prs_definition=_MV_PRS_DF,
+        platform_variants=_MV_PLATFORM,
+        genome_build="GRCh37",
+        reference_panel_id="1000G_phase3_EUR",
+        training_ancestry="EUR",
+    )
+    return model
+
+
+@pytest.fixture
+def mv_all_on_platform_model(mv_vcf_file):
+    """Model whose platform covers every PRS variant -> masking is a no-op and the
+    estimate equals the true PRS exactly (perfect-recovery fixture)."""
+    pytest.importorskip("cyvcf2")
+    model = LinearImputationPRS(
+        window_size=500_000, cv_folds=3, tuning_scope="none", verbose=0, random_state=42
+    )
+    model.fit(
+        reference_genotypes=mv_vcf_file,
+        prs_definition=_MV_PRS_DF,
+        platform_variants=["rs1", "rs2", "rs3", "rs4", "rs5"],
+        genome_build="GRCh37",
+        reference_panel_id="1000G_phase3_EUR",
+        training_ancestry="EUR",
+    )
+    return model
+
+
+def _mv_genotype_data(ref_alleles, alt_alleles, dosage_matrix):
+    """Build a GenotypeData over rs1..rsN matching the masking-validation PRS."""
+    n_variants = len(ref_alleles)
+    variant_info = pd.DataFrame(
+        {
+            "variant_id": [f"rs{i + 1}" for i in range(n_variants)],
+            "chromosome": ["1"] * n_variants,
+            "position": [100000, 100500, 101000, 101500, 102000][:n_variants],
+            "ref_allele": ref_alleles,
+            "alt_allele": alt_alleles,
+        }
+    )
+    return GenotypeData(
+        dosage_matrix=dosage_matrix,
+        variant_info=variant_info,
+        sample_ids=[f"S{i + 1}" for i in range(dosage_matrix.shape[0])],
+        genome_build="GRCh37",
+    )
+
+
+class TestMaskReferenceToPlatform:
+    """mask_reference_to_platform blanks off-platform columns, keeps platform ones."""
+
+    def test_keeps_exactly_platform_columns(self):
+        dm = np.random.default_rng(0).integers(0, 3, size=(12, 5)).astype(np.float32)
+        gd = _mv_genotype_data(list(_MV_REF_ALLELES), list(_MV_ALT_ALLELES), dm)
+
+        masked = mask_reference_to_platform(gd, {"rs1", "rs2", "rs3"})
+
+        # Kept columns (rs1-rs3) are bit-identical; masked columns (rs4, rs5) are NaN.
+        np.testing.assert_array_equal(masked.dosage_matrix[:, :3], dm[:, :3])
+        assert np.all(np.isnan(masked.dosage_matrix[:, 3:]))
+        # variant_info is preserved (columns blanked, not dropped).
+        assert list(masked.variant_info["variant_id"]) == list(gd.variant_info["variant_id"])
+
+    def test_chrpos_platform_matching(self):
+        """A platform expressed as chr:pos must still match rsID-keyed columns."""
+        dm = np.random.default_rng(1).integers(0, 3, size=(12, 5)).astype(np.float32)
+        gd = _mv_genotype_data(list(_MV_REF_ALLELES), list(_MV_ALT_ALLELES), dm)
+
+        masked = mask_reference_to_platform(gd, {"1:100000", "1:100500", "1:101000"})
+
+        np.testing.assert_array_equal(masked.dosage_matrix[:, :3], dm[:, :3])
+        assert np.all(np.isnan(masked.dosage_matrix[:, 3:]))
+
+    def test_no_op_when_all_on_platform(self):
+        dm = np.random.default_rng(2).integers(0, 3, size=(12, 5)).astype(np.float32)
+        gd = _mv_genotype_data(list(_MV_REF_ALLELES), list(_MV_ALT_ALLELES), dm)
+
+        masked = mask_reference_to_platform(gd, {"rs1", "rs2", "rs3", "rs4", "rs5"})
+
+        np.testing.assert_array_equal(masked.dosage_matrix, dm)
+
+
+class TestRunMaskingValidationEndToEnd:
+    """The headline gate: masking validation runs and emits the metric panel."""
+
+    def test_populates_all_report_fields(self, mv_imputation_model, mv_vcf_file):
+        pytest.importorskip("snps")
+        report = run_masking_validation(
+            mv_imputation_model, mv_vcf_file, random_state=1, verbose=0
+        )
+
+        assert isinstance(report, MaskingValidationReport)
+        assert report.model_type == "imputation"
+        assert report.n_samples == 20
+        assert report.n_observed == 3
+        assert report.n_variants_masked == 2
+        assert report.n_platform_variants_retained == 3
+        assert -1.0 <= report.correlation <= 1.0
+        assert 0.0 <= report.r2 <= 1.0
+        assert np.isfinite(report.empirical_error_sd) and report.empirical_error_sd >= 0.0
+        assert np.isfinite(report.empirical_error_mean)
+        assert 0.0 <= report.top_decile_concordance <= 1.0
+        assert report.coverage_95 is not None and 0.0 <= report.coverage_95 <= 1.0
+        assert report.raw_parser_checked is True
+        assert report.raw_parser_agrees is True
+        assert report.raw_parser_max_abs_diff <= 1e-6
+        assert report.cross_ancestry is False
+        assert _CALIBRATION_CAVEAT in report.caveats
+        # to_dict round-trips every field.
+        d = report.to_dict()
+        assert d["model_type"] == "imputation"
+        assert "percentile_concordance" in d
+
+    def test_metric_panel_summary_renders(self, mv_imputation_model, mv_vcf_file):
+        report = run_masking_validation(
+            mv_imputation_model,
+            mv_vcf_file,
+            run_raw_parser_check=False,
+            verbose=0,
+        )
+        text = report.summary()
+        assert isinstance(text, str) and text
+        lowered = text.lower()
+        assert "correlation" in lowered
+        assert "top-decile" in lowered
+        assert "empirical error" in lowered
+
+
+class TestPerfectRecoveryMaskingValidation:
+    """When the platform covers every PRS variant, the estimate == the full PRS."""
+
+    def test_perfect_recovery(self, mv_all_on_platform_model, mv_vcf_file):
+        report = run_masking_validation(
+            mv_all_on_platform_model,
+            mv_vcf_file,
+            run_raw_parser_check=False,
+            verbose=0,
+        )
+        assert report.n_variants_masked == 0
+        # Estimate == full PRS up to float32 dosage noise (the true-PRS and
+        # string-scoring paths cast the float32 reference differently).
+        assert report.correlation == pytest.approx(1.0, abs=1e-9)
+        assert report.empirical_error_sd == pytest.approx(0.0, abs=1e-6)
+        assert report.top_decile_concordance == pytest.approx(1.0, abs=1e-9)
+        # The "no off-platform variants" caveat must fire so the result is not
+        # misread as validating imputation.
+        assert any("no off-platform" in c.lower() for c in report.caveats)
+
+
+class TestRawParserRoundTrip:
+    """The literal upload path (predict(file)) agrees with the batch estimate."""
+
+    def test_file_predict_matches_batch(self, mv_imputation_model, mv_vcf_file):
+        pytest.importorskip("snps")
+        report = run_masking_validation(
+            mv_imputation_model,
+            mv_vcf_file,
+            raw_parser_max_samples=8,
+            verbose=0,
+        )
+        assert report.raw_parser_checked is True
+        assert report.raw_parser_n > 0
+        assert report.raw_parser_agrees is True
+        assert report.raw_parser_max_abs_diff == pytest.approx(0.0, abs=1e-6)
+
+    def test_no_userwarning_from_file_predict(self, mv_imputation_model, tmp_path):
+        pytest.importorskip("snps")
+        # Render a single sample's platform genotypes to a synthetic 23andMe file.
+        records = [("rs1", "1", 100000, "AG"), ("rs2", "1", 100500, "CC"),
+                   ("rs3", "1", 101000, "AA")]
+        path = tmp_path / "user_23andme.txt"
+        _write_synthetic_23andme(path, records)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            mv_imputation_model.predict(path, genome_build="GRCh37", strict=True)
+        user_warnings = [w for w in caught if issubclass(w.category, UserWarning)]
+        assert not user_warnings, [str(w.message) for w in user_warnings]
+
+    def test_synthetic_file_recognized_as_23andme(self, tmp_path):
+        pytest.importorskip("snps")
+        records = [("rs1", "1", 100000, "AG"), ("rs2", "1", 100500, "CC"),
+                   ("rs3", "1", 101000, "AA")]
+        path = tmp_path / "user_23andme.txt"
+        _write_synthetic_23andme(path, records)
+        assert load_user_genotype_strings(path) == {"rs1": "AG", "rs2": "CC", "rs3": "AA"}
+
+
+class TestCrossAncestryNoteLogic:
+    """evaluation_ancestry recording + caveat emission."""
+
+    def test_note_emitted_when_ancestries_differ(self, mv_imputation_model, mv_vcf_file):
+        report = run_masking_validation(
+            mv_imputation_model,
+            mv_vcf_file,
+            evaluation_ancestry="EAS",  # model trained on EUR
+            run_raw_parser_check=False,
+            verbose=0,
+        )
+        assert report.cross_ancestry is True
+        assert report.evaluation_ancestry == "EAS"
+        assert any("cross-ancestry" in c.lower() for c in report.caveats)
+
+    def test_no_note_when_same_ancestry(self, mv_imputation_model, mv_vcf_file):
+        report = run_masking_validation(
+            mv_imputation_model,
+            mv_vcf_file,
+            evaluation_ancestry="eur",  # case-insensitive match to training EUR
+            run_raw_parser_check=False,
+            verbose=0,
+        )
+        assert report.cross_ancestry is False
+        assert not any("cross-ancestry" in c.lower() for c in report.caveats)
+
+    def test_no_note_when_label_missing(self, mv_imputation_model, mv_vcf_file):
+        report = run_masking_validation(
+            mv_imputation_model,
+            mv_vcf_file,
+            run_raw_parser_check=False,
+            verbose=0,
+        )
+        assert report.cross_ancestry is False
+
+    def test_internal_calibration_caveat_always_present(
+        self, mv_imputation_model, mv_vcf_file
+    ):
+        report = run_masking_validation(
+            mv_imputation_model,
+            mv_vcf_file,
+            run_raw_parser_check=False,
+            verbose=0,
+        )
+        assert _CALIBRATION_CAVEAT in report.caveats
+
+
+class TestProjectionMaskingValidation:
+    """The harness dispatches to the projection evaluator and populates fields."""
+
+    def test_projection_model_runs(self, mv_projection_model, mv_vcf_file):
+        pytest.importorskip("snps")
+        report = run_masking_validation(
+            mv_projection_model,
+            mv_vcf_file,
+            raw_parser_max_samples=8,
+            random_state=1,
+            verbose=0,
+        )
+        assert report.model_type == "projection"
+        assert report.n_imputed_or_regions >= 1
+        assert np.isfinite(report.correlation)
+        assert report.n_variants_masked == 2
+        assert report.raw_parser_agrees is True
+
+
+class TestMaskingValidationEdgeCases:
+    """Degenerate cohorts and small samples degrade gracefully, never crash."""
+
+    def test_unfitted_model_raises(self, mv_vcf_file):
+        model = LinearImputationPRS(verbose=0)
+        with pytest.raises(ModelNotFittedError):
+            run_masking_validation(model, mv_vcf_file, verbose=0)
+
+    def test_zero_variance_true_prs_handled(self, mv_imputation_model):
+        # 25 identical samples -> the PRS is constant -> correlation undefined.
+        one_row = np.array([[0, 1, 2, 0, 1]], dtype=np.float32)
+        dm = np.tile(one_row, (25, 1))
+        gd = _mv_genotype_data(list(_MV_REF_ALLELES), list(_MV_ALT_ALLELES), dm)
+
+        report = run_masking_validation(
+            mv_imputation_model, gd, run_raw_parser_check=False, verbose=0
+        )
+        assert np.isnan(report.correlation)
+        assert any("degenerate" in c.lower() for c in report.caveats)
+
+    def test_small_sample_skips_concordance(self, mv_imputation_model):
+        dm = np.random.default_rng(3).integers(0, 3, size=(6, 5)).astype(np.float32)
+        gd = _mv_genotype_data(list(_MV_REF_ALLELES), list(_MV_ALT_ALLELES), dm)
+
+        report = run_masking_validation(
+            mv_imputation_model, gd, run_raw_parser_check=False, verbose=0
+        )
+        assert report.percentile_concordance == {}
+        assert np.isnan(report.top_decile_concordance)
+        assert any("concordance skipped" in c.lower() for c in report.caveats)
