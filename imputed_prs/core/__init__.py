@@ -11,6 +11,7 @@ from imputed_prs.core.types import (
     PredictionResult,
     ProjectionRegionModel,
     ProjectionTrainingResult,
+    TrainingFailure,
     TrainingResult,
     VariantInfo,
 )
@@ -54,6 +55,7 @@ __all__ = [
     "PredictionResult",
     "ProjectionRegionModel",
     "ProjectionTrainingResult",
+    "TrainingFailure",
     "TrainingResult",
     "VariantInfo",
     # Exceptions

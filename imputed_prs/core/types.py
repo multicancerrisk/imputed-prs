@@ -382,6 +382,38 @@ class SingleVariantModelResult:
         }
 
 
+@dataclass(frozen=True)
+class TrainingFailure:
+    """Structured reason a per-variant or per-region training fit failed.
+
+    Captured when an ElasticNet fit raises a genuine exception inside the
+    trainer. Degenerate-but-handled cases (zero-variance target, too few
+    samples, no predictors) are downgraded to intercept-only models elsewhere
+    and are *not* failures. Surfaced through the orchestrators'
+    ``variant_dispositions`` / ``summary`` so a failed variant reports *why* it
+    failed, not merely that it did.
+
+    Attributes:
+        unit_id: variant_id (imputation) or region_id (projection) that failed.
+        error_type: Exception class name (``type(exc).__name__``).
+        error_message: Exception message (``str(exc)``).
+        n_valid_samples: Non-missing target samples at the failed fit, if known.
+        target_variance: Variance of the non-missing target, if known.
+        n_predictors: Number of windowed predictors at the failed fit, if known.
+        member_ids: PRS variant IDs covered by a failed projection region, so a
+            region failure can be attributed to each affected PRS variant. Empty
+            for imputation, where the unit *is* the variant.
+    """
+
+    unit_id: str
+    error_type: str
+    error_message: str
+    n_valid_samples: Optional[int] = None
+    target_variance: Optional[float] = None
+    n_predictors: Optional[int] = None
+    member_ids: Tuple[str, ...] = ()
+
+
 @dataclass
 class GridSearchResult:
     """Result from global hyperparameter search.
@@ -394,6 +426,8 @@ class GridSearchResult:
             l1_ratio, alpha, mean_cv_mse, std_cv_mse, n_variants_evaluated.
         n_variants_sampled: Number of variants used in search.
         n_variants_failed: Number of variants where fitting failed.
+        failure_reasons: Map of exception class name -> count of sampled
+            variants whose fit raised that exception during the search.
     """
 
     best_l1_ratio: float
@@ -402,6 +436,7 @@ class GridSearchResult:
     grid_results: List[Dict[str, Any]]
     n_variants_sampled: int
     n_variants_failed: int
+    failure_reasons: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -425,6 +460,8 @@ class TrainingResult:
             - n_medium_quality: Count with 0.4 < R² <= 0.8.
             - n_low_quality: Count with R² <= 0.4.
             - mean_n_predictors: Average number of predictors per model.
+        failures: Map of variant_id -> TrainingFailure for variants whose fit
+            raised a genuine exception (structured reason; see TrainingFailure).
     """
 
     models: Dict[str, "ImputedVariantModel"]
@@ -433,6 +470,7 @@ class TrainingResult:
     n_variants_failed: int
     n_intercept_only: int
     training_summary: Dict[str, Any]
+    failures: Dict[str, "TrainingFailure"] = field(default_factory=dict)
 
 
 @dataclass
@@ -448,6 +486,8 @@ class OptunaSearchResult:
         n_variants_failed: Number of variants where fitting failed at best params.
         trial_history: List of dicts with trial details (trial_number, l1_ratio, alpha, mean_cv_mse).
         optimization_time_seconds: Total optimization time.
+        failure_reasons: Map of exception class name -> count of trial fits that
+            raised that exception.
     """
 
     best_l1_ratio: float
@@ -458,6 +498,7 @@ class OptunaSearchResult:
     n_variants_failed: int
     trial_history: List[Dict[str, Any]]
     optimization_time_seconds: float
+    failure_reasons: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -565,6 +606,9 @@ class ProjectionTrainingResult:
             n_high_quality (r2 > 0.8), n_medium_quality (0.4-0.8),
             n_low_quality (r2 <= 0.4), mean_n_predictors,
             mean_n_prs_variants_per_region.
+        failures: Map of region_id -> TrainingFailure for regions whose fit
+            raised a genuine exception. Each carries member_ids (the PRS variant
+            IDs in the failed region) so the failure can be attributed per variant.
     """
 
     region_models: Dict[str, "ProjectionRegionModel"]
@@ -573,3 +617,4 @@ class ProjectionTrainingResult:
     n_regions_failed: int
     n_intercept_only: int
     training_summary: Dict[str, Any]
+    failures: Dict[str, "TrainingFailure"] = field(default_factory=dict)

@@ -567,3 +567,38 @@ class TestRegionStandardization:
 
         assert result.is_intercept_only
         assert np.allclose(result.coefficients, 0, atol=1e-12)
+
+
+class TestProjectionTrainerFailureReasons:
+    """P5.1: per-region training failures are captured with a structured reason
+    that carries the region's member PRS variants."""
+
+    def test_region_failure_is_captured_with_member_ids(self, monkeypatch):
+        Z, X, prs_variants, platform_info = create_projection_test_data(
+            n_samples=120, n_platform_variants=40, n_missing_variants=6,
+        )
+
+        def boom(*args, **kwargs):
+            raise ValueError("synthetic region fit failure")
+
+        monkeypatch.setattr(
+            "imputed_prs.models.projection_trainer.fit_single_region_model", boom
+        )
+
+        trainer = ProjectionRegionTrainer(window_size=1_000_000, random_state=42)
+        result = trainer.fit_all_regions(Z, X, prs_variants, platform_info)
+
+        decomposition = merge_variant_windows(prs_variants, window_size=1_000_000)
+        assert result.n_regions_trained == 0
+        assert result.n_regions_failed == decomposition.n_regions
+        assert len(result.failures) == decomposition.n_regions
+
+        region = decomposition.regions[0]
+        region_id = f"chr{region.chromosome}:{region.start}-{region.end}"
+        failure = result.failures[region_id]
+        assert failure.unit_id == region_id
+        assert failure.error_type == "ValueError"
+        assert failure.error_message == "synthetic region fit failure"
+        # The failure can be attributed to each affected PRS variant.
+        assert failure.member_ids == tuple(region.prs_variant_ids)
+        assert failure.n_valid_samples == X.shape[0]

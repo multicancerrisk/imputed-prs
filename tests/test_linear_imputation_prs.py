@@ -1917,3 +1917,53 @@ class TestObservedFallbackTraining:
         assert disp.loc["rs999", "status"] == "observed"
         assert bool(disp.loc["rs999", "has_fallback"]) is False
         assert disp.loc["rs999", "fallback_reason"] == "no_reference_target"
+
+
+class TestLinearImputationPRSTrainingFailureSurfacing:
+    """P5.1: a missing-variant training failure surfaces *why* it failed in both
+    variant_dispositions and summary (not merely an opaque count)."""
+
+    def test_training_failure_in_dispositions_and_summary(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial, monkeypatch
+    ):
+        pytest.importorskip("cyvcf2")
+        from imputed_prs.models.elastic_net import (
+            fit_single_variant_model as real_fit,
+        )
+
+        # Fail only the first per-variant fit (the first missing variant, rs4);
+        # rs5 and the observed fallbacks still train, so the pipeline completes.
+        calls = {"n": 0}
+
+        def fail_first(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValueError("synthetic fit failure")
+            return real_fit(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "imputed_prs.models.trainer.fit_single_variant_model", fail_first
+        )
+
+        model = LinearImputationPRS(
+            window_size=500_000, cv_folds=3, tuning_scope="none",
+            verbose=0, random_state=42,
+        )
+        model.fit(
+            reference_genotypes=synthetic_vcf_file,
+            prs_definition=synthetic_prs_df,
+            platform_variants=platform_variants_partial,
+        )
+
+        disp = model.variant_dispositions.set_index("variant_id")
+        # rs4 failed training -> dropped, reason unchanged, but now explained.
+        assert disp.loc["rs4", "status"] == "dropped"
+        assert disp.loc["rs4", "reason"] == "training_failed"
+        assert disp.loc["rs4", "failure_error_type"] == "ValueError"
+        assert "synthetic fit failure" in disp.loc["rs4", "failure_error_message"]
+        # A non-failed variant carries no failure detail.
+        assert pd.isna(disp.loc["rs1", "failure_error_type"])
+
+        summary = model.summary
+        assert summary["n_training_failed"] == 1
+        assert summary["training_failures_by_type"] == {"ValueError": 1}

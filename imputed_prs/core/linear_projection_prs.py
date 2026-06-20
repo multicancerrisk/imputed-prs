@@ -27,6 +27,7 @@ from imputed_prs.core.types import (
     PredictionResult,
     ProjectionRegionModel,
     ProjectionTrainingResult,
+    TrainingFailure,
     VariantInfo,
 )
 from imputed_prs.evaluation.calibration import (
@@ -741,6 +742,7 @@ class LinearProjectionPRS:
             missing_drop_reason=missing_drop_reason,
             observed_fallback_ids=observed_fallback_ids,
             fallback_no_target_ids=fallback_no_target_ids,
+            training_failures=training_result.failures,
         )
 
         # Step 12: Populate instance state
@@ -779,6 +781,7 @@ class LinearProjectionPRS:
         missing_drop_reason: Dict[str, str],
         observed_fallback_ids: Optional[Set[str]] = None,
         fallback_no_target_ids: Optional[Set[str]] = None,
+        training_failures: Optional[Dict[str, TrainingFailure]] = None,
     ) -> List[Dict[str, Any]]:
         """Build one disposition record per input PRS variant.
 
@@ -791,9 +794,22 @@ class LinearProjectionPRS:
         fallback model was trained (P2.4) and ``fallback_reason`` explains its
         absence ({no_reference_target, no_fallback_model}); both are False/None
         for non-observed rows.
+
+        ``training_failures`` (region_id -> TrainingFailure) adds the
+        ``failure_error_type``/``failure_error_message``/``failure_n_valid_samples``/
+        ``failure_target_variance`` columns explaining *why* a region fit raised
+        (P5.1). A region failure is attributed to each of its member PRS variants;
+        all None for variants whose region did not fail. ``reason`` is left
+        unchanged ("training_failed") so existing aggregation is stable.
         """
         observed_fallback_ids = observed_fallback_ids or set()
         fallback_no_target_ids = fallback_no_target_ids or set()
+        # A region failure affects every PRS variant in that region; index the
+        # failure by member variant id so each gets the explanation (P5.1).
+        failure_by_member: Dict[str, TrainingFailure] = {}
+        for failure in (training_failures or {}).values():
+            for member_id in failure.member_ids:
+                failure_by_member[member_id] = failure
         dispositions: List[Dict[str, Any]] = []
         for _, row in prs_df.iterrows():
             var_id = row["variant_id"]
@@ -823,6 +839,7 @@ class LinearProjectionPRS:
                         else "no_fallback_model"
                     )
 
+            failure = failure_by_member.get(var_id)
             dispositions.append({
                 "variant_id": var_id,
                 "chromosome": str(row["chromosome"]),
@@ -834,6 +851,16 @@ class LinearProjectionPRS:
                 "reason": reason,
                 "has_fallback": has_fallback,
                 "fallback_reason": fallback_reason,
+                "failure_error_type": failure.error_type if failure is not None else None,
+                "failure_error_message": (
+                    failure.error_message if failure is not None else None
+                ),
+                "failure_n_valid_samples": (
+                    failure.n_valid_samples if failure is not None else None
+                ),
+                "failure_target_variance": (
+                    failure.target_variance if failure is not None else None
+                ),
             })
         return dispositions
 
@@ -1015,6 +1042,19 @@ class LinearProjectionPRS:
             n_dropped = 0
         coverage = (n_observed + n_missing) / n_definition if n_definition else 0.0
 
+        # Training-failure breakdown by exception class (P5.1). Keyed by region
+        # (the projection training unit); loaded models have no training result.
+        if self._training_result is not None:
+            training_failures_by_type: Dict[str, int] = {}
+            for f in self._training_result.failures.values():
+                training_failures_by_type[f.error_type] = (
+                    training_failures_by_type.get(f.error_type, 0) + 1
+                )
+            n_training_failed = len(self._training_result.failures)
+        else:
+            training_failures_by_type = {}
+            n_training_failed = 0
+
         return {
             "n_observed_variants": n_observed,
             "n_observed_with_fallback": n_observed_with_fallback,
@@ -1022,6 +1062,8 @@ class LinearProjectionPRS:
             "n_definition_variants": n_definition,
             "n_dropped": n_dropped,
             "dropped_by_reason": dropped_by_reason,
+            "n_training_failed": n_training_failed,
+            "training_failures_by_type": training_failures_by_type,
             "coverage": coverage,
             "n_regions": n_regions,
             "n_intercept_only_regions": n_intercept_only,

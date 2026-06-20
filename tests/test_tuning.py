@@ -451,3 +451,62 @@ class TestOptunaHyperparameterSearch:
         Z, X, mvi, pvi = imputation_data
         with pytest.raises(ValidationError):
             optuna_hyperparameter_search(Z[:50], X, mvi, pvi, window_size=1_000_000)
+
+
+class TestTunerFailureReasons:
+    """P5.1: the grid search records *why* fits raised, separate from the
+    intercept-only no-op (which both historically collapsed to None)."""
+
+    @staticmethod
+    def _dataset(seed, n_samples=200, n_pred=4):
+        rng = np.random.default_rng(seed)
+        predictors = rng.binomial(2, 0.3, (n_samples, n_pred)).astype(float)
+        coeffs = rng.uniform(0.3, 0.6, n_pred)
+        target = predictors @ coeffs + rng.normal(0, 0.1, n_samples)
+        return predictors, target
+
+    def test_grid_search_tallies_fit_exceptions(self):
+        from imputed_prs.models.tuning import _grid_search_over_datasets
+
+        good = self._dataset(seed=1)
+        bad = self._dataset(seed=2)
+        bad[1][0] = 999.0  # sentinel the fit_fn raises on
+
+        def fit_fn(target, predictors, **kwargs):
+            if target[0] == 999.0:
+                raise ValueError("boom")
+            return fit_single_variant_model(target, predictors, **kwargs)
+
+        result = _grid_search_over_datasets(
+            datasets=[good, bad],
+            l1_ratios=[0.5],
+            alphas=[0.01],
+            cv_folds=5,
+            random_state=0,
+            n_variants_sampled=2,
+            fit_fn=fit_fn,
+        )
+
+        assert result.failure_reasons == {"ValueError": 1}
+        assert result.n_variants_failed == 1
+
+    def test_intercept_only_does_not_inflate_failure_reasons(self):
+        from imputed_prs.models.tuning import _grid_search_over_datasets
+
+        good = self._dataset(seed=3)
+        flat_predictors, _ = self._dataset(seed=4)
+        # Zero-variance target -> the real fitter returns intercept-only (None),
+        # which must NOT be counted as a failure.
+        flat = (flat_predictors, np.full(flat_predictors.shape[0], 0.7))
+
+        result = _grid_search_over_datasets(
+            datasets=[good, flat],
+            l1_ratios=[0.5],
+            alphas=[0.01],
+            cv_folds=5,
+            random_state=0,
+            n_variants_sampled=2,
+            fit_fn=fit_single_variant_model,
+        )
+
+        assert result.failure_reasons == {}

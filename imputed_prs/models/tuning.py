@@ -206,6 +206,14 @@ def _dataset_has_predictors(dataset: Tuple[np.ndarray, np.ndarray]) -> bool:
     return predictor.size > 0 and predictor.ndim == 2 and predictor.shape[1] > 0
 
 
+def _tally_failure_reasons(error_types: List[str]) -> Dict[str, int]:
+    """Count occurrences of each exception class name (P5.1 diagnostics)."""
+    reasons: Dict[str, int] = {}
+    for name in error_types:
+        reasons[name] = reasons.get(name, 0) + 1
+    return reasons
+
+
 def _evaluate_one_dataset(
     predictor_dosages: np.ndarray,
     target: np.ndarray,
@@ -214,6 +222,7 @@ def _evaluate_one_dataset(
     cv_folds: int,
     random_state: Optional[int],
     fit_fn: Callable[..., Any] = fit_single_variant_model,
+    failure_sink: Optional[List[str]] = None,
 ) -> Optional[float]:
     """Fit one ``(predictor, target)`` dataset and return its CV MSE, or None.
 
@@ -221,6 +230,10 @@ def _evaluate_one_dataset(
     effect) or the fit raises. ``fit_fn`` is the CV fitter; both
     ``fit_single_variant_model`` and ``fit_single_region_model`` accept
     ``(target, predictor_dosages, l1_ratio=, alpha=, cv_folds=, random_state=)``.
+
+    When ``failure_sink`` is provided, the exception class name is appended to it
+    on a genuine fit failure (P5.1) — this distinguishes a raised exception from
+    the intercept-only ``None``, which does not touch the sink.
     """
     try:
         result = fit_fn(
@@ -234,7 +247,9 @@ def _evaluate_one_dataset(
         if result.is_intercept_only:
             return None
         return result.cv_mse
-    except Exception:
+    except Exception as exc:
+        if failure_sink is not None:
+            failure_sink.append(type(exc).__name__)
         return None
 
 
@@ -276,6 +291,7 @@ def _grid_search_over_datasets(
         )
 
     grid_results: List[Dict[str, Any]] = []
+    failures_by_point: Dict[Tuple[float, float], List[str]] = {}
     best_mean_mse = float("inf")
     best_l1_ratio = l1_ratios[0]
     best_alpha = alphas[0]
@@ -283,6 +299,7 @@ def _grid_search_over_datasets(
     for l1_ratio in l1_ratios:
         for alpha in alphas:
             mse_values = []
+            point_failures: List[str] = []
             for predictor_dosages, target in datasets:
                 mse = _evaluate_one_dataset(
                     predictor_dosages,
@@ -292,9 +309,11 @@ def _grid_search_over_datasets(
                     cv_folds,
                     random_state,
                     fit_fn,
+                    failure_sink=point_failures,
                 )
                 if mse is not None:
                     mse_values.append(mse)
+            failures_by_point[(l1_ratio, alpha)] = point_failures
 
             if len(mse_values) > 0:
                 mean_mse = float(np.mean(mse_values))
@@ -328,6 +347,13 @@ def _grid_search_over_datasets(
             "Check that input data has sufficient variance and valid samples."
         )
 
+    # Genuine fit exceptions at the best grid point, by exception class. A subset
+    # of ``n_variants_failed`` (which also counts intercept-only/no-eval
+    # datasets); surfaces *why* fits raised (P5.1).
+    failure_reasons = _tally_failure_reasons(
+        failures_by_point.get((best_l1_ratio, best_alpha), [])
+    )
+
     return GridSearchResult(
         best_l1_ratio=best_l1_ratio,
         best_alpha=best_alpha,
@@ -335,6 +361,7 @@ def _grid_search_over_datasets(
         grid_results=grid_results,
         n_variants_sampled=n_variants_sampled,
         n_variants_failed=total_failed,
+        failure_reasons=failure_reasons,
     )
 
 
@@ -615,18 +642,22 @@ def optuna_hyperparameter_search(
         )
 
     trial_history: List[dict] = []
+    trial_failures: Dict[int, List[str]] = {}
 
     def objective(trial: "optuna.Trial") -> float:
         l1_ratio = trial.suggest_float("l1_ratio", l1_min, l1_max)
         alpha = trial.suggest_float("alpha", alpha_min, alpha_max, log=True)
         mse_values = []
+        failure_sink: List[str] = []
         for predictor_dosages, target in datasets:
             mse = _evaluate_one_dataset(
                 predictor_dosages, target, l1_ratio, alpha,
                 cv_folds, seed, fit_single_variant_model,
+                failure_sink=failure_sink,
             )
             if mse is not None:
                 mse_values.append(mse)
+        trial_failures[trial.number] = failure_sink
         mean_mse = float(np.mean(mse_values)) if mse_values else float("inf")
         trial_history.append({
             "trial_number": trial.number,
@@ -664,11 +695,15 @@ def optuna_hyperparameter_search(
             n_variants_failed = n_variants_sampled - best_trial_entry["n_variants_evaluated"]
         else:
             n_variants_failed = 0
+        failure_reasons = _tally_failure_reasons(
+            trial_failures.get(study.best_trial.number, [])
+        )
     else:
         best_l1_ratio = l1_min
         best_alpha = alpha_min
         best_mean_cv_mse = float("inf")
         n_variants_failed = n_variants_sampled
+        failure_reasons = {}
 
     return OptunaSearchResult(
         best_l1_ratio=best_l1_ratio,
@@ -679,6 +714,7 @@ def optuna_hyperparameter_search(
         n_variants_failed=n_variants_failed,
         trial_history=trial_history,
         optimization_time_seconds=optimization_time,
+        failure_reasons=failure_reasons,
     )
 
 

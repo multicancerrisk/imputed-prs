@@ -12,6 +12,7 @@ from imputed_prs.core.regions import GenomicRegion, merge_variant_windows
 from imputed_prs.core.types import (
     ProjectionRegionModel,
     ProjectionTrainingResult,
+    TrainingFailure,
 )
 from imputed_prs.models.projection import fit_single_region_model
 
@@ -116,7 +117,9 @@ def _fit_one_region(
     cv_folds: int,
     random_state: Optional[int],
     max_predictors: Optional[int],
-) -> Tuple[str, Optional[ProjectionRegionModel], Optional[np.ndarray], bool]:
+) -> Tuple[
+    str, Optional[ProjectionRegionModel], Optional[np.ndarray], bool, Optional[TrainingFailure]
+]:
     """Fit projection model for a single region (parallelizable).
 
     Args:
@@ -132,10 +135,16 @@ def _fit_one_region(
         max_predictors: Maximum number of predictors per region.
 
     Returns:
-        Tuple of (region_id, model_or_None, cv_predictions_or_None, is_intercept_only).
+        Tuple of (region_id, model, cv_predictions, is_intercept_only, failure).
+        ``failure`` is a TrainingFailure on failure (carrying the region's PRS
+        member_ids) and None otherwise.
     """
     region_id = f"chr{region.chromosome}:{region.start}-{region.end}"
 
+    # Diagnostics captured for failure reporting (P5.1); bound progressively.
+    n_valid_samples: Optional[int] = None
+    target_variance: Optional[float] = None
+    n_predictors: Optional[int] = None
     try:
         # Get betas for PRS variants in this region
         indices = region.prs_variant_indices
@@ -159,6 +168,10 @@ def _fit_one_region(
         X_region = X[:, indices]
         target = X_region @ betas
 
+        valid = ~np.isnan(target)
+        n_valid_samples = int(valid.sum())
+        target_variance = float(np.nanvar(target)) if valid.any() else 0.0
+
         # Find platform variants in region
         predictor_ids, platform_indices = _find_platform_variants_in_region(
             region, platform_variant_info, max_predictors
@@ -169,6 +182,7 @@ def _fit_one_region(
             predictor_dosages = Z[:, platform_indices]
         else:
             predictor_dosages = np.empty((Z.shape[0], 0))
+        n_predictors = int(predictor_dosages.shape[1])
 
         # Fit model
         result = fit_single_region_model(
@@ -227,10 +241,22 @@ def _fit_one_region(
             prs_other_alleles=prs_other_alleles,
         )
 
-        return (region_id, model, result.cv_predictions, result.is_intercept_only)
+        return (region_id, model, result.cv_predictions, result.is_intercept_only, None)
 
-    except Exception:
-        return (region_id, None, None, False)
+    except Exception as exc:
+        # Capture a structured failure reason instead of silently dropping it (P5.1).
+        # member_ids lets the orchestrator attribute the region failure to each
+        # affected PRS variant in its dispositions.
+        failure = TrainingFailure(
+            unit_id=region_id,
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            n_valid_samples=n_valid_samples,
+            target_variance=target_variance,
+            n_predictors=n_predictors,
+            member_ids=tuple(region.prs_variant_ids),
+        )
+        return (region_id, None, None, False, failure)
 
 
 class ProjectionRegionTrainer:
@@ -398,12 +424,15 @@ class ProjectionRegionTrainer:
         # Collect results
         region_models: Dict[str, ProjectionRegionModel] = {}
         cv_predictions: Dict[str, np.ndarray] = {}
+        failures: Dict[str, TrainingFailure] = {}
         n_regions_failed = 0
         n_intercept_only = 0
 
-        for region_id, model, cv_preds, is_intercept_only in results:
+        for region_id, model, cv_preds, is_intercept_only, failure in results:
             if model is None:
                 n_regions_failed += 1
+                if failure is not None:
+                    failures[failure.unit_id] = failure
                 continue
 
             region_models[region_id] = model
@@ -424,4 +453,5 @@ class ProjectionRegionTrainer:
             n_regions_failed=n_regions_failed,
             n_intercept_only=n_intercept_only,
             training_summary=training_summary,
+            failures=failures,
         )

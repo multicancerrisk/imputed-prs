@@ -23,6 +23,7 @@ from imputed_prs.core.types import (
     GenotypeData,
     ImputedVariantModel,
     PredictionResult,
+    TrainingFailure,
     TrainingResult,
     VariantInfo,
 )
@@ -815,6 +816,7 @@ class LinearImputationPRS:
             missing_drop_reason=missing_drop_reason,
             observed_fallback_ids=observed_fallback_ids,
             fallback_no_target_ids=fallback_no_target_ids,
+            training_failures=training_result.failures,
         )
 
         # Step 13: Populate instance state
@@ -855,6 +857,7 @@ class LinearImputationPRS:
         missing_drop_reason: Dict[str, str],
         observed_fallback_ids: Optional[Set[str]] = None,
         fallback_no_target_ids: Optional[Set[str]] = None,
+        training_failures: Optional[Dict[str, TrainingFailure]] = None,
     ) -> List[Dict[str, Any]]:
         """Build one disposition record per input PRS variant.
 
@@ -868,9 +871,16 @@ class LinearImputationPRS:
         fallback model was trained (P1.8) and ``fallback_reason`` explains its
         absence ({no_reference_target, no_fallback_model}); both are False/None
         for non-observed rows.
+
+        ``training_failures`` (variant_id -> TrainingFailure) adds the
+        ``failure_error_type``/``failure_error_message``/``failure_n_valid_samples``/
+        ``failure_target_variance`` columns explaining *why* a training fit raised
+        (P5.1); all None for variants that did not fail training. ``reason`` is
+        left unchanged ("training_failed") so existing aggregation is stable.
         """
         observed_fallback_ids = observed_fallback_ids or set()
         fallback_no_target_ids = fallback_no_target_ids or set()
+        training_failures = training_failures or {}
         dispositions: List[Dict[str, Any]] = []
         for _, row in prs_df.iterrows():
             var_id = row["variant_id"]
@@ -902,6 +912,7 @@ class LinearImputationPRS:
                         else "no_fallback_model"
                     )
 
+            failure = training_failures.get(var_id)
             dispositions.append({
                 "variant_id": var_id,
                 "chromosome": str(row["chromosome"]),
@@ -913,6 +924,16 @@ class LinearImputationPRS:
                 "reason": reason,
                 "has_fallback": has_fallback,
                 "fallback_reason": fallback_reason,
+                "failure_error_type": failure.error_type if failure is not None else None,
+                "failure_error_message": (
+                    failure.error_message if failure is not None else None
+                ),
+                "failure_n_valid_samples": (
+                    failure.n_valid_samples if failure is not None else None
+                ),
+                "failure_target_variance": (
+                    failure.target_variance if failure is not None else None
+                ),
             })
         return dispositions
 
@@ -1448,6 +1469,19 @@ class LinearImputationPRS:
 
         coverage = (n_observed + n_imputed) / n_definition if n_definition else 0.0
 
+        # Training-failure breakdown by exception class (P5.1). Loaded models have
+        # no training result -> empty/zero.
+        if self._training_result is not None:
+            training_failures_by_type: Dict[str, int] = {}
+            for f in self._training_result.failures.values():
+                training_failures_by_type[f.error_type] = (
+                    training_failures_by_type.get(f.error_type, 0) + 1
+                )
+            n_training_failed = len(self._training_result.failures)
+        else:
+            training_failures_by_type = {}
+            n_training_failed = 0
+
         return {
             "n_total_variants": n_definition,
             "n_definition_variants": n_definition,
@@ -1457,6 +1491,8 @@ class LinearImputationPRS:
             "n_intercept_only": n_intercept_only,
             "n_dropped": n_dropped,
             "dropped_by_reason": dropped_by_reason,
+            "n_training_failed": n_training_failed,
+            "training_failures_by_type": training_failures_by_type,
             "coverage": coverage,
             "mean_imputation_r2": mean_r2,
             "prs_id": self._prs_id,

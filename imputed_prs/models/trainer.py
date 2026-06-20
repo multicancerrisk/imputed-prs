@@ -11,6 +11,7 @@ from imputed_prs.core.harmonizer import filter_to_local_window
 from imputed_prs.core.types import (
     ImputedVariantModel,
     SingleVariantModelResult,
+    TrainingFailure,
     TrainingResult,
 )
 from imputed_prs.models.elastic_net import fit_single_variant_model
@@ -174,7 +175,9 @@ def _fit_one_variant(
     tuning_scope: str = "none",
     l1_ratios: Optional[List[float]] = None,
     alphas: Optional[List[float]] = None,
-) -> Tuple[int, Optional[ImputedVariantModel], Optional[np.ndarray], bool]:
+) -> Tuple[
+    int, Optional[ImputedVariantModel], Optional[np.ndarray], bool, Optional[TrainingFailure]
+]:
     """Fit imputation model for a single variant.
 
     Args:
@@ -196,12 +199,23 @@ def _fit_one_variant(
         alphas: Grid for per-variant search (defaults applied when None).
 
     Returns:
-        Tuple of (variant_idx, model, cv_predictions, is_intercept_only).
-        Model and cv_predictions are None if fitting failed.
+        Tuple of (variant_idx, model, cv_predictions, is_intercept_only, failure).
+        Model and cv_predictions are None if fitting failed; ``failure`` is a
+        TrainingFailure on failure and None otherwise.
     """
+    # Diagnostics captured for failure reporting (P5.1). Initialized to None and
+    # bound progressively so a failure reports whatever context was available
+    # when it raised.
+    n_valid_samples: Optional[int] = None
+    target_variance: Optional[float] = None
+    n_predictors: Optional[int] = None
     try:
         # Extract target dosages
         target_dosages = X[:, variant_idx]
+
+        valid = ~np.isnan(target_dosages)
+        n_valid_samples = int(valid.sum())
+        target_variance = float(np.var(target_dosages[valid])) if valid.any() else 0.0
 
         # Filter to local window
         window_result = filter_to_local_window(
@@ -223,6 +237,7 @@ def _fit_one_variant(
             predictor_dosages = np.empty((Z.shape[0], 0))
             predictor_ids = []
             predictor_rows = platform_variant_info.iloc[[]]
+        n_predictors = int(predictor_dosages.shape[1])
 
         # Fit model. For per-variant tuning, grid-search this variant's own local
         # window (same matrix used below) and keep the best fit; otherwise fit once
@@ -256,11 +271,19 @@ def _fit_one_variant(
             predictor_dosages=predictor_dosages,
         )
 
-        return (variant_idx, model, result.cv_predictions, result.is_intercept_only)
+        return (variant_idx, model, result.cv_predictions, result.is_intercept_only, None)
 
-    except Exception:
-        # Return None to indicate failure
-        return (variant_idx, None, None, False)
+    except Exception as exc:
+        # Capture a structured failure reason instead of silently dropping it (P5.1).
+        failure = TrainingFailure(
+            unit_id=str(variant_row["variant_id"]),
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            n_valid_samples=n_valid_samples,
+            target_variance=target_variance,
+            n_predictors=n_predictors,
+        )
+        return (variant_idx, None, None, False, failure)
 
 
 class ImputationModelTrainer:
@@ -457,12 +480,15 @@ class ImputationModelTrainer:
         # Collect results
         models: Dict[str, ImputedVariantModel] = {}
         cv_predictions: Dict[str, np.ndarray] = {}
+        failures: Dict[str, TrainingFailure] = {}
         n_variants_failed = 0
         n_intercept_only = 0
 
-        for variant_idx, model, cv_preds, is_intercept_only in results:
+        for variant_idx, model, cv_preds, is_intercept_only, failure in results:
             if model is None:
                 n_variants_failed += 1
+                if failure is not None:
+                    failures[failure.unit_id] = failure
                 continue
 
             variant_id = model.variant_id
@@ -484,4 +510,5 @@ class ImputationModelTrainer:
             n_variants_failed=n_variants_failed,
             n_intercept_only=n_intercept_only,
             training_summary=training_summary,
+            failures=failures,
         )

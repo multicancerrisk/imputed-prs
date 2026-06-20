@@ -735,3 +735,55 @@ class TestReproducibility:
             m2 = result2.models[var_id]
             assert m1.imputation_r2 == m2.imputation_r2
             assert np.allclose(m1.coefficients, m2.coefficients)
+
+
+class TestTrainerFailureReasons:
+    """P5.1: per-variant training failures are captured with a structured reason,
+    not silently reduced to a bare count."""
+
+    def test_fit_failure_is_captured_with_structured_reason(self, monkeypatch):
+        """A fit that raises is recorded in ``failures`` with the exception class,
+        message, and the diagnostics bound before the fit call."""
+        Z, X, prs_variants, platform_variant_info = create_test_data(
+            n_samples=120, n_platform_variants=40, n_missing_variants=4,
+        )
+
+        def boom(*args, **kwargs):
+            raise ValueError("synthetic fit failure")
+
+        monkeypatch.setattr(
+            "imputed_prs.models.trainer.fit_single_variant_model", boom
+        )
+
+        trainer = ImputationModelTrainer(
+            window_size=100_000, cv_folds=5, n_jobs=1, random_state=42,
+        )
+        result = trainer.fit_all_variants(Z, X, prs_variants, platform_variant_info)
+
+        assert result.n_variants_trained == 0
+        assert result.n_variants_failed == len(prs_variants)
+        # Every failed variant is explained, keyed by its id.
+        assert len(result.failures) == len(prs_variants)
+
+        vid = prs_variants.iloc[0]["variant_id"]
+        failure = result.failures[vid]
+        assert failure.unit_id == vid
+        assert failure.error_type == "ValueError"
+        assert failure.error_message == "synthetic fit failure"
+        # Diagnostics are bound before the fit call, so they survive the raise.
+        assert failure.n_valid_samples == X.shape[0]
+        assert failure.target_variance is not None
+        assert failure.n_predictors is not None
+
+    def test_clean_training_reports_no_failures(self):
+        """A normal fit leaves ``failures`` empty (no false positives)."""
+        Z, X, prs_variants, platform_variant_info = create_test_data(
+            n_samples=200, n_platform_variants=50, n_missing_variants=5,
+        )
+        trainer = ImputationModelTrainer(
+            window_size=100_000, cv_folds=5, n_jobs=1, random_state=42,
+        )
+        result = trainer.fit_all_variants(Z, X, prs_variants, platform_variant_info)
+
+        assert result.n_variants_failed == 0
+        assert result.failures == {}

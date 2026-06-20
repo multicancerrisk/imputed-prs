@@ -326,6 +326,8 @@ class TestLinearProjectionPRSProperties:
             "n_definition_variants",
             "n_dropped",
             "dropped_by_reason",
+            "n_training_failed",
+            "training_failures_by_type",
             "coverage",
             "n_regions",
             "n_intercept_only_regions",
@@ -468,3 +470,85 @@ class TestObservedFallbackTraining:
         assert disp.loc["rs999", "status"] == "observed"
         assert bool(disp.loc["rs999", "has_fallback"]) is False
         assert disp.loc["rs999", "fallback_reason"] == "no_reference_target"
+
+
+class TestLinearProjectionPRSTrainingFailureSurfacing:
+    """P5.1: a failed region's reason is attributed to each of its member PRS
+    variants in the dispositions, and the breakdown appears in summary."""
+
+    def test_region_failure_attributed_to_member_variants(self):
+        """The per-variant disposition table explains a region failure for every
+        member variant, and only those variants."""
+        from imputed_prs.core.types import TrainingFailure
+
+        model = LinearProjectionPRS()
+        prs_df = pd.DataFrame({
+            "variant_id": ["rsA", "rsB", "rsC"],
+            "chromosome": ["1", "1", "1"],
+            "position": [100, 200, 300],
+            "effect_allele": ["A", "C", "G"],
+            "other_allele": ["G", "T", "A"],
+            "beta": [0.1, 0.2, 0.3],
+        })
+        failure = TrainingFailure(
+            unit_id="chr1:0-1000",
+            error_type="LinAlgError",
+            error_message="singular matrix",
+            n_valid_samples=80,
+            target_variance=1.5,
+            member_ids=("rsA", "rsB"),
+        )
+        dispositions = model._build_variant_dispositions(
+            prs_df=prs_df,
+            observed_kept_ids=set(),
+            covered_ids=set(),
+            ambiguous_excluded_ids=set(),
+            missing_drop_reason={},
+            training_failures={"chr1:0-1000": failure},
+        )
+        by_id = {d["variant_id"]: d for d in dispositions}
+        # Both region members get the explanation, reason left as training_failed.
+        for vid in ("rsA", "rsB"):
+            assert by_id[vid]["reason"] == "training_failed"
+            assert by_id[vid]["failure_error_type"] == "LinAlgError"
+            assert by_id[vid]["failure_error_message"] == "singular matrix"
+            assert by_id[vid]["failure_n_valid_samples"] == 80
+        # The non-member variant carries no failure detail.
+        assert by_id["rsC"]["failure_error_type"] is None
+
+    def test_region_failure_in_summary(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial, monkeypatch
+    ):
+        """End-to-end: a failed region surfaces in summary and dispositions."""
+        pytest.importorskip("cyvcf2")
+        from imputed_prs.models.projection import (
+            fit_single_region_model as real_fit,
+        )
+
+        calls = {"n": 0}
+
+        def fail_first(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise ValueError("synthetic region failure")
+            return real_fit(*args, **kwargs)
+
+        monkeypatch.setattr(
+            "imputed_prs.models.projection_trainer.fit_single_region_model", fail_first
+        )
+
+        model = LinearProjectionPRS(
+            window_size=500_000, cv_folds=3, verbose=0, random_state=42,
+        )
+        model.fit(
+            reference_genotypes=synthetic_vcf_file,
+            prs_definition=synthetic_prs_df,
+            platform_variants=platform_variants_partial,
+        )
+
+        summary = model.summary
+        assert summary["n_training_failed"] == 1
+        assert summary["training_failures_by_type"] == {"ValueError": 1}
+        disp = model.variant_dispositions.set_index("variant_id")
+        # rs4 belongs to the (single) failed region -> explained.
+        assert disp.loc["rs4", "failure_error_type"] == "ValueError"
