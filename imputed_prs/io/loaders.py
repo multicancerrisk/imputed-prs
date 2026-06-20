@@ -21,6 +21,7 @@ from imputed_prs.core.types import (
     CalibrationParams,
     EvaluationMetrics,
     ImputedVariantModel,
+    ProjectionRegionModel,
     VariantInfo,
 )
 from imputed_prs.io.exporters.csv_export import (
@@ -199,6 +200,64 @@ def _attach_observed_fallbacks(
             v.fallback = model
 
 
+def parse_imputed_model_json(m: Dict[str, Any]) -> ImputedVariantModel:
+    """Reconstruct an ImputedVariantModel from its JSON dict (schema v2 or v1.0).
+
+    v2 emits a self-describing ``predictors`` list; v1.0 used parallel
+    ``predictor_variant_ids``/``coefficients`` arrays with no predictor allele
+    metadata. Restoring the P1.3 metadata is essential: the oriented scorer indexes
+    ``predictor_counted_alleles[i]`` etc., so a model reloaded without it would
+    mis-score (or ``IndexError``) on real uploads. Shared by the imputation loader,
+    the per-observed-variant fallback models (P1.8), and the projection loader (P2.2)
+    so the JSON reconstruction lives in one place.
+    """
+    preds = m.get("predictors")
+    if preds is not None:
+        pred_ids = [p["variant_id"] for p in preds]
+        coefficients = np.array(
+            [p["coefficient"] for p in preds], dtype=np.float64
+        )
+        predictor_chromosomes = [p["chromosome"] for p in preds]
+        predictor_positions = [p["position"] for p in preds]
+        predictor_counted_alleles = [p["counted_allele"] for p in preds]
+        predictor_other_alleles = [p["other_allele"] for p in preds]
+        predictor_allele_frequencies = np.array(
+            [p["allele_frequency"] for p in preds], dtype=np.float64
+        )
+    else:
+        # v1.0 / legacy parallel-array layout (predictor allele metadata absent
+        # -> empty, preserving the historical load behavior).
+        pred_ids = m.get("predictor_variant_ids", [])
+        coefficients = np.array(m.get("coefficients", []), dtype=np.float64)
+        predictor_chromosomes = m.get("predictor_chromosomes", [])
+        predictor_positions = m.get("predictor_positions", [])
+        predictor_counted_alleles = m.get("predictor_counted_alleles", [])
+        predictor_other_alleles = m.get("predictor_other_alleles", [])
+        predictor_allele_frequencies = np.array(
+            m.get("predictor_allele_frequencies", []), dtype=np.float64
+        )
+    return ImputedVariantModel(
+        variant_id=m["variant_id"],
+        chromosome=m["chromosome"],
+        position=m["position"],
+        effect_allele=m["effect_allele"],
+        other_allele=m.get("other_allele"),
+        beta=m["beta"],
+        allele_frequency=m["allele_frequency"],
+        imputation_r2=m["imputation_r2"],
+        residual_variance=m.get("residual_variance", 0.0),
+        intercept=m["intercept"],
+        predictor_variant_ids=pred_ids,
+        coefficients=coefficients,
+        is_intercept_only=m.get("is_intercept_only", False),
+        predictor_chromosomes=predictor_chromosomes,
+        predictor_positions=predictor_positions,
+        predictor_counted_alleles=predictor_counted_alleles,
+        predictor_other_alleles=predictor_other_alleles,
+        predictor_allele_frequencies=predictor_allele_frequencies,
+    )
+
+
 def load_model_json(path: Union[str, Path]) -> Dict[str, Any]:
     """Load trained imputation model from JSON format.
 
@@ -240,6 +299,83 @@ def load_model_json(path: Union[str, Path]) -> Dict[str, Any]:
         raise ValueError(f"Missing required keys in JSON model: {missing_keys}")
 
     return data
+
+
+def load_projection_model_json(path: Union[str, Path]) -> Dict[str, Any]:
+    """Load a trained projection model from JSON (schema v2.0).
+
+    The projection analog of :func:`load_model_json`: returns the complete JSON
+    dictionary for reconstruction and JavaScript-interop inspection. Validates the
+    projection-specific key set — ``region_models`` replaces the imputation
+    ``imputed_variants`` list.
+
+    Args:
+        path: Path to the JSON model file.
+
+    Returns:
+        Dictionary with metadata, provenance, observed_variants, region_models,
+        platform_variant_index, and optional calibration_params/training_summary.
+
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        json.JSONDecodeError: If the file is not valid JSON.
+        ValueError: If required keys are missing.
+    """
+    path = Path(path)
+
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    required_keys = ["metadata", "observed_variants", "region_models"]
+    missing_keys = [k for k in required_keys if k not in data]
+    if missing_keys:
+        raise ValueError(
+            f"Missing required keys in projection JSON model: {missing_keys}"
+        )
+
+    return data
+
+
+def parse_projection_region_model(r: Dict[str, Any]) -> ProjectionRegionModel:
+    """Reconstruct a ProjectionRegionModel from its JSON dict (schema v2.0).
+
+    Inverse of ``projection_json_export._serialize_region_model``: each predictor
+    and each projected PRS variant is a self-describing object, so the index-aligned
+    dataclass arrays are rebuilt by unzipping those lists (no cross-array alignment
+    is assumed in the artifact). An intercept-only region has an empty ``predictors``
+    list and reconstructs with empty predictor arrays. ``prs_variants[].other_allele``
+    may legitimately be ``null`` (the PRS source lacked it) and is preserved as
+    ``None``.
+    """
+    predictors = r.get("predictors", [])
+    prs_variants = r.get("prs_variants", [])
+    return ProjectionRegionModel(
+        region_id=r["region_id"],
+        chromosome=r["chromosome"],
+        start=r["start"],
+        end=r["end"],
+        prs_variant_ids=[pv["variant_id"] for pv in prs_variants],
+        betas=np.array([pv["beta"] for pv in prs_variants], dtype=np.float64),
+        predictor_variant_ids=[p["variant_id"] for p in predictors],
+        coefficients=np.array(
+            [p["coefficient"] for p in predictors], dtype=np.float64
+        ),
+        intercept=r["intercept"],
+        cv_mse=r["cv_mse"],
+        cv_r2=r["cv_r2"],
+        is_intercept_only=r["is_intercept_only"],
+        mean_prs_contribution=r["mean_prs_contribution"],
+        predictor_allele_frequencies=np.array(
+            [p["allele_frequency"] for p in predictors], dtype=np.float64
+        ),
+        predictor_chromosomes=[p["chromosome"] for p in predictors],
+        predictor_positions=[p["position"] for p in predictors],
+        predictor_counted_alleles=[p["counted_allele"] for p in predictors],
+        predictor_other_alleles=[p["other_allele"] for p in predictors],
+        prs_positions=[pv["position"] for pv in prs_variants],
+        prs_effect_alleles=[pv["effect_allele"] for pv in prs_variants],
+        prs_other_alleles=[pv["other_allele"] for pv in prs_variants],
+    )
 
 
 def _load_observed_variants_hdf5(f: h5py.File) -> List[VariantInfo]:

@@ -6,7 +6,11 @@ from typing import Any, Dict, List, Optional, Set, Union
 import numpy as np
 import pandas as pd
 
-from imputed_prs.core.exceptions import ModelNotFittedError, ValidationError
+from imputed_prs.core.exceptions import (
+    DataLoadError,
+    ModelNotFittedError,
+    ValidationError,
+)
 from imputed_prs.core.harmonizer import (
     _is_ambiguous_snp,
     _normalize_chromosome,
@@ -960,6 +964,122 @@ class LinearProjectionPRS:
                 output_paths["json"] = output_path
 
         return output_paths
+
+    @classmethod
+    def load(cls, path: Union[str, Path]) -> "LinearProjectionPRS":
+        """Load a trained projection model from a JSON artifact.
+
+        Projection models export to JSON only (the browser-deployable artifact; the
+        HDF5/Arrow/CSV formats remain imputation-only), so ``load`` accepts a
+        ``.json`` file and raises on any other format.
+
+        Args:
+            path: Path to a saved projection model (a ``.json`` file).
+
+        Returns:
+            Loaded LinearProjectionPRS instance ready for prediction.
+
+        Raises:
+            DataLoadError: If the file is missing or its format is unsupported.
+        """
+        path = Path(path)
+
+        if not path.exists():
+            raise DataLoadError(f"Model file not found: {path}")
+
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            return cls._load_from_json(path)
+        raise DataLoadError(
+            f"Unsupported projection model file format: {suffix or path.name}. "
+            "Projection models are exported to JSON only (.json)."
+        )
+
+    @classmethod
+    def _load_from_json(cls, path: Path) -> "LinearProjectionPRS":
+        """Reconstruct a fitted projection model from a JSON file (schema v2.0).
+
+        Mirrors :meth:`LinearImputationPRS._load_from_json`. Restores exactly the
+        state ``predict()`` consumes: the region models (with P1.3 predictor allele
+        metadata), the observed terms (and their optional P2.4 fallbacks),
+        calibration, and the identity/provenance the build/platform guard checks.
+        Training-time diagnostics (``_training_result``/``_variant_dispositions``)
+        are not serialized and stay ``None``; ``summary``/``variant_dispositions``
+        tolerate that.
+        """
+        from imputed_prs.io.loaders import (
+            load_projection_model_json,
+            parse_imputed_model_json,
+            parse_projection_region_model,
+        )
+
+        try:
+            data = load_projection_model_json(path)
+        except Exception as e:
+            raise DataLoadError(
+                f"Failed to load projection JSON model: {e}"
+            ) from e
+
+        instance = cls()
+
+        # Observed variants, each with an optional per-variant fallback (P2.4). The
+        # fallback block is the same self-describing shape the imputation product
+        # emits, so it reconstructs through the shared reader.
+        observed_variants = []
+        for v in data.get("observed_variants", []):
+            fb = v.get("fallback")
+            observed_variants.append(
+                VariantInfo(
+                    variant_id=v["variant_id"],
+                    chromosome=v["chromosome"],
+                    position=v["position"],
+                    effect_allele=v["effect_allele"],
+                    other_allele=v.get("other_allele"),
+                    beta=v["beta"],
+                    fallback=parse_imputed_model_json(fb) if fb else None,
+                )
+            )
+
+        # Region models — each predictor / projected PRS variant is self-describing,
+        # so the index-aligned dataclass arrays rebuild via the shared reader.
+        region_models = [
+            parse_projection_region_model(r)
+            for r in data.get("region_models", [])
+        ]
+
+        # Calibration: the top-level block mirrors the imputation export; fall back
+        # to the provenance centering/scaling copy when only that is present.
+        metadata = data.get("metadata", {})
+        provenance = data.get("provenance", {})
+        calib_source = data.get("calibration_params") or provenance.get(
+            "centering_scaling"
+        )
+        calib_params = CalibrationParams(**calib_source) if calib_source else None
+
+        # Populate fitted state.
+        instance._is_fitted = True
+        instance._observed_variants = observed_variants
+        instance._region_models = region_models
+        instance._calibration_params = calib_params
+        instance._platform_variant_index = data.get("platform_variant_index")
+
+        # Identity + provenance, with the same precedence as the imputation loader:
+        # the provenance block is authoritative for the deploy fields, falling back
+        # to `metadata` for the identity fields that predate it.
+        instance._prs_id = metadata.get("prs_id")
+        instance._platform_name = (
+            metadata.get("platform_name") or provenance.get("platform_id")
+        )
+        instance._genome_build = (
+            metadata.get("genome_build") or provenance.get("genome_build")
+        )
+        instance._model_name = metadata.get("model_name")
+        instance._reference_panel_id = provenance.get("reference_panel_id")
+        instance._training_ancestry = provenance.get("training_ancestry")
+        if provenance.get("ambiguous_policy"):
+            instance._ambiguous_policy = provenance["ambiguous_policy"]
+
+        return instance
 
     def __repr__(self) -> str:
         """String representation of the model."""

@@ -19,6 +19,7 @@ import pandas as pd
 import pytest
 
 from imputed_prs import LinearImputationPRS, LinearProjectionPRS
+from imputed_prs.core.exceptions import DataLoadError
 from imputed_prs.core.types import GenotypeData
 from imputed_prs.evaluation import ImputationEvaluator
 from imputed_prs.evaluation._scoring import is_hard_called
@@ -93,7 +94,14 @@ def fitted_projection_model(vcf_file):
         window_size=500_000, cv_folds=3, verbose=0, random_state=42
     )
     model.fit(
-        reference_genotypes=vcf_file, prs_definition=_PRS_DF, platform_variants=_PLATFORM
+        reference_genotypes=vcf_file,
+        prs_definition=_PRS_DF,
+        platform_variants=_PLATFORM,
+        # Provenance so the JSON round trip exercises a deployable artifact (P1.7);
+        # symmetric with fitted_imputation_model.
+        genome_build="GRCh37",
+        reference_panel_id="1000G_phase3_EUR",
+        training_ancestry="EUR",
     )
     return model
 
@@ -259,6 +267,94 @@ class TestImputationRoundTrip:
             atol=1e-12,
             err_msg=f"format={fmt}",
         )
+
+
+class TestProjectionRoundTrip:
+    """Export -> load() -> predict equivalence for the projection product (P2.2).
+
+    Projection exports to JSON only, so this is the single-format analog of
+    TestImputationRoundTrip: a reloaded model must score a user upload identically
+    to the in-memory model through the public ``predict`` (the browser/upload path).
+    """
+
+    def test_export_load_predict_equivalence(
+        self, fitted_projection_model, user_genotype_df, tmp_path
+    ):
+        model = fitted_projection_model
+        paths = model.export(tmp_path, model_name="rt", formats=["json"])
+        loaded = LinearProjectionPRS.load(paths["json"])
+
+        # The model declares GRCh37; pass it so the build guard stays silent.
+        r0 = model.predict(
+            user_genotype_df, apply_calibration=False, genome_build="GRCh37"
+        )
+        r1 = loaded.predict(
+            user_genotype_df, apply_calibration=False, genome_build="GRCh37"
+        )
+
+        # Floats: allclose. The round trip must not perturb the score.
+        np.testing.assert_allclose(
+            [r1.prs, r1.prs_observed_component, r1.prs_imputed_component],
+            [r0.prs, r0.prs_observed_component, r0.prs_imputed_component],
+            rtol=0,
+            atol=1e-12,
+        )
+        # Ids / counts: exact.
+        assert r1.n_variants_used == r0.n_variants_used
+        assert r1.unresolved_observed_ids == r0.unresolved_observed_ids
+
+    def test_calibration_survives_round_trip(
+        self, fitted_projection_model, user_genotype_df, tmp_path
+    ):
+        """Calibration params restore, so the calibrated score round-trips too."""
+        model = fitted_projection_model
+        loaded = LinearProjectionPRS.load(
+            model.export(tmp_path, formats=["json"])["json"]
+        )
+        assert (loaded.calibration_params is None) == (
+            model.calibration_params is None
+        )
+        r0 = model.predict(
+            user_genotype_df, apply_calibration=True, genome_build="GRCh37"
+        )
+        r1 = loaded.predict(
+            user_genotype_df, apply_calibration=True, genome_build="GRCh37"
+        )
+        np.testing.assert_allclose(r1.prs, r0.prs, rtol=0, atol=1e-12)
+        if r0.prs_scaled is not None:
+            np.testing.assert_allclose(
+                r1.prs_scaled, r0.prs_scaled, rtol=0, atol=1e-12
+            )
+
+    def test_provenance_restored(self, fitted_projection_model, tmp_path):
+        """The build/platform guard's inputs survive the round trip (P1.7)."""
+        model = fitted_projection_model
+        loaded = LinearProjectionPRS.load(
+            model.export(tmp_path, formats=["json"])["json"]
+        )
+        assert loaded._genome_build == "GRCh37"
+        assert loaded._reference_panel_id == "1000G_phase3_EUR"
+        assert loaded._training_ancestry == "EUR"
+
+    def test_summary_works_after_load(self, fitted_projection_model, tmp_path):
+        """summary tolerates the un-serialized training_result (stays None)."""
+        model = fitted_projection_model
+        loaded = LinearProjectionPRS.load(
+            model.export(tmp_path, formats=["json"])["json"]
+        )
+        summary = loaded.summary
+        assert summary["n_regions"] == len(model.region_models)
+
+    def test_load_rejects_non_json(self, tmp_path):
+        """Projection exports JSON only; a non-JSON path is a clear error."""
+        bad = tmp_path / "model.hdf5"
+        bad.write_text("not json")
+        with pytest.raises(DataLoadError):
+            LinearProjectionPRS.load(bad)
+
+    def test_load_missing_file_raises(self, tmp_path):
+        with pytest.raises(DataLoadError):
+            LinearProjectionPRS.load(tmp_path / "does_not_exist.json")
 
 
 # =============================================================================

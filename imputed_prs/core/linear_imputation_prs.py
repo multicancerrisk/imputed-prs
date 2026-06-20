@@ -1194,7 +1194,7 @@ class LinearImputationPRS:
     @classmethod
     def _load_from_json(cls, path: Path) -> "LinearImputationPRS":
         """Load model from JSON file."""
-        from imputed_prs.io.loaders import load_model_json
+        from imputed_prs.io.loaders import load_model_json, parse_imputed_model_json
 
         try:
             data = load_model_json(path)
@@ -1204,58 +1204,10 @@ class LinearImputationPRS:
         # Create instance with default parameters
         instance = cls()
 
-        # v2 emits a self-describing `predictors` list; v1.0 used parallel
-        # `predictor_variant_ids`/`coefficients` arrays with no predictor allele
-        # metadata. Restoring the P1.3 metadata is essential: the oriented scorer
-        # indexes predictor_counted_alleles[i] etc., so a model reloaded without it
-        # would mis-score (or IndexError) on real uploads. Shared by the imputed
-        # models and the per-observed-variant fallback models (P1.8).
-        def _parse_imputed_model(m: dict) -> ImputedVariantModel:
-            preds = m.get("predictors")
-            if preds is not None:
-                pred_ids = [p["variant_id"] for p in preds]
-                coefficients = np.array(
-                    [p["coefficient"] for p in preds], dtype=np.float64
-                )
-                predictor_chromosomes = [p["chromosome"] for p in preds]
-                predictor_positions = [p["position"] for p in preds]
-                predictor_counted_alleles = [p["counted_allele"] for p in preds]
-                predictor_other_alleles = [p["other_allele"] for p in preds]
-                predictor_allele_frequencies = np.array(
-                    [p["allele_frequency"] for p in preds], dtype=np.float64
-                )
-            else:
-                # v1.0 / legacy parallel-array layout (predictor allele metadata
-                # absent -> empty, preserving the historical load behavior).
-                pred_ids = m.get("predictor_variant_ids", [])
-                coefficients = np.array(m.get("coefficients", []), dtype=np.float64)
-                predictor_chromosomes = m.get("predictor_chromosomes", [])
-                predictor_positions = m.get("predictor_positions", [])
-                predictor_counted_alleles = m.get("predictor_counted_alleles", [])
-                predictor_other_alleles = m.get("predictor_other_alleles", [])
-                predictor_allele_frequencies = np.array(
-                    m.get("predictor_allele_frequencies", []), dtype=np.float64
-                )
-            return ImputedVariantModel(
-                variant_id=m["variant_id"],
-                chromosome=m["chromosome"],
-                position=m["position"],
-                effect_allele=m["effect_allele"],
-                other_allele=m.get("other_allele"),
-                beta=m["beta"],
-                allele_frequency=m["allele_frequency"],
-                imputation_r2=m["imputation_r2"],
-                residual_variance=m.get("residual_variance", 0.0),
-                intercept=m["intercept"],
-                predictor_variant_ids=pred_ids,
-                coefficients=coefficients,
-                is_intercept_only=m.get("is_intercept_only", False),
-                predictor_chromosomes=predictor_chromosomes,
-                predictor_positions=predictor_positions,
-                predictor_counted_alleles=predictor_counted_alleles,
-                predictor_other_alleles=predictor_other_alleles,
-                predictor_allele_frequencies=predictor_allele_frequencies,
-            )
+        # `parse_imputed_model_json` restores the self-describing v2 `predictors`
+        # list (or the v1.0 parallel arrays), including the P1.3 predictor allele
+        # metadata the oriented scorer indexes. Shared with the projection loader
+        # (P2.2) so the two products reconstruct identically.
 
         # Parse observed variants, each with an optional fallback model (P1.8).
         observed_variants = []
@@ -1269,13 +1221,13 @@ class LinearImputationPRS:
                     effect_allele=v["effect_allele"],
                     other_allele=v.get("other_allele"),
                     beta=v["beta"],
-                    fallback=_parse_imputed_model(fb) if fb else None,
+                    fallback=parse_imputed_model_json(fb) if fb else None,
                 )
             )
 
         # Parse imputed models.
         imputed_models = [
-            _parse_imputed_model(m) for m in data.get("imputed_variants", [])
+            parse_imputed_model_json(m) for m in data.get("imputed_variants", [])
         ]
 
         # Parse calibration params if present

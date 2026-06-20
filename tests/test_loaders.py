@@ -9,11 +9,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from imputed_prs.core.exceptions import DataLoadError
 from imputed_prs.core.linear_imputation_prs import LinearImputationPRS
+from imputed_prs.core.linear_projection_prs import LinearProjectionPRS
 from imputed_prs.core.types import (
     CalibrationParams,
     EvaluationMetrics,
     ImputedVariantModel,
+    ProjectionRegionModel,
     VariantInfo,
 )
 from imputed_prs.io.exporters.arrow_export import (
@@ -23,9 +26,13 @@ from imputed_prs.io.exporters.arrow_export import (
 from imputed_prs.io.exporters.csv_export import export_variant_table
 from imputed_prs.io.exporters.hdf5_export import export_to_hdf5
 from imputed_prs.io.exporters.json_export import export_to_json
+from imputed_prs.io.exporters.projection_json_export import (
+    export_projection_to_json,
+)
 from imputed_prs.io.loaders import load_model_hdf5, load_model_json
 from imputed_prs.io.user_genotypes import load_raw_user_genotypes
 from imputed_prs.models.predictor import compute_imputed_prs_oriented
+from imputed_prs.models.projection_predictor import compute_projected_prs_oriented
 
 
 @pytest.fixture
@@ -1096,3 +1103,206 @@ class TestV2FormatRoundTrip:
         )
         assert rs4.predictor_counted_alleles == []
         assert rs4.predictor_allele_frequencies.size == 0
+
+
+def _projection_regions():
+    """One real region (2 predictors -> 1 projected PRS variant) and one
+    intercept-only region whose PRS variant has a null other_allele, so the round
+    trip exercises empty predictor arrays and JSON-null preservation."""
+    full = ProjectionRegionModel(
+        region_id="chr1:1-500000",
+        chromosome="1",
+        start=1,
+        end=500_000,
+        prs_variant_ids=["rs2000"],
+        betas=np.array([0.3]),
+        predictor_variant_ids=["rs1000", "rs1001"],
+        coefficients=np.array([0.2, -0.1]),
+        intercept=0.05,
+        cv_mse=0.01,
+        cv_r2=0.8,
+        is_intercept_only=False,
+        mean_prs_contribution=0.5,
+        predictor_allele_frequencies=np.array([0.3, 0.4]),
+        predictor_chromosomes=["1", "1"],
+        predictor_positions=[100, 200],
+        predictor_counted_alleles=["A", "C"],
+        predictor_other_alleles=["G", "T"],
+        prs_positions=[300],
+        prs_effect_alleles=["A"],
+        prs_other_alleles=["G"],
+    )
+    intercept_only = ProjectionRegionModel(
+        region_id="chr2:1-500000",
+        chromosome="2",
+        start=1,
+        end=500_000,
+        prs_variant_ids=["rs3000"],
+        betas=np.array([0.15]),
+        predictor_variant_ids=[],
+        coefficients=np.array([]),
+        intercept=0.42,
+        cv_mse=0.02,
+        cv_r2=0.0,
+        is_intercept_only=True,
+        mean_prs_contribution=0.1,
+        predictor_allele_frequencies=np.array([]),
+        predictor_chromosomes=[],
+        predictor_positions=[],
+        predictor_counted_alleles=[],
+        predictor_other_alleles=[],
+        prs_positions=[400],
+        prs_effect_alleles=["T"],
+        prs_other_alleles=[None],  # PRS source lacked other_allele
+    )
+    return [full, intercept_only]
+
+
+class TestProjectionJSONRoundTrip:
+    """Export -> ``load()`` round trip for the projection product (P2.2).
+
+    The projection analog of ``TestJSONv2RoundTrip``: build region models directly,
+    export, reload, and assert exact reconstruction of the region / predictor / PRS
+    metadata plus score-equivalence on ``compute_projected_prs_oriented`` (the teeth
+    — a loader that dropped predictor allele metadata would mis-score or
+    ``IndexError``).
+    """
+
+    def _export_and_load(self, tmpdir, observed, regions, **kwargs):
+        json_path = Path(tmpdir) / "proj.json"
+        export_projection_to_json(
+            require_provenance=False,
+            output_path=json_path,
+            observed_variants=observed,
+            region_models=regions,
+            **kwargs,
+        )
+        return LinearProjectionPRS.load(json_path)
+
+    def test_region_models_round_trip(self):
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.1)]
+        regions = _projection_regions()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loaded = self._export_and_load(tmpdir, observed, regions)
+
+        # Region count + ids exact.
+        assert [r.region_id for r in loaded._region_models] == [
+            r.region_id for r in regions
+        ]
+
+        lf, of = loaded._region_models[0], regions[0]
+        # Predictor metadata exact.
+        assert lf.predictor_variant_ids == of.predictor_variant_ids
+        assert lf.predictor_chromosomes == of.predictor_chromosomes
+        assert lf.predictor_positions == of.predictor_positions
+        assert lf.predictor_counted_alleles == of.predictor_counted_alleles
+        assert lf.predictor_other_alleles == of.predictor_other_alleles
+        assert lf.is_intercept_only is False
+        assert lf.region_id == of.region_id
+        assert lf.chromosome == of.chromosome
+        assert (lf.start, lf.end) == (of.start, of.end)
+        # PRS-variant metadata exact.
+        assert lf.prs_variant_ids == of.prs_variant_ids
+        assert lf.prs_positions == of.prs_positions
+        assert lf.prs_effect_alleles == of.prs_effect_alleles
+        assert lf.prs_other_alleles == of.prs_other_alleles
+        # Floats allclose.
+        np.testing.assert_allclose(
+            lf.coefficients, of.coefficients, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(lf.betas, of.betas, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(
+            lf.predictor_allele_frequencies,
+            of.predictor_allele_frequencies,
+            rtol=0,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            [lf.intercept, lf.cv_mse, lf.cv_r2, lf.mean_prs_contribution],
+            [of.intercept, of.cv_mse, of.cv_r2, of.mean_prs_contribution],
+            rtol=0,
+            atol=1e-12,
+        )
+
+    def test_intercept_only_region_round_trip(self):
+        """Empty predictor arrays and a null PRS other_allele survive the trip."""
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.1)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loaded = self._export_and_load(tmpdir, observed, _projection_regions())
+
+        li = loaded._region_models[1]
+        assert li.is_intercept_only is True
+        assert li.predictor_variant_ids == []
+        assert li.coefficients.size == 0
+        assert li.predictor_allele_frequencies.size == 0
+        assert li.predictor_counted_alleles == []
+        # A null other_allele round-trips as None (not "" or dropped).
+        assert li.prs_other_alleles == [None]
+        np.testing.assert_allclose(li.intercept, 0.42, rtol=0, atol=1e-12)
+
+    def test_oriented_score_equivalence(self):
+        """The teeth: loaded region models score raw genotypes identically."""
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.1)]
+        regions = _projection_regions()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loaded = self._export_and_load(tmpdir, observed, regions)
+
+        raw = load_raw_user_genotypes(
+            pd.DataFrame(
+                {
+                    "rsid": ["rs1000", "rs1001"],
+                    "chrom": ["1", "1"],
+                    "pos": [100, 200],
+                    "genotype": ["AG", "CC"],
+                }
+            )
+        )
+        orig = compute_projected_prs_oriented(raw, regions, allow_ambiguous=True)
+        new = compute_projected_prs_oriented(
+            raw, loaded._region_models, allow_ambiguous=True
+        )
+        np.testing.assert_allclose(orig[0], new[0], rtol=0, atol=1e-12)
+        np.testing.assert_allclose(orig[1], new[1], rtol=0, atol=1e-12)
+
+    def test_observed_variants_and_calibration_round_trip(self):
+        observed = [
+            VariantInfo("rs1", "1", 100, "A", "G", 0.1),
+            VariantInfo("rs2", "1", 200, "C", "T", -0.2),
+        ]
+        calib = CalibrationParams(
+            scaling_factor=1.05,
+            scaling_factor_se=0.02,
+            calibration_intercept=0.01,
+            calibration_r2=0.98,
+            sd_cv_predicted=0.5,
+            sd_true=0.52,
+            sd_scaled=0.525,
+            attenuation_factor=0.96,
+            n_calibration=200,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            loaded = self._export_and_load(
+                tmpdir, observed, _projection_regions(), calibration_params=calib
+            )
+
+        assert [v.variant_id for v in loaded._observed_variants] == ["rs1", "rs2"]
+        assert loaded._observed_variants[0].effect_allele == "A"
+        assert loaded._observed_variants[1].other_allele == "T"
+        np.testing.assert_allclose(
+            loaded._observed_variants[1].beta, -0.2, rtol=0, atol=1e-12
+        )
+        # Calibration restores field-for-field.
+        assert loaded._calibration_params is not None
+        np.testing.assert_allclose(
+            loaded._calibration_params.scaling_factor, 1.05, rtol=0, atol=1e-12
+        )
+        assert loaded._calibration_params.n_calibration == 200
+
+    def test_missing_region_models_key_raises(self):
+        """A JSON lacking ``region_models`` is rejected by the projection reader."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "bad.json"
+            with open(json_path, "w") as f:
+                json.dump({"metadata": {}, "observed_variants": []}, f)
+            with pytest.raises(DataLoadError):
+                LinearProjectionPRS.load(json_path)
