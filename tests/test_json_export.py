@@ -631,3 +631,144 @@ class TestV2Schema:
             )
             assert data["observed_variants"][0]["other_allele"] is None
             assert data["observed_variants"][0]["ambiguous"] is False
+
+
+# Committed machine-readable schema for the v2.0 deployable artifact (P1.5c).
+SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "schemas"
+    / "imputation_model_v2.schema.json"
+)
+
+
+@pytest.fixture
+def jsonschema_mod():
+    """The jsonschema module; schema tests skip if the dev dep is absent."""
+    return pytest.importorskip("jsonschema")
+
+
+@pytest.fixture
+def imputation_v2_validator(jsonschema_mod):
+    """A validator built from the committed v2 schema.
+
+    Building it also asserts the committed schema is itself a valid Draft
+    2020-12 schema (``check_schema``), so a malformed schema fails loudly.
+    """
+    with open(SCHEMA_PATH) as f:
+        schema = json.load(f)
+    validator_cls = jsonschema_mod.validators.validator_for(schema)
+    validator_cls.check_schema(schema)
+    return validator_cls(schema)
+
+
+class TestSchemaValidation:
+    """Validate exported v2 artifacts against the committed JSON Schema (P1.5c)."""
+
+    def _export(self, tmpdir, observed, imputed, **kwargs):
+        output_path = Path(tmpdir) / "model.json"
+        export_to_json(
+            output_path=output_path,
+            observed_variants=observed,
+            imputed_models=imputed,
+            **kwargs,
+        )
+        with open(output_path) as f:
+            return json.load(f)
+
+    def test_committed_schema_is_valid(self, imputation_v2_validator):
+        """The committed schema parses and passes Draft 2020-12 check_schema."""
+        # Reaching here means the fixture built the validator without raising.
+        assert imputation_v2_validator is not None
+
+    def test_full_export_validates(
+        self,
+        imputation_v2_validator,
+        sample_observed_variants,
+        sample_imputed_models,
+        sample_calibration_params,
+        sample_evaluation_metrics,
+    ):
+        """A fully-populated deployable export conforms to the schema."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._export(
+                tmpdir,
+                sample_observed_variants,
+                sample_imputed_models,
+                calibration_params=sample_calibration_params,
+                evaluation_metrics=sample_evaluation_metrics,
+                training_summary={"mean_r2": 0.75, "n_high_quality": 100},
+                platform_name="23andme_v5",
+                prs_id="PGS000004",
+                genome_build="GRCh37",
+                model_name="Test PRS Model",
+                reference_panel_id="1000G_phase3_EUR",
+                training_ancestry="EUR",
+                include_variance_scaling=True,
+            )
+        imputation_v2_validator.validate(data)  # raises on invalid
+
+    def test_minimal_export_validates(
+        self,
+        imputation_v2_validator,
+        sample_observed_variants,
+        sample_imputed_models,
+    ):
+        """A minimal export still conforms.
+
+        No calibration/evaluation/training_summary, ``include_variance_scaling``
+        off — so the optional top-level blocks are absent, ``centering_scaling``
+        is null, and imputed variants carry no ``residual_variance``.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._export(
+                tmpdir,
+                sample_observed_variants,
+                sample_imputed_models,
+                include_variance_scaling=False,
+            )
+        assert "calibration_params" not in data
+        assert "evaluation_metrics" not in data
+        assert "training_summary" not in data
+        assert data["provenance"]["centering_scaling"] is None
+        assert all("residual_variance" not in m for m in data["imputed_variants"])
+        imputation_v2_validator.validate(data)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            pytest.param(
+                lambda d: d["metadata"].__setitem__("unexpected", 1),
+                id="extra-field",
+            ),
+            pytest.param(
+                lambda d: d["imputed_variants"][0]["predictors"][0].pop(
+                    "counted_allele"
+                ),
+                id="missing-predictor-counted-allele",
+            ),
+            pytest.param(
+                lambda d: d["observed_variants"][0].__setitem__("position", "100"),
+                id="position-wrong-type",
+            ),
+            pytest.param(
+                lambda d: d["metadata"].__setitem__("format_version", "1.0"),
+                id="wrong-format-version",
+            ),
+        ],
+    )
+    def test_invalid_artifacts_are_rejected(
+        self,
+        jsonschema_mod,
+        imputation_v2_validator,
+        sample_observed_variants,
+        sample_imputed_models,
+        mutate,
+    ):
+        """The schema actually constrains: malformed artifacts fail validation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._export(
+                tmpdir, sample_observed_variants, sample_imputed_models
+            )
+        mutate(data)
+        with pytest.raises(jsonschema_mod.ValidationError):
+            imputation_v2_validator.validate(data)
