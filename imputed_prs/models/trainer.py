@@ -14,6 +14,7 @@ from imputed_prs.core.types import (
     TrainingResult,
 )
 from imputed_prs.models.elastic_net import fit_single_variant_model
+from imputed_prs.models.tuning import tune_single_variant_model
 
 
 def compute_residual_variance(allele_frequency: float, r2: float) -> float:
@@ -170,6 +171,9 @@ def _fit_one_variant(
     cv_folds: int,
     random_state: Optional[int],
     max_predictors: Optional[int],
+    tuning_scope: str = "none",
+    l1_ratios: Optional[List[float]] = None,
+    alphas: Optional[List[float]] = None,
 ) -> Tuple[int, Optional[ImputedVariantModel], Optional[np.ndarray], bool]:
     """Fit imputation model for a single variant.
 
@@ -180,11 +184,16 @@ def _fit_one_variant(
         X: Missing variant dosages (n_samples, n_missing_variants).
         platform_variant_info: Platform variant info DataFrame.
         window_size: Window size in base pairs.
-        l1_ratio: ElasticNet L1 ratio.
-        alpha: ElasticNet regularization strength.
+        l1_ratio: ElasticNet L1 ratio (used when tuning_scope != "per_variant").
+        alpha: ElasticNet regularization strength (used when not "per_variant").
         cv_folds: Number of CV folds.
         random_state: Random seed.
         max_predictors: Maximum number of predictors to use.
+        tuning_scope: "per_variant" runs a per-variant grid search on this
+            variant's local window (selecting its own l1_ratio/alpha); any other
+            value fits a single model with the supplied l1_ratio/alpha.
+        l1_ratios: Grid for per-variant search (defaults applied when None).
+        alphas: Grid for per-variant search (defaults applied when None).
 
     Returns:
         Tuple of (variant_idx, model, cv_predictions, is_intercept_only).
@@ -215,15 +224,27 @@ def _fit_one_variant(
             predictor_ids = []
             predictor_rows = platform_variant_info.iloc[[]]
 
-        # Fit model
-        result = fit_single_variant_model(
-            target_dosages=target_dosages,
-            predictor_dosages=predictor_dosages,
-            l1_ratio=l1_ratio,
-            alpha=alpha,
-            cv_folds=cv_folds,
-            random_state=random_state,
-        )
+        # Fit model. For per-variant tuning, grid-search this variant's own local
+        # window (same matrix used below) and keep the best fit; otherwise fit once
+        # with the supplied (globally tuned or default) hyperparameters.
+        if tuning_scope == "per_variant" and predictor_dosages.shape[1] > 0:
+            result = tune_single_variant_model(
+                target_dosages,
+                predictor_dosages,
+                l1_ratios=l1_ratios,
+                alphas=alphas,
+                cv_folds=cv_folds,
+                random_state=random_state,
+            )
+        else:
+            result = fit_single_variant_model(
+                target_dosages=target_dosages,
+                predictor_dosages=predictor_dosages,
+                l1_ratio=l1_ratio,
+                alpha=alpha,
+                cv_folds=cv_folds,
+                random_state=random_state,
+            )
 
         # Convert to ImputedVariantModel
         model = _convert_to_imputed_model(
@@ -258,6 +279,9 @@ class ImputationModelTrainer:
         n_jobs: int = 1,
         random_state: Optional[int] = None,
         max_predictors: Optional[int] = None,
+        tuning_scope: str = "none",
+        tuning_l1_ratios: Optional[List[float]] = None,
+        tuning_alphas: Optional[List[float]] = None,
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
         verbose: int = 1,
     ):
@@ -284,6 +308,9 @@ class ImputationModelTrainer:
         self.n_jobs = n_jobs
         self.random_state = random_state
         self.max_predictors = max_predictors
+        self.tuning_scope = tuning_scope
+        self.tuning_l1_ratios = tuning_l1_ratios
+        self.tuning_alphas = tuning_alphas
         self.progress_callback = progress_callback
         self.verbose = verbose
 
@@ -404,6 +431,9 @@ class ImputationModelTrainer:
                 self.cv_folds,
                 self.random_state,
                 self.max_predictors,
+                self.tuning_scope,
+                self.tuning_l1_ratios,
+                self.tuning_alphas,
             )
             for idx in range(n_variants)
         ]

@@ -96,7 +96,7 @@ The library provides two approaches for computing PRS when the genotyping platfo
 | Feature | `LinearImputationPRS` | `LinearProjectionPRS` |
 |---------|----------------------|----------------------|
 | **Unit of prediction** | Per-variant dosage | Per-region PRS contribution |
-| **`tuning_scope` parameter** | Yes (`global`/`per_variant`/`none`) | No (fixed parameters) |
+| **`tuning_scope` parameter** | Yes (`global`/`per_variant`/`none`) | Yes (`global`/`none`) |
 | **`evaluation_genotypes` in `fit()`** | Yes | No |
 | **Dosage clipping** | Yes (truncated normal variance) | No (target is PRS, not dosage) |
 | **Missing predictor handling** | Fallback to intercept-only | Mean-substitution ($2 \cdot AF$) |
@@ -123,6 +123,7 @@ LinearImputationPRS(
     n_jobs: int = 1,
     random_state: Optional[int] = None,
     max_predictors: Optional[int] = None,
+    max_tuning_variants: Optional[int] = 50,
     verbose: int = 1,
 )
 ```
@@ -132,13 +133,14 @@ LinearImputationPRS(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `window_size` | `int` | `1_000_000` | Size of genomic window (bp) for selecting predictor variants. Larger windows include more potential predictors but increase computation. |
-| `tuning_scope` | `str` | `"global"` | Hyperparameter tuning strategy: `"global"` (tune once), `"per_variant"` (tune each variant), or `"none"` (use provided values). |
+| `tuning_scope` | `str` | `"global"` | Hyperparameter tuning strategy. All modes tune on the same local-window matrices used in training: `"global"` (search a bounded, stratified sample of variants and apply one winning `l1_ratio`/`alpha` to all), `"per_variant"` (search each variant's own window), or `"none"` (use provided values). |
 | `l1_ratio` | `float` | `0.5` | ElasticNet L1/L2 mixing parameter. 0=Ridge, 1=Lasso. Only used when `tuning_scope="none"`. |
 | `alpha` | `float` | `0.01` | ElasticNet regularization strength. Only used when `tuning_scope="none"`. |
 | `cv_folds` | `int` | `5` | Number of cross-validation folds for training and calibration. |
 | `n_jobs` | `int` | `1` | Number of parallel jobs for training. Use `-1` for all CPUs. |
 | `random_state` | `int` | `None` | Random seed for reproducibility. |
 | `max_predictors` | `int` | `None` | Maximum number of predictor variants per model. If `None`, uses all variants in window. |
+| `max_tuning_variants` | `int` | `50` | Cap on missing variants sampled for `tuning_scope="global"`. `None` tunes on all missing variants. |
 | `verbose` | `int` | `1` | Verbosity level. 0=silent, 1=progress bar, 2=debug output. |
 
 **Example:**
@@ -356,12 +358,14 @@ The projection-based class for training region-level models and computing PRS pr
 ```python
 LinearProjectionPRS(
     window_size: int = 1_000_000,
+    tuning_scope: Literal["global", "none"] = "global",
     l1_ratio: float = 0.5,
     alpha: float = 0.01,
     cv_folds: int = 5,
     n_jobs: int = 1,
     random_state: Optional[int] = None,
     max_predictors: Optional[int] = None,
+    max_tuning_regions: Optional[int] = 50,
     verbose: int = 1,
 )
 ```
@@ -371,15 +375,15 @@ LinearProjectionPRS(
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `window_size` | `int` | `1_000_000` | Size of genomic window (bp) for defining regions and selecting predictor variants. Overlapping windows merge into regions. |
-| `l1_ratio` | `float` | `0.5` | ElasticNet L1/L2 mixing parameter. 0=Ridge, 1=Lasso. Applied directly to all regions. |
-| `alpha` | `float` | `0.01` | ElasticNet regularization strength. Applied directly to all regions. |
+| `tuning_scope` | `str` | `"global"` | Hyperparameter tuning strategy: `"global"` (search a bounded, stratified sample of regions on the same region matrices used in training, applying one winning `l1_ratio`/`alpha` to all) or `"none"` (use provided values). There is no `"per_variant"` mode for projection. |
+| `l1_ratio` | `float` | `0.5` | ElasticNet L1/L2 mixing parameter. 0=Ridge, 1=Lasso. Only used when `tuning_scope="none"`. |
+| `alpha` | `float` | `0.01` | ElasticNet regularization strength. Only used when `tuning_scope="none"`. |
 | `cv_folds` | `int` | `5` | Number of cross-validation folds for training and calibration. |
 | `n_jobs` | `int` | `1` | Number of parallel jobs for training. Use `-1` for all CPUs. |
 | `random_state` | `int` | `None` | Random seed for reproducibility. |
 | `max_predictors` | `int` | `None` | Maximum number of predictor variants per region. If `None`, uses all variants in region. |
+| `max_tuning_regions` | `int` | `50` | Cap on regions sampled for `tuning_scope="global"`. `None` tunes on all regions. |
 | `verbose` | `int` | `1` | Verbosity level. 0=silent, 1=progress bar, 2=debug output. |
-
-**Note:** Unlike `LinearImputationPRS`, there is no `tuning_scope` parameter. The provided `l1_ratio` and `alpha` are used directly for all regions.
 
 **Example:**
 

@@ -99,6 +99,7 @@ class LinearImputationPRS:
         n_jobs: int = 1,
         random_state: Optional[int] = None,
         max_predictors: Optional[int] = None,
+        max_tuning_variants: Optional[int] = 50,
         exclude_ambiguous: bool = False,
         ambiguous_maf_threshold: float = 0.4,
         verbose: int = 1,
@@ -109,10 +110,14 @@ class LinearImputationPRS:
             window_size: Size of genomic window (bp) for selecting predictor variants.
                 Larger windows include more potential predictors but increase computation.
                 Default: 1,000,000 (1 Mb).
-            tuning_scope: Hyperparameter tuning strategy:
-                - "global": Tune once on subset of variants (recommended)
-                - "per_variant": Tune separately for each variant (slow)
-                - "none": Use provided l1_ratio and alpha directly
+            tuning_scope: Hyperparameter tuning strategy. All modes tune on the
+                same local-window matrices used in training:
+                - "global": Tune once on a bounded, stratified sample of missing
+                  variants (by chromosome / MAF / |beta|) and apply the winning
+                  l1_ratio/alpha to every variant (recommended).
+                - "per_variant": Grid-search each variant's own local window and
+                  give each variant its own l1_ratio/alpha (slow).
+                - "none": Use provided l1_ratio and alpha directly.
                 Default: "global".
             l1_ratio: ElasticNet L1/L2 mixing parameter. 0=pure Ridge, 1=pure Lasso.
                 Only used when tuning_scope="none". Default: 0.5.
@@ -125,6 +130,9 @@ class LinearImputationPRS:
             random_state: Random seed for reproducibility. Default: None.
             max_predictors: Maximum number of predictor variants per model.
                 If None, uses all variants in window. Default: None.
+            max_tuning_variants: Cap on the number of missing variants sampled for
+                tuning_scope="global". None tunes on all missing variants. Must be
+                positive when set. Default: 50.
             exclude_ambiguous: If True, drop strand-ambiguous (palindromic A/T and
                 C/G) SNPs whose reference minor-allele frequency exceeds
                 ``ambiguous_maf_threshold``, since their strand cannot be resolved
@@ -135,6 +143,16 @@ class LinearImputationPRS:
                 Default: 1.
         """
         # Configuration parameters
+        if tuning_scope not in ("global", "per_variant", "none"):
+            raise ValidationError(
+                f"tuning_scope must be 'global', 'per_variant', or 'none', "
+                f"got {tuning_scope!r}"
+            )
+        if max_tuning_variants is not None and max_tuning_variants <= 0:
+            raise ValidationError(
+                f"max_tuning_variants must be positive or None, "
+                f"got {max_tuning_variants}"
+            )
         self.window_size = window_size
         self.tuning_scope = tuning_scope
         self.l1_ratio = l1_ratio
@@ -143,6 +161,7 @@ class LinearImputationPRS:
         self.n_jobs = n_jobs
         self.random_state = random_state
         self.max_predictors = max_predictors
+        self.max_tuning_variants = max_tuning_variants
         self.exclude_ambiguous = exclude_ambiguous
         self.ambiguous_maf_threshold = ambiguous_maf_threshold
         self.verbose = verbose
@@ -488,7 +507,13 @@ class LinearImputationPRS:
                 f"missing_prs_df={len(missing_prs_df)} variants"
             )
 
-        # Step 9: Hyperparameter tuning (if tuning_scope="global")
+        # Step 9: Hyperparameter tuning. "global" searches a stratified sample of
+        # missing variants on their local windows (the same matrices training uses)
+        # and applies one winning (l1_ratio, alpha) to every variant. "per_variant"
+        # defers to the trainer, which tunes each variant on its own window.
+        # "none" (and the no-data cases) use the configured l1_ratio/alpha.
+        effective_l1_ratio = self.l1_ratio
+        effective_alpha = self.alpha
         if self.tuning_scope == "global" and X.shape[1] > 0 and Z.shape[1] > 0:
             if self.verbose >= 1:
                 print("Running global hyperparameter search...")
@@ -496,7 +521,11 @@ class LinearImputationPRS:
                 grid_result = global_hyperparameter_search(
                     Z=Z,
                     X_missing=X,
-                    sample_indices=None,  # Use all variants
+                    missing_variant_info=missing_prs_df,
+                    platform_variant_info=platform_variant_info,
+                    window_size=self.window_size,
+                    max_predictors=self.max_predictors,
+                    max_tuning_variants=self.max_tuning_variants,
                     cv_folds=self.cv_folds,
                     random_state=self.random_state,
                 )
@@ -505,21 +534,13 @@ class LinearImputationPRS:
                 if self.verbose >= 1:
                     print(
                         f"Best hyperparameters: l1_ratio={effective_l1_ratio}, "
-                        f"alpha={effective_alpha}"
+                        f"alpha={effective_alpha} "
+                        f"(tuned on {grid_result.n_variants_sampled} variants)"
                     )
             except ValidationError:
                 # Fall back to defaults if tuning fails
-                effective_l1_ratio = self.l1_ratio
-                effective_alpha = self.alpha
                 if self.verbose >= 1:
                     print("Hyperparameter search failed, using defaults")
-        elif self.tuning_scope == "none" or X.shape[1] == 0 or Z.shape[1] == 0:
-            effective_l1_ratio = self.l1_ratio
-            effective_alpha = self.alpha
-        else:
-            # per_variant tuning - let trainer handle it
-            effective_l1_ratio = self.l1_ratio
-            effective_alpha = self.alpha
 
         # Step 10: Train imputation models
         if X.shape[1] > 0:
@@ -534,6 +555,7 @@ class LinearImputationPRS:
                 n_jobs=self.n_jobs,
                 random_state=self.random_state,
                 max_predictors=self.max_predictors,
+                tuning_scope=self.tuning_scope,
                 verbose=self.verbose,
             )
             training_result = trainer.fit_all_variants(
@@ -712,6 +734,7 @@ class LinearImputationPRS:
                 n_jobs=self.n_jobs,
                 random_state=self.random_state,
                 max_predictors=self.max_predictors,
+                tuning_scope=self.tuning_scope,
                 verbose=0,
             )
             fb_result = fb_trainer.fit_all_variants(

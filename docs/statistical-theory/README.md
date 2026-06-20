@@ -132,19 +132,27 @@ LinearProjectionPRS(alpha=0.01, l1_ratio=0.5)
 
 The two methods differ in their tuning support:
 
+All tuning modes evaluate candidate hyperparameters on the **same local-window
+(imputation) or region (projection) matrices used in training**, so the tuner never
+optimizes a model that is not the one ultimately fit.
+
 **Linear Imputation** supports the `tuning_scope` parameter with three strategies:
 
 | Strategy | Behavior |
 |----------|----------|
-| `"global"` | Tune once on a random subset of variants, apply best parameters to all |
-| `"per_variant"` | Tune separately for each variant (slower, more precise) |
+| `"global"` | Tune once on a bounded, stratified sample of missing variants (by chromosome / MAF / \|beta\|), each scored on its own local window; apply the winning `alpha`/`l1_ratio` to all variants. Sample size is capped by `max_tuning_variants`. |
+| `"per_variant"` | Grid-search each variant's own local window and give each variant its own `alpha`/`l1_ratio` (slower, more precise). |
 | `"none"` | Use the provided `alpha` and `l1_ratio` directly |
 
 See `imputed_prs/models/tuning.py` for the tuning implementation and `imputed_prs/models/elastic_net.py:fit_single_variant_model()` for per-variant fitting.
 
-**Linear Projection** currently uses fixed parameters directly (equivalent to `"none"`). The `alpha` and `l1_ratio` passed to `LinearProjectionPRS()` are applied uniformly to all region models.
+**Linear Projection** supports `tuning_scope` with `"global"` and `"none"`. `"global"`
+searches a bounded, stratified sample of regions (capped by `max_tuning_regions`) on
+the same region matrices training uses — target $S_R = X_R \beta_R$, predictors the
+region's platform variants — and applies the winning `alpha`/`l1_ratio` to all region
+models. There is no `"per_variant"` mode for projection.
 
-See `imputed_prs/models/projection.py:fit_single_region_model()` for the region fitting implementation.
+See `imputed_prs/models/projection.py:fit_single_region_model()` for the region fitting implementation and `imputed_prs/models/tuning.py:projection_hyperparameter_search()` for the region tuner.
 
 ---
 

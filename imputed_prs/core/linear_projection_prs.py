@@ -1,7 +1,7 @@
 """Main LinearProjectionPRS class for training and prediction."""
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Literal, Optional, Set, Union
 
 import numpy as np
 import pandas as pd
@@ -45,6 +45,7 @@ from imputed_prs.io.exporters.projection_json_export import export_projection_to
 from imputed_prs.models.projection_predictor import ProjectionPredictor
 from imputed_prs.models.projection_trainer import ProjectionRegionTrainer
 from imputed_prs.models.trainer import ImputationModelTrainer
+from imputed_prs.models.tuning import projection_hyperparameter_search
 
 
 class LinearProjectionPRS:
@@ -70,12 +71,14 @@ class LinearProjectionPRS:
     def __init__(
         self,
         window_size: int = 1_000_000,
+        tuning_scope: Literal["global", "none"] = "global",
         l1_ratio: float = 0.5,
         alpha: float = 0.01,
         cv_folds: int = 5,
         n_jobs: int = 1,
         random_state: Optional[int] = None,
         max_predictors: Optional[int] = None,
+        max_tuning_regions: Optional[int] = 50,
         exclude_ambiguous: bool = False,
         ambiguous_maf_threshold: float = 0.4,
         verbose: int = 1,
@@ -85,24 +88,44 @@ class LinearProjectionPRS:
         Args:
             window_size: Size of genomic window (bp) for defining regions
                 and selecting predictor variants. Default: 1,000,000 (1 Mb).
+            tuning_scope: Hyperparameter tuning strategy:
+                - "global": Tune once on a bounded, stratified sample of regions
+                  using the same region matrices as training (recommended).
+                - "none": Use the provided l1_ratio/alpha directly.
+                Default: "global".
             l1_ratio: ElasticNet L1/L2 mixing parameter (0=Ridge, 1=Lasso).
-                Default: 0.5.
-            alpha: ElasticNet regularization strength. Default: 0.01.
+                Only used when tuning_scope="none". Default: 0.5.
+            alpha: ElasticNet regularization strength. Only used when
+                tuning_scope="none". Default: 0.01.
             cv_folds: Number of cross-validation folds. Default: 5.
             n_jobs: Number of parallel jobs for training. Default: 1.
             random_state: Random seed for reproducibility. Default: None.
             max_predictors: Maximum predictor variants per region.
                 Default: None (no limit).
+            max_tuning_regions: Cap on the number of regions sampled for
+                tuning_scope="global". None tunes on all regions. Must be positive
+                when set. Default: 50.
             verbose: Verbosity level (0=silent, 1=progress, 2=debug).
                 Default: 1.
         """
+        if tuning_scope not in ("global", "none"):
+            raise ValidationError(
+                f"tuning_scope must be 'global' or 'none', got {tuning_scope!r}"
+            )
+        if max_tuning_regions is not None and max_tuning_regions <= 0:
+            raise ValidationError(
+                f"max_tuning_regions must be positive or None, "
+                f"got {max_tuning_regions}"
+            )
         self.window_size = window_size
+        self.tuning_scope = tuning_scope
         self.l1_ratio = l1_ratio
         self.alpha = alpha
         self.cv_folds = cv_folds
         self.n_jobs = n_jobs
         self.random_state = random_state
         self.max_predictors = max_predictors
+        self.max_tuning_regions = max_tuning_regions
         self.exclude_ambiguous = exclude_ambiguous
         self.ambiguous_maf_threshold = ambiguous_maf_threshold
         self.verbose = verbose
@@ -418,6 +441,41 @@ class LinearProjectionPRS:
                 f"missing_prs_df={len(missing_prs_df)} variants"
             )
 
+        # Step 8.5: Hyperparameter tuning. "global" searches a stratified sample of
+        # regions on the same region matrices training uses (predictors selected by
+        # the identical region/window logic; target = sum of PRS contributions) and
+        # applies one winning (l1_ratio, alpha) to every region. "none" (and the
+        # no-data cases) use the configured l1_ratio/alpha.
+        effective_l1_ratio = self.l1_ratio
+        effective_alpha = self.alpha
+        if self.tuning_scope == "global" and X.shape[1] > 0 and Z.shape[1] > 0:
+            if self.verbose >= 1:
+                print("Running projection hyperparameter search...")
+            try:
+                grid_result = projection_hyperparameter_search(
+                    Z=Z,
+                    X=X,
+                    prs_variants=missing_prs_df,
+                    platform_variant_info=platform_variant_info,
+                    window_size=self.window_size,
+                    max_predictors=self.max_predictors,
+                    max_tuning_regions=self.max_tuning_regions,
+                    cv_folds=self.cv_folds,
+                    random_state=self.random_state,
+                )
+                effective_l1_ratio = grid_result.best_l1_ratio
+                effective_alpha = grid_result.best_alpha
+                if self.verbose >= 1:
+                    print(
+                        f"Best hyperparameters: l1_ratio={effective_l1_ratio}, "
+                        f"alpha={effective_alpha} "
+                        f"(tuned on {grid_result.n_variants_sampled} regions)"
+                    )
+            except ValidationError:
+                # Fall back to defaults if tuning fails
+                if self.verbose >= 1:
+                    print("Hyperparameter search failed, using defaults")
+
         # Step 9: Train projection models
         if X.shape[1] > 0:
             if self.verbose >= 1:
@@ -425,8 +483,8 @@ class LinearProjectionPRS:
 
             trainer = ProjectionRegionTrainer(
                 window_size=self.window_size,
-                l1_ratio=self.l1_ratio,
-                alpha=self.alpha,
+                l1_ratio=effective_l1_ratio,
+                alpha=effective_alpha,
                 cv_folds=self.cv_folds,
                 n_jobs=self.n_jobs,
                 random_state=self.random_state,
@@ -577,11 +635,12 @@ class LinearProjectionPRS:
             fb_target_pos.append(pos_in_kept)
             fb_columns.append(match[1])
 
-        # Train the fallbacks with the same trainer/config as the region models.
-        # Projection does no tuning, so use self.l1_ratio / self.alpha (the region
-        # trainer above does the same). The trainer keys results by variant_id, which
-        # is not unique at duplicate-rsID multiallelic loci, so train against a unique
-        # synthetic key and reset each model's identity to its real variant afterwards.
+        # Train the observed-variant fallbacks. Region tuning (Step 8.5) does not
+        # apply here: these are imputation-style single-variant recoveries, so they
+        # use the configured l1_ratio / alpha rather than the region-tuned values.
+        # The trainer keys results by variant_id, which is not unique at duplicate-rsID
+        # multiallelic loci, so train against a unique synthetic key and reset each
+        # model's identity to its real variant afterwards.
         fallback_by_pos: Dict[int, ImputedVariantModel] = {}
         if fb_columns:
             if self.verbose >= 1:

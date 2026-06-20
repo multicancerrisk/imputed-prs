@@ -167,13 +167,22 @@ class TestLinearProjectionPRSConstructor:
         model = LinearProjectionPRS()
 
         assert model.window_size == 1_000_000
+        assert model.tuning_scope == "global"
         assert model.l1_ratio == 0.5
         assert model.alpha == 0.01
         assert model.cv_folds == 5
         assert model.n_jobs == 1
         assert model.random_state is None
         assert model.max_predictors is None
+        assert model.max_tuning_regions == 50
         assert model.verbose == 1
+
+    def test_invalid_tuning_scope_raises(self):
+        """An unsupported tuning_scope is rejected (projection has no per_variant)."""
+        from imputed_prs.core.exceptions import ValidationError
+
+        with pytest.raises(ValidationError):
+            LinearProjectionPRS(tuning_scope="per_variant")
 
     def test_custom_parameters(self):
         """Custom parameters are stored correctly."""

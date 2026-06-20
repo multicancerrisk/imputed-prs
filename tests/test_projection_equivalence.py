@@ -206,7 +206,7 @@ class TestEquivalenceWithoutRegularization:
             platform_variants=platform_ids,
         )
 
-        proj_model = LinearProjectionPRS(**common_kwargs)
+        proj_model = LinearProjectionPRS(tuning_scope="none", **common_kwargs)
         proj_model.fit(
             reference_genotypes=vcf_path,
             prs_definition=prs_df,
@@ -272,7 +272,7 @@ class TestEquivalenceWithoutRegularization:
             platform_variants=platform_ids,
         )
 
-        proj_model = LinearProjectionPRS(**common_kwargs)
+        proj_model = LinearProjectionPRS(tuning_scope="none", **common_kwargs)
         proj_model.fit(
             reference_genotypes=vcf_path,
             prs_definition=prs_df,
@@ -338,7 +338,7 @@ class TestDivergenceWithRegularization:
             platform_variants=platform_ids,
         )
 
-        proj_model = LinearProjectionPRS(**common_kwargs)
+        proj_model = LinearProjectionPRS(tuning_scope="none", **common_kwargs)
         proj_model.fit(
             reference_genotypes=vcf_path,
             prs_definition=prs_df,
@@ -397,7 +397,7 @@ class TestProjectionAdvantage:
             platform_variants=platform_ids,
         )
 
-        proj_model = LinearProjectionPRS(**common_kwargs)
+        proj_model = LinearProjectionPRS(tuning_scope="none", **common_kwargs)
         proj_model.fit(
             reference_genotypes=vcf_path,
             prs_definition=prs_df,

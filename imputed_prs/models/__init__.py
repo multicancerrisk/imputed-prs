@@ -24,7 +24,13 @@ from imputed_prs.models.predictor import (
 from imputed_prs.models.projection import SingleRegionModelResult, fit_single_region_model
 from imputed_prs.models.projection_trainer import ProjectionRegionTrainer
 from imputed_prs.models.trainer import ImputationModelTrainer
-from imputed_prs.models.tuning import global_hyperparameter_search, optuna_hyperparameter_search
+from imputed_prs.models.tuning import (
+    global_hyperparameter_search,
+    optuna_hyperparameter_search,
+    projection_hyperparameter_search,
+    select_stratified_sample,
+    tune_single_variant_model,
+)
 
 __all__ = [
     "clip_and_adjust_variance",
@@ -41,10 +47,13 @@ __all__ = [
     "optuna_hyperparameter_search",
     "OptunaSearchResult",
     "ProjectionRegionTrainer",
+    "projection_hyperparameter_search",
     "PRSPredictor",
+    "select_stratified_sample",
     "SingleRegionModelResult",
     "SingleVariantModelResult",
     "TrainingResult",
+    "tune_single_variant_model",
     "fit_single_region_model",
     "truncated_normal_mean",
     "truncated_normal_variance",

@@ -32,7 +32,15 @@ class TestLinearImputationPRSConstructor:
         assert model.n_jobs == 1
         assert model.random_state is None
         assert model.max_predictors is None
+        assert model.max_tuning_variants == 50
         assert model.verbose == 1
+
+    def test_invalid_tuning_scope_raises(self):
+        """An unsupported tuning_scope is rejected, not silently accepted."""
+        from imputed_prs.core.exceptions import ValidationError
+
+        with pytest.raises(ValidationError):
+            LinearImputationPRS(tuning_scope="bogus")
 
     def test_custom_parameters(self):
         """Test constructor with custom parameters."""
@@ -697,6 +705,30 @@ class TestLinearImputationPRSFitTuningScope:
         )
 
         assert model.is_fitted is True
+
+    def test_fit_with_tuning_scope_per_variant(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """Test fit() with tuning_scope='per_variant' tunes each variant and fits."""
+        pytest.importorskip("cyvcf2")
+
+        model = LinearImputationPRS(
+            window_size=500_000,
+            cv_folds=3,
+            tuning_scope="per_variant",
+            verbose=0,
+            random_state=42,
+        )
+
+        model.fit(
+            reference_genotypes=synthetic_vcf_file,
+            prs_definition=synthetic_prs_df,
+            platform_variants=platform_variants_partial,
+        )
+
+        assert model.is_fitted is True
+        # rs4, rs5 are off-platform and recovered via per-variant-tuned imputation.
+        assert len(model.imputed_models) == 2
 
 
 # =============================================================================
