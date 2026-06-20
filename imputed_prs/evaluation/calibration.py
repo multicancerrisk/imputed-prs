@@ -1,11 +1,47 @@
 """CV-predicted PRS computation and calibration parameter estimation."""
 
+import warnings
 from typing import Dict
 
 import numpy as np
 from scipy import stats
 
 from imputed_prs.core.types import CalibrationParams
+
+
+def mean_impute_columns(matrix: np.ndarray) -> np.ndarray:
+    """Fill NaN dosages with each column's non-missing mean (per-variant mean imputation).
+
+    Each column is one PRS variant's effect-oriented reference dosage. A NaN marks a
+    sample whose reference dosage is missing; it is replaced with that column's mean of
+    the observed dosages. Under Hardy-Weinberg equilibrium that column mean equals the
+    population-expected dosage 2*AF (AF = effect-allele frequency), so this substitutes
+    the unbiased population expectation rather than 0 (= homozygous non-effect allele),
+    which ``np.nan_to_num`` would wrongly assume. Columns that are entirely NaN are
+    filled with 0.0 (degenerate fallback; matches the convention in models/tuning.py).
+
+    The input is not mutated; the returned array preserves the input dtype.
+
+    Args:
+        matrix: (n_samples, n_variants) dosage matrix; columns are variants, may hold NaN.
+
+    Returns:
+        A copy of ``matrix`` with every NaN replaced by its column mean (or 0.0 for an
+        all-NaN column).
+    """
+    out = matrix.copy()
+    # An entirely-NaN column makes np.nanmean emit a "Mean of empty slice" RuntimeWarning
+    # and return NaN; that column is a legitimate degenerate fallback (handled below), so
+    # silence the warning rather than letting it surface to callers.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        col_means = np.nanmean(out, axis=0)
+    # An entirely-NaN column has a NaN mean; fall back to 0.0 so the matmul is NaN-free.
+    col_means = np.where(np.isnan(col_means), 0.0, col_means)
+    nan_mask = np.isnan(out)
+    fill = np.broadcast_to(col_means, out.shape)
+    out[nan_mask] = fill[nan_mask].astype(out.dtype, copy=False)
+    return out
 
 
 def compute_cv_predicted_prs(

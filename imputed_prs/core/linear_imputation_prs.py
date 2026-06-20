@@ -28,6 +28,7 @@ from imputed_prs.core.types import (
 from imputed_prs.evaluation.calibration import (
     compute_cv_predicted_prs,
     estimate_cv_calibration,
+    mean_impute_columns,
 )
 from imputed_prs.io.genotype_loader import load_genotypes
 from imputed_prs.io.pgs_catalog import download_pgs_catalog_score
@@ -622,7 +623,12 @@ class LinearImputationPRS:
                     placed_betas.append(float(prs_row["beta"]))
 
                 if placed_columns:
-                    X_full = np.nan_to_num(
+                    # Per-column (per-variant) mean imputation of missing reference
+                    # dosages: a NaN sample is filled with the column mean (≈ 2*AF, the
+                    # population-expected dosage under HWE), NOT 0 (= homozygous
+                    # non-effect), which would bias s_true and the observed part of
+                    # s_cv toward zero. See evaluation.calibration.mean_impute_columns.
+                    X_full = mean_impute_columns(
                         np.column_stack(placed_columns).astype(np.float32)
                     )
                     all_betas = np.array(placed_betas)
