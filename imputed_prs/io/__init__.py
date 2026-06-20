@@ -28,7 +28,10 @@ from imputed_prs.io.genotype_loader import (
 )
 from imputed_prs.io.user_genotypes import (
     load_user_genotypes,
+    load_user_genotype_strings,
+    load_raw_user_genotypes,
     genotype_to_dosage,
+    count_allele,
     detect_genome_build,
 )
 from imputed_prs.io.exporters.json_export import export_to_json
@@ -62,7 +65,10 @@ __all__ = [
     "load_genotypes_plink",
     # User genotype loader
     "load_user_genotypes",
+    "load_user_genotype_strings",
+    "load_raw_user_genotypes",
     "genotype_to_dosage",
+    "count_allele",
     "detect_genome_build",
     # Exporters
     "export_to_json",

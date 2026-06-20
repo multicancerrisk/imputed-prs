@@ -1,7 +1,7 @@
 """Core data types for the imputed-prs library."""
 
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -55,6 +55,37 @@ class VariantInfo:
     effect_allele: str
     other_allele: Optional[str]
     beta: float
+
+
+@dataclass(frozen=True)
+class VariantIdentity:
+    """Stable, multi-key identity for a single scored variant.
+
+    Used to resolve a user's raw genotype against the several identifiers a DTC
+    file may use, and to carry the *role-specific* counted/other alleles for
+    oriented scoring. The same physical locus can appear as different
+    ``VariantIdentity`` instances in different roles (e.g. an observed-PRS term
+    counts the effect allele, while a predictor counts the ALT allele), so the
+    counted allele lives on the identity, not on a shared per-locus dict.
+
+    Attributes:
+        feature_id: Canonical, collision-free key ("chr:pos:ref:alt").
+        variant_id: Primary identifier (rsID or source-provided id).
+        accepted_ids: All identifiers that should match this variant in a user
+            file (rsID, PRS id, platform id, "chr:pos"); every one is tried.
+        chromosome: Chromosome (1-22, X, Y, MT).
+        position: Genomic position.
+        counted_allele: Allele whose copies are counted for this role.
+        other_allele: The complementary allele of the biallelic pair.
+    """
+
+    feature_id: str
+    variant_id: str
+    accepted_ids: Tuple[str, ...]
+    chromosome: str
+    position: int
+    counted_allele: str
+    other_allele: str
 
 
 @dataclass

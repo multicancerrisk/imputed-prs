@@ -9,9 +9,13 @@ import pandas as pd
 import pytest
 
 from imputed_prs.core.exceptions import DataLoadError, ValidationError
+from imputed_prs.core.types import VariantIdentity
 from imputed_prs.io.user_genotypes import (
+    count_allele,
     detect_genome_build,
     genotype_to_dosage,
+    load_raw_user_genotypes,
+    load_user_genotype_strings,
     load_user_genotypes,
 )
 
@@ -424,3 +428,284 @@ class TestLoadFromPGP:
         # At least some real ones should have values
         real_variants = [v for k, v in dosages.items() if k != "rs12345_fake"]
         assert any(v is not None for v in real_variants)
+
+
+class TestCountAllele:
+    """Golden table for the oriented allele-counting primitive (P1.1)."""
+
+    def test_effect_alt_counts_named_allele(self):
+        # counted=A (e.g. ALT), other=G: AA/AG/GG -> 2/1/0 copies of A.
+        assert count_allele("AA", "A", "G", allow_ambiguous=False, allow_strand_flip=False) == 2.0
+        assert count_allele("AG", "A", "G", allow_ambiguous=False, allow_strand_flip=False) == 1.0
+        assert count_allele("GG", "A", "G", allow_ambiguous=False, allow_strand_flip=False) == 0.0
+
+    def test_heterozygote_order_invariant(self):
+        assert count_allele("GA", "A", "G", allow_ambiguous=False, allow_strand_flip=False) == 1.0
+
+    def test_effect_ref_symmetry(self):
+        # counted=G (e.g. REF) on the same genotypes: AA/AG/GG -> 0/1/2 copies of G.
+        assert count_allele("AA", "G", "A", allow_ambiguous=False, allow_strand_flip=False) == 0.0
+        assert count_allele("AG", "G", "A", allow_ambiguous=False, allow_strand_flip=False) == 1.0
+        assert count_allele("GG", "G", "A", allow_ambiguous=False, allow_strand_flip=False) == 2.0
+
+    def test_partial_overlap_is_unresolved(self):
+        # "AC" against {A, G}: C is foreign -> unresolved, NOT a single copy of A.
+        assert count_allele("AC", "A", "G", allow_ambiguous=False, allow_strand_flip=False) is None
+        assert count_allele("CG", "A", "G", allow_ambiguous=False, allow_strand_flip=False) is None
+
+    def test_full_mismatch_is_unresolved(self):
+        assert count_allele("CT", "A", "G", allow_ambiguous=False, allow_strand_flip=False) is None
+
+    def test_palindromic_blocked_unless_allowed(self):
+        assert count_allele("AA", "A", "T", allow_ambiguous=False, allow_strand_flip=False) is None
+        assert count_allele("CC", "C", "G", allow_ambiguous=False, allow_strand_flip=False) is None
+
+    def test_palindromic_allowed(self):
+        assert count_allele("AA", "A", "T", allow_ambiguous=True, allow_strand_flip=False) == 2.0
+        assert count_allele("AT", "A", "T", allow_ambiguous=True, allow_strand_flip=False) == 1.0
+        assert count_allele("TT", "A", "T", allow_ambiguous=True, allow_strand_flip=False) == 0.0
+
+    def test_strand_flip_disabled_does_not_resolve(self):
+        # "TT" complements to "AA" (in {A, G}), but only with the flip enabled.
+        assert count_allele("TT", "A", "G", allow_ambiguous=False, allow_strand_flip=False) is None
+
+    def test_strand_flip_enabled_resolves(self):
+        assert count_allele("TT", "A", "G", allow_ambiguous=False, allow_strand_flip=True) == 2.0
+        assert count_allele("TC", "A", "G", allow_ambiguous=False, allow_strand_flip=True) == 1.0
+        assert count_allele("CC", "A", "G", allow_ambiguous=False, allow_strand_flip=True) == 0.0
+
+    def test_strand_flip_still_unresolved(self):
+        # "AC" -> complement "TG"; neither orientation is a subset of {A, G}.
+        assert count_allele("AC", "A", "G", allow_ambiguous=False, allow_strand_flip=True) is None
+
+    def test_palindrome_with_flip_does_not_double_resolve(self):
+        # Direct match already resolves; enabling the flip must not change the count.
+        assert count_allele("AT", "A", "T", allow_ambiguous=True, allow_strand_flip=True) == 1.0
+        assert count_allele("AA", "A", "T", allow_ambiguous=True, allow_strand_flip=True) == 2.0
+
+    def test_separators(self):
+        assert count_allele("A/G", "A", "G", allow_ambiguous=False, allow_strand_flip=False) == 1.0
+        assert count_allele("A|G", "A", "G", allow_ambiguous=False, allow_strand_flip=False) == 1.0
+        assert count_allele("A/A", "A", "G", allow_ambiguous=False, allow_strand_flip=False) == 2.0
+
+    def test_lowercase_and_whitespace(self):
+        assert count_allele("ag", "a", "g", allow_ambiguous=False, allow_strand_flip=False) == 1.0
+        assert count_allele(" AG ", "A", "G", allow_ambiguous=False, allow_strand_flip=False) == 1.0
+
+    def test_missing_indel_haploid_unresolved(self):
+        bad_tokens = [
+            "--", "", "NA", "N/A", "NULL", "..", "NN", "00",
+            "I", "D", "II", "DD", "ID", "-A", "A-", "N0",
+            "A", "G", "AAA", "X", "123", None, np.nan,
+        ]
+        for bad in bad_tokens:
+            assert (
+                count_allele(bad, "A", "G", allow_ambiguous=False, allow_strand_flip=False)
+                is None
+            ), bad
+
+    def test_degenerate_pair_unresolved(self):
+        # counted == other is not a valid biallelic locus.
+        assert count_allele("AA", "A", "A", allow_ambiguous=False, allow_strand_flip=False) is None
+        assert count_allele("AG", "A", "A", allow_ambiguous=False, allow_strand_flip=False) is None
+
+    def test_non_acgt_alleles_unresolved(self):
+        assert count_allele("AG", "A", "I", allow_ambiguous=False, allow_strand_flip=False) is None
+        assert count_allele("AG", "-", "G", allow_ambiguous=False, allow_strand_flip=False) is None
+        # Empty string is a substring of "ACGT"; must still be rejected.
+        assert count_allele("AG", "", "G", allow_ambiguous=False, allow_strand_flip=False) is None
+        # Multi-base allele argument must be rejected.
+        assert count_allele("AG", "AG", "G", allow_ambiguous=False, allow_strand_flip=False) is None
+
+    def test_numeric_cell_unresolved(self):
+        assert count_allele(12.0, "A", "G", allow_ambiguous=False, allow_strand_flip=False) is None
+
+
+class TestLoadUserGenotypeStrings:
+    """Tests for the raw-string loader (P1.1)."""
+
+    def test_dataframe_index(self):
+        df = pd.DataFrame({"genotype": ["AA", "AG", "GG"]}, index=["rs1", "rs2", "rs3"])
+        strings = load_user_genotype_strings(df)
+        assert strings["rs1"] == "AA"
+        assert strings["rs2"] == "AG"
+        assert strings["rs3"] == "GG"
+
+    def test_returns_strings_not_dosages(self):
+        df = pd.DataFrame({"genotype": ["AG"]}, index=["rs1"])
+        strings = load_user_genotype_strings(df)
+        assert strings["rs1"] == "AG"
+        assert strings["rs1"] != 1.0
+
+    def test_dataframe_rsid_column(self):
+        df = pd.DataFrame({"rsid": ["rs1", "rs2"], "genotype": ["AA", "AG"]})
+        strings = load_user_genotype_strings(df)
+        assert strings["rs1"] == "AA"
+        assert strings["rs2"] == "AG"
+
+    def test_dataframe_variant_id_column(self):
+        df = pd.DataFrame({"variant_id": ["rs1", "rs2"], "genotype": ["AA", "AG"]})
+        strings = load_user_genotype_strings(df)
+        assert strings["rs1"] == "AA"
+        assert strings["rs2"] == "AG"
+
+    def test_snps_object(self):
+        from snps import SNPs
+
+        mock_snps = MagicMock(spec=SNPs)
+        mock_snps.snps = pd.DataFrame({
+            "chrom": ["1", "1", "2"],
+            "pos": [100, 200, 300],
+            "genotype": ["AA", "AG", "GG"],
+        }, index=["rs1", "rs2", "rs3"])
+
+        strings = load_user_genotype_strings(mock_snps)
+        assert strings["rs1"] == "AA"
+        assert strings["rs2"] == "AG"
+        assert strings["rs3"] == "GG"
+
+    def test_expected_variants_filter_omits_absent(self):
+        df = pd.DataFrame({"genotype": ["AA", "AG"]}, index=["rs1", "rs2"])
+        strings = load_user_genotype_strings(df, expected_variants={"rs1", "rs99"})
+        assert strings == {"rs1": "AA"}
+
+    def test_missing_genotype_column_raises(self):
+        df = pd.DataFrame({"rsid": ["rs1"], "alleles": ["AA"]})
+        with pytest.raises(ValidationError, match="genotype"):
+            load_user_genotype_strings(df)
+
+    def test_duplicate_rsid_does_not_raise(self):
+        # Regression: a duplicated index must not crash (no df.loc on a dup index).
+        df = pd.DataFrame({"genotype": ["AA", "AG"]}, index=["rs1", "rs1"])
+        strings = load_user_genotype_strings(df)
+        assert strings["rs1"] == "AG"  # last write wins in the projected dict
+
+
+class TestLoadRawUserGenotypes:
+    """Tests for the raw multi-key collection build (P1.1b)."""
+
+    def test_indexes_by_rsid_lowercased_and_chrpos_normalized(self):
+        df = pd.DataFrame({
+            "rsid": ["RS1"],
+            "genotype": ["AG"],
+            "chrom": ["chr1"],
+            "pos": [100],
+        })
+        collection = load_raw_user_genotypes(df)
+        assert "rs1" in collection._by_rsid
+        assert "1:100" in collection._by_chrpos
+
+    def test_duplicate_rsid_kept_as_multiple_records(self):
+        df = pd.DataFrame({"genotype": ["AA", "AG"]}, index=["rs1", "rs1"])
+        collection = load_raw_user_genotypes(df)
+        assert len(collection._by_rsid["rs1"]) == 2
+
+    def test_no_chrpos_index_when_absent(self):
+        df = pd.DataFrame({"genotype": ["AG"]}, index=["rs1"])
+        collection = load_raw_user_genotypes(df)
+        assert collection._by_chrpos == {}
+
+
+def _identity(accepted_ids, chromosome, position, counted="A", other="G"):
+    """Build a VariantIdentity for resolver tests (alleles are arbitrary here:
+    resolution is allele-agnostic; counting happens later in count_allele)."""
+    return VariantIdentity(
+        feature_id=f"{chromosome}:{position}:{other}:{counted}",
+        variant_id=accepted_ids[0],
+        accepted_ids=tuple(accepted_ids),
+        chromosome=chromosome,
+        position=position,
+        counted_allele=counted,
+        other_allele=other,
+    )
+
+
+class TestVariantIdentityResolver:
+    """Tests for multi-key, conflict-aware resolution (P1.1b)."""
+
+    def _collection(self, rows):
+        # rows: list of (rsid, chrom, pos, genotype)
+        df = pd.DataFrame({
+            "rsid": [r[0] for r in rows],
+            "chrom": [r[1] for r in rows],
+            "pos": [r[2] for r in rows],
+            "genotype": [r[3] for r in rows],
+        })
+        return load_raw_user_genotypes(df)
+
+    def test_rsid_match_resolves(self):
+        coll = self._collection([("rs1", "1", 100, "AG")])
+        res = coll.resolve(_identity(["rs1"], "1", 100))
+        assert res.status == "resolved"
+        assert res.genotype == "AG"
+        assert res.matched_id == "rs1"
+
+    def test_chrpos_only_match_resolves(self):
+        # The user row uses an rsID the model does not know; only chr:pos links them.
+        coll = self._collection([("rs_user", "1", 100, "AG")])
+        res = coll.resolve(_identity(["rs_model", "1:100"], "1", 100))
+        assert res.status == "resolved"
+        assert res.genotype == "AG"
+
+    def test_both_resolve(self):
+        coll = self._collection([
+            ("rs1", "1", 100, "AG"),
+            ("rs_user", "2", 200, "CC"),
+        ])
+        assert coll.resolve(_identity(["rs1"], "1", 100)).status == "resolved"
+        assert coll.resolve(_identity(["rs_model", "2:200"], "2", 200)).status == "resolved"
+
+    def test_not_found(self):
+        coll = self._collection([("rs1", "1", 100, "AG")])
+        res = coll.resolve(_identity(["rs999", "9:999"], "9", 999))
+        assert res.status == "not_found"
+        assert res.genotype is None
+
+    def test_conflict_by_genotype(self):
+        coll = self._collection([
+            ("rs1", "1", 100, "AG"),
+            ("rs1", "1", 100, "GG"),
+        ])
+        res = coll.resolve(_identity(["rs1"], "1", 100))
+        assert res.status == "duplicate_conflict"
+        assert res.genotype is None
+
+    def test_conflict_by_locus(self):
+        coll = self._collection([
+            ("rs1", "1", 100, "AG"),
+            ("rs1", "1", 200, "AG"),
+        ])
+        res = coll.resolve(_identity(["rs1"], "1", 100))
+        assert res.status == "duplicate_conflict"
+
+    def test_same_record_via_rsid_and_chrpos_not_conflict(self):
+        # rsID and chr:pos both point at the SAME single record -> dedup, resolved.
+        coll = self._collection([("rs1", "1", 100, "AG")])
+        res = coll.resolve(_identity(["rs1", "1:100"], "1", 100))
+        assert res.status == "resolved"
+        assert res.genotype == "AG"
+
+    def test_none_chrpos_plus_present_chrpos_not_conflict(self):
+        # record A matched by rsID has no chr/pos; record B matched by chr:pos has
+        # both; same genotype -> resolved, not a false-positive conflict.
+        df = pd.DataFrame({
+            "rsid": ["rs1", "rs_user"],
+            "chrom": [None, "1"],
+            "pos": [None, 100],
+            "genotype": ["AG", "AG"],
+        })
+        coll = load_raw_user_genotypes(df)
+        res = coll.resolve(_identity(["rs1", "1:100"], "1", 100))
+        assert res.status == "resolved"
+        assert res.genotype == "AG"
+
+    def test_case_insensitive_rsid(self):
+        coll = self._collection([("rs1", "1", 100, "AG")])
+        assert coll.resolve(_identity(["RS1"], "1", 100)).status == "resolved"
+
+    def test_chromosome_normalization(self):
+        coll = self._collection([("rs_user", "chr1", 100, "AG")])
+        assert coll.resolve(_identity(["1:100"], "1", 100)).status == "resolved"
+
+        coll_mt = self._collection([("rs_user", "MT", 50, "AG")])
+        assert coll_mt.resolve(_identity(["M:50"], "M", 50)).status == "resolved"
