@@ -14,7 +14,13 @@ from imputed_prs.models.bounding import (
 )
 from imputed_prs.models.elastic_net import fit_single_variant_model
 from imputed_prs.models.metrics import compute_cv_r2
-from imputed_prs.models.predictor import PRSPredictor, compute_imputed_prs, compute_observed_prs
+from imputed_prs.models.predictor import (
+    ObservedScore,
+    PRSPredictor,
+    compute_imputed_prs,
+    compute_observed_prs,
+    compute_observed_prs_oriented,
+)
 from imputed_prs.models.projection import SingleRegionModelResult, fit_single_region_model
 from imputed_prs.models.projection_trainer import ProjectionRegionTrainer
 from imputed_prs.models.trainer import ImputationModelTrainer
@@ -25,11 +31,13 @@ __all__ = [
     "compute_cv_r2",
     "compute_imputed_prs",
     "compute_observed_prs",
+    "compute_observed_prs_oriented",
     "compute_truncation_adjustment_factor",
     "fit_single_variant_model",
     "global_hyperparameter_search",
     "GridSearchResult",
     "ImputationModelTrainer",
+    "ObservedScore",
     "optuna_hyperparameter_search",
     "OptunaSearchResult",
     "ProjectionRegionTrainer",

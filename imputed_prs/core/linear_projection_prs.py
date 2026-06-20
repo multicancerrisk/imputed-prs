@@ -31,7 +31,10 @@ from imputed_prs.io.platform_loader import (
     load_platform_variants_from_list,
 )
 from imputed_prs.io.prs_loader import load_prs_from_dataframe, load_prs_from_file
-from imputed_prs.io.user_genotypes import load_user_genotypes
+from imputed_prs.io.user_genotypes import (
+    load_raw_user_genotypes,
+    load_user_genotypes,
+)
 from imputed_prs.models.projection_predictor import ProjectionPredictor
 from imputed_prs.models.projection_trainer import ProjectionRegionTrainer
 
@@ -277,6 +280,44 @@ class LinearProjectionPRS:
                 af = float(np.mean(dosage[valid]) / 2.0)
                 if min(af, 1.0 - af) > self.ambiguous_maf_threshold:
                     ambiguous_excluded_ids.add(row["variant_id"])
+
+        # Allele-aware observed inclusion (see LinearImputationPRS): require an
+        # observed variant's (effect, other) alleles to be compatible with the
+        # reference at its locus. Locus-in-reference but allele-incompatible ->
+        # reclassify to missing (recovered by projection where possible, else
+        # dropped-with-reason "allele_mismatch"). Locus absent from reference ->
+        # keep observed (still scoreable directly from the user's genotype).
+        observed_variant_ids = set(observed_variant_ids)
+        missing_variant_ids = set(missing_variant_ids)
+        observed_allele_reclassified: Set[str] = set()
+        for _, row in prs_df[
+            prs_df["variant_id"].isin(observed_variant_ids)
+        ].iterrows():
+            var_id = row["variant_id"]
+            if var_id in ambiguous_excluded_ids:
+                continue
+            locus = (
+                f"{_normalize_chromosome(str(row['chromosome']))}:"
+                f"{int(row['position'])}"
+            )
+            if locus not in reference_index:
+                continue  # platform-measured but absent from reference: keep observed
+            match = match_oriented_dosage(
+                row["chromosome"], int(row["position"]),
+                row["effect_allele"], row.get("other_allele"),
+                genotype_data.variant_info, genotype_data.dosage_matrix,
+                reference_index,
+            )
+            if match is None:
+                observed_allele_reclassified.add(var_id)
+        if observed_allele_reclassified:
+            observed_variant_ids -= observed_allele_reclassified
+            missing_variant_ids |= observed_allele_reclassified
+            if self.verbose >= 1:
+                print(
+                    f"Reclassified {len(observed_allele_reclassified)} observed "
+                    f"variants to missing (allele-incompatible with reference)"
+                )
 
         # Build platform variant info DataFrame and Z matrix
         platform_variant_indices = []
@@ -607,17 +648,27 @@ class LinearProjectionPRS:
 
         expected_variants = self._get_expected_variants()
 
+        # See LinearImputationPRS.predict: real uploads also load a multi-key raw
+        # collection for allele-aware observed scoring; the projected component
+        # still reads the legacy dosage dict (unchanged until P1.4), hence the
+        # deliberate double parse.
+        raw_genotypes = None
         if isinstance(user_genotypes, dict):
             user_dosages = user_genotypes
         else:
             user_dosages = load_user_genotypes(user_genotypes, expected_variants)
+            raw_genotypes = load_raw_user_genotypes(user_genotypes)
 
         predictor = ProjectionPredictor(
             observed_variants=self._observed_variants,
             region_models=self._region_models,
             calibration_params=self._calibration_params,
         )
-        return predictor.predict(user_dosages, apply_calibration=apply_calibration)
+        return predictor.predict(
+            user_dosages,
+            apply_calibration=apply_calibration,
+            raw_genotypes=raw_genotypes,
+        )
 
     def _get_expected_variants(self) -> Set[str]:
         """Get set of all variant IDs needed for prediction."""

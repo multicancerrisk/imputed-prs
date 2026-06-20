@@ -245,6 +245,115 @@ def platform_variants_all():
     return ["rs1", "rs2", "rs3", "rs4", "rs5"]
 
 
+class TestLinearImputationPRSObservedAlleleGate:
+    """P1.2 fit-time allele-aware observed inclusion."""
+
+    def _model(self):
+        return LinearImputationPRS(
+            window_size=500_000,
+            cv_folds=3,
+            tuning_scope="none",
+            verbose=0,
+            random_state=42,
+        )
+
+    def test_allele_incompatible_observed_is_reclassified(self, synthetic_vcf_file):
+        """An observed locus whose alleles mismatch the reference is not labeled
+        observed; it is dropped-with-reason, never mis-scored as 2*beta."""
+        pytest.importorskip("cyvcf2")
+        # Reference rs1 is A/G at 1:100000; declare an incompatible A/C there
+        # ({A,C} is neither {A,G} nor its complement {T,C}).
+        prs_df = pd.DataFrame({
+            "variant_id": ["rs1", "rs2", "rs3"],
+            "chromosome": ["1", "1", "1"],
+            "position": [100000, 100500, 101000],
+            "effect_allele": ["A", "T", "A"],
+            "other_allele": ["C", "C", "G"],
+            "beta": [0.5, -0.05, 0.2],
+        })
+        model = self._model()
+        model.fit(
+            reference_genotypes=synthetic_vcf_file,
+            prs_definition=prs_df,
+            platform_variants=["rs1", "rs2", "rs3"],
+        )
+
+        observed_ids = {v.variant_id for v in model.observed_variants}
+        assert "rs1" not in observed_ids  # not mis-labeled observed
+        # Allele-compatible siblings remain observed.
+        assert "rs2" in observed_ids
+        assert "rs3" in observed_ids
+
+        disp = model.variant_dispositions.set_index("variant_id")
+        assert disp.loc["rs1", "status"] != "observed"
+        assert disp.loc["rs1", "reason"] == "allele_mismatch"
+
+    def test_not_in_reference_observed_is_kept(self, synthetic_vcf_file):
+        """A platform variant absent from the (chr1-only) reference stays observed:
+        it remains directly scoreable from the user's genotype."""
+        pytest.importorskip("cyvcf2")
+        prs_df = pd.DataFrame({
+            "variant_id": ["rs1", "rs2", "rs99"],
+            "chromosome": ["1", "1", "2"],
+            "position": [100000, 100500, 5000],
+            "effect_allele": ["G", "T", "A"],
+            "other_allele": ["A", "C", "G"],
+            "beta": [0.1, -0.05, 0.3],
+        })
+        model = self._model()
+        model.fit(
+            reference_genotypes=synthetic_vcf_file,
+            prs_definition=prs_df,
+            platform_variants=["rs1", "rs2", "rs99"],
+        )
+
+        observed_ids = {v.variant_id for v in model.observed_variants}
+        assert "rs99" in observed_ids  # not dropped despite absence from reference
+        assert "rs1" in observed_ids  # in-reference, allele-compatible: stays observed
+
+
+class TestLinearImputationPRSOrientedPredict:
+    """P1.2 end-to-end: predict() scores observed terms by the effect allele."""
+
+    def test_predict_dataframe_is_allele_oriented(self, synthetic_vcf_file):
+        """A genotype-string upload counts the effect allele, not homozygosity."""
+        pytest.importorskip("cyvcf2")
+        # rs1 effect=A is the REF at 1:100000 (ref A/G); rs2 effect=T is the ALT.
+        prs_df = pd.DataFrame({
+            "variant_id": ["rs1", "rs2"],
+            "chromosome": ["1", "1"],
+            "position": [100000, 100500],
+            "effect_allele": ["A", "T"],
+            "other_allele": ["G", "C"],
+            "beta": [1.0, 2.0],
+        })
+        model = LinearImputationPRS(
+            window_size=500_000, cv_folds=3, tuning_scope="none",
+            verbose=0, random_state=42,
+        )
+        model.fit(
+            reference_genotypes=synthetic_vcf_file,
+            prs_definition=prs_df,
+            platform_variants=["rs1", "rs2"],
+        )
+
+        # rs1 "GG" -> 0 copies of effect A (NOT 2); rs2 "TT" -> 2 copies of effect T.
+        user_df = pd.DataFrame({
+            "rsid": ["rs1", "rs2"],
+            "chrom": ["1", "1"],
+            "pos": [100000, 100500],
+            "genotype": ["GG", "TT"],
+        })
+        result = model.predict(user_df, apply_calibration=False)
+
+        # Oriented observed = 0*1.0 + 2*2.0 = 4.0 (allele-blind would give 6.0).
+        np.testing.assert_allclose(
+            result.prs_observed_component, 4.0, rtol=0, atol=1e-12
+        )
+        assert result.n_observed_scored_direct == 2
+        assert result.unresolved_observed_ids == ()
+
+
 # =============================================================================
 # Tests for fit() method input validation
 # =============================================================================

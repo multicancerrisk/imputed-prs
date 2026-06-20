@@ -1,6 +1,7 @@
 """Tests for projection prediction pipeline."""
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from imputed_prs.core.types import (
@@ -9,10 +10,24 @@ from imputed_prs.core.types import (
     ProjectionRegionModel,
     VariantInfo,
 )
+from imputed_prs.io.user_genotypes import load_raw_user_genotypes
 from imputed_prs.models.projection_predictor import (
     ProjectionPredictor,
     compute_projected_prs,
 )
+
+
+def _collection(rows):
+    """Build a RawUserGenotypeCollection from (rsid, chrom, pos, genotype) rows."""
+    df = pd.DataFrame(
+        {
+            "rsid": [r[0] for r in rows],
+            "chrom": [r[1] for r in rows],
+            "pos": [r[2] for r in rows],
+            "genotype": [r[3] for r in rows],
+        }
+    )
+    return load_raw_user_genotypes(df)
 
 
 def _make_region_model(
@@ -264,6 +279,50 @@ class TestProjectionPredictor:
         assert result.prs_observed_component == pytest.approx(-0.1)
         assert result.prs_imputed_component == pytest.approx(0.45)
         assert result.prs == pytest.approx(-0.1 + 0.45)
+
+    def test_legacy_dict_path_leaves_oriented_diagnostics_none(self):
+        """The allele-blind dosage-dict path does not populate oriented fields."""
+        observed = _make_observed_variants()
+        predictor = ProjectionPredictor(observed, [])
+
+        result = predictor.predict({"rs100": 2.0, "rs101": 0.0}, apply_calibration=False)
+
+        assert result.n_observed_scored_direct is None
+        assert result.unresolved_observed_ids is None
+
+    def test_oriented_observed_via_raw_genotypes(self):
+        """raw_genotypes routes observed scoring through the allele-aware path."""
+        observed = _make_observed_variants()  # rs100=(A,G,0.5), rs101=(C,T,-0.3)
+        model = _make_region_model(
+            coefficients=np.array([0.4]),
+            intercept=0.05,
+            predictor_variant_ids=["rs500"],
+            predictor_allele_frequencies=np.array([0.3]),
+            cv_mse=0.01,
+        )
+        predictor = ProjectionPredictor(observed, [model])
+
+        # Projected component still reads the legacy dosage dict (unchanged in P1.2).
+        user_dosages = {"rs500": 1.0}
+        # Observed scored from strings: rs100 "GG" -> 0 copies of effect A (NOT 2),
+        # rs101 "CC" -> 2 copies of effect C.
+        coll = _collection(
+            [("rs100", "1", 500_000, "GG"), ("rs101", "1", 600_000, "CC")]
+        )
+        result = predictor.predict(
+            user_dosages, apply_calibration=False, raw_genotypes=coll
+        )
+
+        # Oriented observed = 0*0.5 + 2*(-0.3) = -0.6 (allele-blind would give 0.4).
+        np.testing.assert_allclose(
+            result.prs_observed_component, -0.6, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            result.prs_imputed_component, 0.45, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(result.prs, -0.15, rtol=0, atol=1e-12)
+        assert result.n_observed_scored_direct == 2
+        assert result.unresolved_observed_ids == ()
 
     def test_all_observed_no_projection(self):
         """No region models: PRS == observed component."""

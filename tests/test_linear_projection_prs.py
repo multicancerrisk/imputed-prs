@@ -79,6 +79,69 @@ def fitted_model(synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
     return model
 
 
+class TestLinearProjectionPRSObservedAlleleGate:
+    """P1.2 fit-time allele-aware observed inclusion (projection product)."""
+
+    def _model(self):
+        return LinearProjectionPRS(
+            window_size=500_000,
+            cv_folds=3,
+            verbose=0,
+            random_state=42,
+        )
+
+    def test_allele_incompatible_observed_is_reclassified(self, synthetic_vcf_file):
+        """An observed locus whose alleles mismatch the reference is not labeled
+        observed; it is dropped-with-reason, never mis-scored as 2*beta."""
+        pytest.importorskip("cyvcf2")
+        # Reference rs1 is A/G at 1:100000; declare an incompatible A/C there.
+        prs_df = pd.DataFrame({
+            "variant_id": ["rs1", "rs2", "rs3"],
+            "chromosome": ["1", "1", "1"],
+            "position": [100000, 100500, 101000],
+            "effect_allele": ["A", "T", "A"],
+            "other_allele": ["C", "C", "G"],
+            "beta": [0.5, -0.05, 0.2],
+        })
+        model = self._model()
+        model.fit(
+            reference_genotypes=synthetic_vcf_file,
+            prs_definition=prs_df,
+            platform_variants=["rs1", "rs2", "rs3"],
+        )
+
+        observed_ids = {v.variant_id for v in model.observed_variants}
+        assert "rs1" not in observed_ids
+        assert "rs2" in observed_ids
+        assert "rs3" in observed_ids
+
+        disp = model.variant_dispositions.set_index("variant_id")
+        assert disp.loc["rs1", "status"] != "observed"
+        assert disp.loc["rs1", "reason"] == "allele_mismatch"
+
+    def test_not_in_reference_observed_is_kept(self, synthetic_vcf_file):
+        """A platform variant absent from the (chr1-only) reference stays observed."""
+        pytest.importorskip("cyvcf2")
+        prs_df = pd.DataFrame({
+            "variant_id": ["rs1", "rs2", "rs99"],
+            "chromosome": ["1", "1", "2"],
+            "position": [100000, 100500, 5000],
+            "effect_allele": ["G", "T", "A"],
+            "other_allele": ["A", "C", "G"],
+            "beta": [0.1, -0.05, 0.3],
+        })
+        model = self._model()
+        model.fit(
+            reference_genotypes=synthetic_vcf_file,
+            prs_definition=prs_df,
+            platform_variants=["rs1", "rs2", "rs99"],
+        )
+
+        observed_ids = {v.variant_id for v in model.observed_variants}
+        assert "rs99" in observed_ids
+        assert "rs1" in observed_ids
+
+
 @pytest.fixture
 def user_dosages_dict():
     """Sample user dosages dictionary."""

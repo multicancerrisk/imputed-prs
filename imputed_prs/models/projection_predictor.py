@@ -10,7 +10,11 @@ from imputed_prs.core.types import (
     ProjectionRegionModel,
     VariantInfo,
 )
-from imputed_prs.models.predictor import compute_observed_prs
+from imputed_prs.io.user_genotypes import RawUserGenotypeCollection
+from imputed_prs.models.predictor import (
+    compute_observed_prs,
+    compute_observed_prs_oriented,
+)
 
 
 def compute_projected_prs(
@@ -78,6 +82,9 @@ class ProjectionPredictor:
         observed_variants: List[VariantInfo],
         region_models: List[ProjectionRegionModel],
         calibration_params: Optional[CalibrationParams] = None,
+        *,
+        allow_ambiguous: bool = True,
+        allow_strand_flip: bool = True,
     ):
         """Initialize the projection predictor.
 
@@ -85,10 +92,17 @@ class ProjectionPredictor:
             observed_variants: List of observed PRS variants (on the platform).
             region_models: List of trained ProjectionRegionModel objects.
             calibration_params: Optional calibration parameters for scaling.
+            allow_ambiguous: Allele policy for the oriented observed scorer —
+                whether palindromic (A/T, C/G) loci may be scored. Default True
+                mirrors training (see ``compute_observed_prs_oriented``).
+            allow_strand_flip: Whether the oriented scorer retries on the
+                complementary strand. Default True mirrors ``match_oriented_dosage``.
         """
         self.observed_variants = observed_variants
         self.region_models = region_models
         self.calibration_params = calibration_params
+        self.allow_ambiguous = allow_ambiguous
+        self.allow_strand_flip = allow_strand_flip
 
         # Pre-compute counts
         self._n_observed_variants = len(observed_variants)
@@ -103,22 +117,45 @@ class ProjectionPredictor:
         self,
         user_genotypes: Dict[str, Optional[float]],
         apply_calibration: bool = True,
+        *,
+        raw_genotypes: Optional[RawUserGenotypeCollection] = None,
     ) -> PredictionResult:
         """Compute full PRS with uncertainty quantification.
 
         Args:
             user_genotypes: Dictionary mapping variant_id to dosage value
-                (0.0, 1.0, 2.0) or None for missing variants.
+                (0.0, 1.0, 2.0) or None for missing variants. Used by the projected
+                component (and the legacy observed scorer when ``raw_genotypes`` is
+                not supplied).
             apply_calibration: Whether to apply calibration scaling.
+            raw_genotypes: When provided, the observed component is scored
+                allele-aware from these raw genotype strings (the path for real
+                uploads). When omitted, the legacy allele-blind dosage-dict scorer
+                is used (evaluators / back-compat until P1.6).
 
         Returns:
             PredictionResult with PRS value, confidence intervals,
             component breakdown, and optionally scaled values.
         """
-        # Step 1: Compute observed component (reused from predictor.py)
-        prs_observed, n_observed_used = compute_observed_prs(
-            user_genotypes, self.observed_variants
-        )
+        # Step 1: Compute observed component. With raw genotype strings, use the
+        # allele-aware oriented scorer; otherwise the legacy allele-blind scorer.
+        n_observed_scored_direct: Optional[int] = None
+        unresolved_observed_ids: Optional[Tuple[str, ...]] = None
+        if raw_genotypes is not None:
+            observed_score = compute_observed_prs_oriented(
+                raw_genotypes,
+                self.observed_variants,
+                allow_ambiguous=self.allow_ambiguous,
+                allow_strand_flip=self.allow_strand_flip,
+            )
+            prs_observed = observed_score.prs
+            n_observed_used = observed_score.n_scored_direct
+            n_observed_scored_direct = observed_score.n_scored_direct
+            unresolved_observed_ids = observed_score.unresolved_ids
+        else:
+            prs_observed, n_observed_used = compute_observed_prs(
+                user_genotypes, self.observed_variants
+            )
 
         # Step 2: Compute projected component
         prs_projected, total_variance, n_regions_used, _ = compute_projected_prs(
@@ -168,4 +205,6 @@ class ProjectionPredictor:
             se_scaled=se_scaled,
             ci_lower_scaled=ci_lower_scaled,
             ci_upper_scaled=ci_upper_scaled,
+            n_observed_scored_direct=n_observed_scored_direct,
+            unresolved_observed_ids=unresolved_observed_ids,
         )

@@ -5,16 +5,20 @@ user genotype data, combining observed variant contributions with
 imputed variant predictions.
 """
 
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
+from imputed_prs.core.harmonizer import _normalize_chromosome
 from imputed_prs.core.types import (
     CalibrationParams,
     ImputedVariantModel,
     PredictionResult,
+    VariantIdentity,
     VariantInfo,
 )
+from imputed_prs.io.user_genotypes import RawUserGenotypeCollection, count_allele
 from imputed_prs.models.bounding import clip_and_adjust_variance
 
 
@@ -48,6 +52,106 @@ def compute_observed_prs(
             n_used += 1
 
     return total, n_used
+
+
+@dataclass(frozen=True)
+class ObservedScore:
+    """Result of allele-aware observed PRS scoring.
+
+    Attributes:
+        prs: Sum of (effect-allele dosage × beta) over resolved observed variants.
+        n_scored_direct: Count of observed variants scored from a direct,
+            allele-oriented effect-allele dosage.
+        unresolved_ids: variant_ids of observed variants that could not be scored
+            (not found, duplicate-conflict, missing other_allele, palindromic under
+            the active policy, partial-overlap, or otherwise uncountable), in
+            ``observed_variants`` order. Recovered via per-variant fallback in P1.8;
+            never silently dropped.
+    """
+
+    prs: float
+    n_scored_direct: int
+    unresolved_ids: Tuple[str, ...]
+
+
+def compute_observed_prs_oriented(
+    raw_genotypes: RawUserGenotypeCollection,
+    observed_variants: List[VariantInfo],
+    *,
+    allow_ambiguous: bool,
+    allow_strand_flip: bool = True,
+) -> ObservedScore:
+    """Allele-aware observed PRS contribution from raw user genotype strings.
+
+    For each observed variant this counts copies of the *effect* allele in the
+    user's genotype (not raw homozygosity), so a ``"GG"`` call contributes
+    ``2 * beta`` only when ``G`` is the effect allele. Each variant is resolved
+    against the user collection by its several identifiers (rsID plus ``chr:pos``)
+    via :meth:`RawUserGenotypeCollection.resolve`, which refuses to guess when
+    duplicate user entries conflict.
+
+    This is the canonical scoring path for real uploads; the legacy
+    :func:`compute_observed_prs` (dosage-dict, allele-blind) is retained only for
+    the evaluator / back-compat path until P1.6.
+
+    Args:
+        raw_genotypes: User genotypes as a multi-key resolvable collection.
+        observed_variants: Observed PRS variants carrying effect/other alleles.
+        allow_ambiguous: Whether palindromic (A/T, C/G) loci may be scored. The
+            orchestrator passes ``True`` so the runtime mirrors training (which
+            keeps palindromes); high-MAF palindromes excluded by training QC are
+            already absent from ``observed_variants``.
+        allow_strand_flip: Whether to retry on the complementary strand, mirroring
+            the unconditional complement pass in ``match_oriented_dosage``.
+
+    Returns:
+        An :class:`ObservedScore` with the PRS, the directly-scored count, and the
+        ids that could not be resolved (in ``observed_variants`` order).
+    """
+    total = 0.0
+    n_scored_direct = 0
+    unresolved: List[str] = []
+
+    for variant in observed_variants:
+        # Browser-safe orientation needs both alleles of the biallelic pair.
+        if variant.other_allele is None:
+            unresolved.append(variant.variant_id)
+            continue
+
+        chrom = _normalize_chromosome(str(variant.chromosome))
+        identity = VariantIdentity(
+            feature_id=(
+                f"{chrom}:{variant.position}:"
+                f"{variant.other_allele}:{variant.effect_allele}"
+            ),
+            variant_id=variant.variant_id,
+            accepted_ids=(variant.variant_id, f"{chrom}:{variant.position}"),
+            chromosome=chrom,
+            position=variant.position,
+            counted_allele=variant.effect_allele,
+            other_allele=variant.other_allele,
+        )
+        resolution = raw_genotypes.resolve(identity)
+        if resolution.status != "resolved":
+            # not_found or duplicate_conflict: never score an arbitrary match.
+            unresolved.append(variant.variant_id)
+            continue
+
+        dosage = count_allele(
+            resolution.genotype,
+            variant.effect_allele,
+            variant.other_allele,
+            allow_ambiguous=allow_ambiguous,
+            allow_strand_flip=allow_strand_flip,
+        )
+        if dosage is None:
+            unresolved.append(variant.variant_id)
+            continue
+
+        total += dosage * variant.beta
+        n_scored_direct += 1
+
+    return ObservedScore(total, n_scored_direct, tuple(unresolved))
 
 
 def compute_imputed_prs(
@@ -143,6 +247,9 @@ class PRSPredictor:
         observed_variants: List[VariantInfo],
         imputed_models: List[ImputedVariantModel],
         calibration_params: Optional[CalibrationParams] = None,
+        *,
+        allow_ambiguous: bool = True,
+        allow_strand_flip: bool = True,
     ):
         """Initialize the predictor.
 
@@ -150,10 +257,17 @@ class PRSPredictor:
             observed_variants: Variants present on the genotyping platform.
             imputed_models: Trained imputation models for missing variants.
             calibration_params: Optional parameters for calibration scaling.
+            allow_ambiguous: Allele policy for the oriented observed scorer —
+                whether palindromic (A/T, C/G) loci may be scored. Default True
+                mirrors training (see ``compute_observed_prs_oriented``).
+            allow_strand_flip: Whether the oriented scorer retries on the
+                complementary strand. Default True mirrors ``match_oriented_dosage``.
         """
         self.observed_variants = observed_variants
         self.imputed_models = imputed_models
         self.calibration_params = calibration_params
+        self.allow_ambiguous = allow_ambiguous
+        self.allow_strand_flip = allow_strand_flip
 
         # Pre-compute counts
         self._n_observed_variants = len(observed_variants)
@@ -166,23 +280,46 @@ class PRSPredictor:
         self,
         user_genotypes: Dict[str, Optional[float]],
         apply_calibration: bool = True,
+        *,
+        raw_genotypes: Optional[RawUserGenotypeCollection] = None,
     ) -> PredictionResult:
         """Compute full PRS with uncertainty quantification.
 
         Args:
             user_genotypes: Dictionary mapping variant_id to dosage value
-                (0.0, 1.0, 2.0) or None for missing variants.
+                (0.0, 1.0, 2.0) or None for missing variants. Used by the imputed
+                component (and the legacy observed scorer when ``raw_genotypes`` is
+                not supplied).
             apply_calibration: Whether to apply calibration scaling
                 (requires calibration_params to be set).
+            raw_genotypes: When provided, the observed component is scored
+                allele-aware from these raw genotype strings (the path for real
+                uploads). When omitted, the legacy allele-blind dosage-dict scorer
+                is used (evaluators / back-compat until P1.6).
 
         Returns:
             PredictionResult with PRS value, confidence intervals,
             component breakdown, and optionally scaled values.
         """
-        # Step 1: Compute observed component
-        prs_observed, n_observed_used = compute_observed_prs(
-            user_genotypes, self.observed_variants
-        )
+        # Step 1: Compute observed component. With raw genotype strings, use the
+        # allele-aware oriented scorer; otherwise the legacy allele-blind scorer.
+        n_observed_scored_direct: Optional[int] = None
+        unresolved_observed_ids: Optional[Tuple[str, ...]] = None
+        if raw_genotypes is not None:
+            observed_score = compute_observed_prs_oriented(
+                raw_genotypes,
+                self.observed_variants,
+                allow_ambiguous=self.allow_ambiguous,
+                allow_strand_flip=self.allow_strand_flip,
+            )
+            prs_observed = observed_score.prs
+            n_observed_used = observed_score.n_scored_direct
+            n_observed_scored_direct = observed_score.n_scored_direct
+            unresolved_observed_ids = observed_score.unresolved_ids
+        else:
+            prs_observed, n_observed_used = compute_observed_prs(
+                user_genotypes, self.observed_variants
+            )
 
         # Step 2: Compute imputed component
         prs_imputed, total_variance, n_imputed, n_truncated = compute_imputed_prs(
@@ -232,4 +369,6 @@ class PRSPredictor:
             se_scaled=se_scaled,
             ci_lower_scaled=ci_lower_scaled,
             ci_upper_scaled=ci_upper_scaled,
+            n_observed_scored_direct=n_observed_scored_direct,
+            unresolved_observed_ids=unresolved_observed_ids,
         )

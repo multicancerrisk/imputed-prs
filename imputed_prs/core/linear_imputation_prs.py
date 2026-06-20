@@ -44,7 +44,10 @@ from imputed_prs.io.exporters import (
 )
 from imputed_prs.io.loaders import load_model_hdf5
 from imputed_prs.io.prs_loader import load_prs_from_dataframe, load_prs_from_file
-from imputed_prs.io.user_genotypes import load_user_genotypes
+from imputed_prs.io.user_genotypes import (
+    load_raw_user_genotypes,
+    load_user_genotypes,
+)
 from imputed_prs.models.predictor import PRSPredictor
 from imputed_prs.models.trainer import ImputationModelTrainer
 from imputed_prs.models.tuning import global_hyperparameter_search
@@ -340,6 +343,48 @@ class LinearImputationPRS:
                 print(
                     f"Excluded {len(ambiguous_excluded_ids)} ambiguous SNPs "
                     f"(MAF > {self.ambiguous_maf_threshold})"
+                )
+
+        # Step 7c: Allele-aware observed inclusion. partition_variants matched the
+        # platform by id/locus only; additionally require that an observed variant's
+        # (effect, other) alleles are compatible with the reference at its locus. A
+        # variant whose locus is in the reference but whose alleles match no
+        # reference row (even on the complementary strand) is reclassified to
+        # missing, so it is recovered by imputation where possible and otherwise
+        # dropped-with-reason ("allele_mismatch") instead of being mis-scored as
+        # observed. A variant whose locus is absent from the reference (e.g. a
+        # non-autosomal platform SNP) is kept observed: it remains directly
+        # scoreable from the user's genotype.
+        observed_variant_ids = set(observed_variant_ids)
+        missing_variant_ids = set(missing_variant_ids)
+        observed_allele_reclassified: Set[str] = set()
+        for _, row in prs_df[
+            prs_df["variant_id"].isin(observed_variant_ids)
+        ].iterrows():
+            var_id = row["variant_id"]
+            if var_id in ambiguous_excluded_ids:
+                continue
+            locus = (
+                f"{_normalize_chromosome(str(row['chromosome']))}:"
+                f"{int(row['position'])}"
+            )
+            if locus not in reference_index:
+                continue  # platform-measured but absent from reference: keep observed
+            match = match_oriented_dosage(
+                row["chromosome"], int(row["position"]),
+                row["effect_allele"], row.get("other_allele"),
+                genotype_data.variant_info, genotype_data.dosage_matrix,
+                reference_index,
+            )
+            if match is None:
+                observed_allele_reclassified.add(var_id)
+        if observed_allele_reclassified:
+            observed_variant_ids -= observed_allele_reclassified
+            missing_variant_ids |= observed_allele_reclassified
+            if self.verbose >= 1:
+                print(
+                    f"Reclassified {len(observed_allele_reclassified)} observed "
+                    f"variants to missing (allele-incompatible with reference)"
                 )
 
         # Step 8: Build training matrices
@@ -727,11 +772,18 @@ class LinearImputationPRS:
         # Get expected variants for filtering
         expected_variants = self._get_expected_variants()
 
-        # Handle dict input directly, otherwise use loader
+        # Handle dict input directly, otherwise use the loaders. For real uploads
+        # (file / DataFrame) also load a multi-key raw collection so the observed
+        # component is scored allele-aware. The imputed component still reads the
+        # legacy dosage dict (unchanged until P1.4), so the input is deliberately
+        # parsed twice here; the double parse goes away when P1.4 routes predictor
+        # inputs through the same collection.
+        raw_genotypes = None
         if isinstance(user_genotypes, dict):
             user_dosages = user_genotypes
         else:
             user_dosages = load_user_genotypes(user_genotypes, expected_variants)
+            raw_genotypes = load_raw_user_genotypes(user_genotypes)
 
         # Create PRSPredictor and compute prediction
         predictor = PRSPredictor(
@@ -739,7 +791,11 @@ class LinearImputationPRS:
             imputed_models=self._imputed_models,
             calibration_params=self._calibration_params,
         )
-        return predictor.predict(user_dosages, apply_calibration=apply_calibration)
+        return predictor.predict(
+            user_dosages,
+            apply_calibration=apply_calibration,
+            raw_genotypes=raw_genotypes,
+        )
 
     def _get_expected_variants(self) -> Set[str]:
         """Get set of all variant IDs needed for prediction.

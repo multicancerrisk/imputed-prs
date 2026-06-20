@@ -175,6 +175,12 @@ class PredictionResult:
         se_scaled: Scaled standard error (optional).
         ci_lower_scaled: Scaled CI lower bound (optional).
         ci_upper_scaled: Scaled CI upper bound (optional).
+        n_observed_scored_direct: Count of observed variants scored from a direct,
+            allele-oriented effect-allele dosage. ``None`` on the legacy
+            allele-blind (dosage-dict) prediction path.
+        unresolved_observed_ids: variant_ids of observed variants that could not be
+            resolved/oriented at runtime (recovered via fallback in P1.8). ``None``
+            on the legacy allele-blind path.
     """
 
     prs: float
@@ -192,6 +198,8 @@ class PredictionResult:
     se_scaled: Optional[float] = None
     ci_lower_scaled: Optional[float] = None
     ci_upper_scaled: Optional[float] = None
+    n_observed_scored_direct: Optional[int] = None
+    unresolved_observed_ids: Optional[Tuple[str, ...]] = None
 
 
 @dataclass

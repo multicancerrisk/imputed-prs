@@ -1,17 +1,185 @@
 """Tests for the predictor module."""
 
 import numpy as np
+import pandas as pd
 
 from imputed_prs.core.types import (
     CalibrationParams,
     ImputedVariantModel,
     VariantInfo,
 )
+from imputed_prs.io.user_genotypes import load_raw_user_genotypes
 from imputed_prs.models.predictor import (
+    ObservedScore,
     PRSPredictor,
     compute_imputed_prs,
     compute_observed_prs,
+    compute_observed_prs_oriented,
 )
+
+
+def _collection(rows):
+    """Build a RawUserGenotypeCollection from (rsid, chrom, pos, genotype) rows."""
+    df = pd.DataFrame(
+        {
+            "rsid": [r[0] for r in rows],
+            "chrom": [r[1] for r in rows],
+            "pos": [r[2] for r in rows],
+            "genotype": [r[3] for r in rows],
+        }
+    )
+    return load_raw_user_genotypes(df)
+
+
+class TestComputeObservedPrsOriented:
+    """Allele-aware observed scoring (P1.2): counts the effect allele."""
+
+    def test_effect_alt_hand_calc(self):
+        """effect=ALT: 'AA' counts 2 copies of A -> 2*beta."""
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.1)]
+        coll = _collection([("rs1", "1", 100, "AA")])
+        result = compute_observed_prs_oriented(
+            coll, observed, allow_ambiguous=True
+        )
+        assert isinstance(result, ObservedScore)
+        np.testing.assert_allclose(result.prs, 0.2, rtol=0, atol=1e-12)
+        assert result.n_scored_direct == 1
+        assert result.unresolved_ids == ()
+
+    def test_effect_ref_hand_calc(self):
+        """effect=REF: 'AA' counts 0 copies of effect=G -> 0.0, NOT 2*beta."""
+        observed = [VariantInfo("rs2", "1", 200, "G", "A", 0.5)]
+        coll = _collection([("rs2", "1", 200, "AA")])
+        result = compute_observed_prs_oriented(
+            coll, observed, allow_ambiguous=True
+        )
+        np.testing.assert_allclose(result.prs, 0.0, rtol=0, atol=1e-12)
+        assert result.n_scored_direct == 1
+        # Contrast: the allele-blind path would score genotype_to_dosage('AA')=2.
+        blind, _ = compute_observed_prs({"rs2": 2.0}, observed)
+        np.testing.assert_allclose(blind, 1.0, rtol=0, atol=1e-12)
+
+    def test_heterozygote_order_invariant(self):
+        """'AG' and 'GA' both count 1 copy of the effect allele."""
+        observed = [VariantInfo("rs3", "1", 300, "A", "G", 0.7)]
+        for geno in ("AG", "GA"):
+            result = compute_observed_prs_oriented(
+                _collection([("rs3", "1", 300, geno)]),
+                observed,
+                allow_ambiguous=True,
+            )
+            np.testing.assert_allclose(result.prs, 0.7, rtol=0, atol=1e-12)
+            assert result.n_scored_direct == 1
+
+    def test_resolves_by_chrpos_when_rsid_differs(self):
+        """A variant whose rsID is absent resolves via chr:pos."""
+        observed = [VariantInfo("rs_prs_only", "1", 400, "A", "G", 0.3)]
+        # User file has a different id at the same locus.
+        coll = _collection([("rs_platform", "1", 400, "AA")])
+        result = compute_observed_prs_oriented(
+            coll, observed, allow_ambiguous=True
+        )
+        np.testing.assert_allclose(result.prs, 0.6, rtol=0, atol=1e-12)
+        assert result.n_scored_direct == 1
+        assert result.unresolved_ids == ()
+
+    def test_duplicate_conflict_is_unresolved(self):
+        """Conflicting duplicate user entries -> unresolved, never scored."""
+        observed = [VariantInfo("rs5", "1", 500, "A", "G", 0.9)]
+        coll = _collection(
+            [("rs5", "1", 500, "AA"), ("rs5", "1", 500, "GG")]
+        )
+        result = compute_observed_prs_oriented(
+            coll, observed, allow_ambiguous=True
+        )
+        np.testing.assert_allclose(result.prs, 0.0, rtol=0, atol=1e-12)
+        assert result.n_scored_direct == 0
+        assert result.unresolved_ids == ("rs5",)
+
+    def test_palindromic_policy_knob(self):
+        """A/T palindrome: unresolved when allow_ambiguous=False, scored when True."""
+        observed = [VariantInfo("rs6", "1", 600, "A", "T", 0.4)]
+        coll = _collection([("rs6", "1", 600, "AA")])
+
+        blocked = compute_observed_prs_oriented(
+            coll, observed, allow_ambiguous=False
+        )
+        assert blocked.n_scored_direct == 0
+        assert blocked.unresolved_ids == ("rs6",)
+
+        allowed = compute_observed_prs_oriented(
+            coll, observed, allow_ambiguous=True
+        )
+        np.testing.assert_allclose(allowed.prs, 0.8, rtol=0, atol=1e-12)
+        assert allowed.n_scored_direct == 1
+
+    def test_strand_flip_knob(self):
+        """Complementary-strand genotype scored only with allow_strand_flip=True."""
+        observed = [VariantInfo("rs7", "1", 700, "A", "G", 0.5)]
+        coll = _collection([("rs7", "1", 700, "TT")])  # complement of AA
+
+        no_flip = compute_observed_prs_oriented(
+            coll, observed, allow_ambiguous=True, allow_strand_flip=False
+        )
+        assert no_flip.n_scored_direct == 0
+        assert no_flip.unresolved_ids == ("rs7",)
+
+        with_flip = compute_observed_prs_oriented(
+            coll, observed, allow_ambiguous=True, allow_strand_flip=True
+        )
+        np.testing.assert_allclose(with_flip.prs, 1.0, rtol=0, atol=1e-12)
+        assert with_flip.n_scored_direct == 1
+
+    def test_missing_other_allele_is_unresolved(self):
+        """other_allele=None cannot be browser-safely oriented -> unresolved."""
+        observed = [VariantInfo("rs8", "1", 800, "A", None, 0.6)]
+        coll = _collection([("rs8", "1", 800, "AA")])
+        result = compute_observed_prs_oriented(
+            coll, observed, allow_ambiguous=True
+        )
+        assert result.n_scored_direct == 0
+        assert result.unresolved_ids == ("rs8",)
+
+    def test_not_found_is_unresolved(self):
+        """A variant absent from the user file is unresolved, not scored."""
+        observed = [VariantInfo("rs9", "1", 900, "A", "G", 0.6)]
+        coll = _collection([("rsX", "2", 111, "AA")])
+        result = compute_observed_prs_oriented(
+            coll, observed, allow_ambiguous=True
+        )
+        np.testing.assert_allclose(result.prs, 0.0, rtol=0, atol=1e-12)
+        assert result.n_scored_direct == 0
+        assert result.unresolved_ids == ("rs9",)
+
+    def test_empty_observed_list(self):
+        """No observed variants -> zeroed ObservedScore."""
+        result = compute_observed_prs_oriented(
+            _collection([("rs1", "1", 100, "AA")]), [], allow_ambiguous=True
+        )
+        assert result == ObservedScore(0.0, 0, ())
+
+    def test_mixed_set_exact_sum_and_unresolved_order(self):
+        """Mixed observed set: exact PRS, count, and unresolved ordering."""
+        observed = [
+            VariantInfo("rs_alt", "1", 100, "A", "G", 0.1),   # AA -> 2*0.1
+            VariantInfo("rs_ref", "1", 200, "G", "A", 0.5),   # AA -> 0*0.5
+            VariantInfo("rs_absent", "1", 300, "A", "G", 1.0),  # not in file
+            VariantInfo("rs_pal", "1", 400, "C", "G", 2.0),   # palindrome blocked
+        ]
+        coll = _collection(
+            [
+                ("rs_alt", "1", 100, "AA"),
+                ("rs_ref", "1", 200, "AA"),
+                ("rs_pal", "1", 400, "CC"),
+            ]
+        )
+        result = compute_observed_prs_oriented(
+            coll, observed, allow_ambiguous=False
+        )
+        np.testing.assert_allclose(result.prs, 0.2, rtol=0, atol=1e-12)
+        assert result.n_scored_direct == 2  # rs_alt and rs_ref
+        # Unresolved preserves observed_variants order.
+        assert result.unresolved_ids == ("rs_absent", "rs_pal")
 
 
 class TestComputeObservedPrs:
@@ -516,6 +684,47 @@ class TestPRSPredictor:
         assert abs(result.prs - expected_prs) < 1e-10
         assert result.n_variants_used == 3
         assert result.n_variants_imputed == 1
+
+    def test_legacy_dict_path_leaves_oriented_diagnostics_none(self):
+        """The allele-blind dosage-dict path does not populate oriented fields."""
+        observed = self._create_observed_variants()
+        imputed = [self._create_imputed_model()]
+        predictor = PRSPredictor(observed, imputed)
+
+        result = predictor.predict({"rs1": 2.0, "rs2": 1.0}, apply_calibration=False)
+
+        assert result.n_observed_scored_direct is None
+        assert result.unresolved_observed_ids is None
+        # Score itself is unchanged from the pre-P1.2 baseline.
+        assert abs(result.prs - 0.47) < 1e-10
+
+    def test_oriented_observed_via_raw_genotypes(self):
+        """raw_genotypes routes observed scoring through the allele-aware path."""
+        observed = self._create_observed_variants()  # rs1=(A,G,0.1), rs2=(C,T,0.2)
+        imputed = [self._create_imputed_model()]
+        predictor = PRSPredictor(observed, imputed)
+
+        # Imputed component still reads the legacy dosage dict (unchanged in P1.2).
+        user_dosages = {"rs1": 2.0, "rs2": 1.0}
+        # Observed scored from strings: rs1 "GG" -> 0 copies of effect A (NOT 2),
+        # rs2 "CC" -> 2 copies of effect C.
+        coll = _collection([("rs1", "1", 100, "GG"), ("rs2", "1", 200, "CC")])
+        result = predictor.predict(
+            user_dosages, apply_calibration=False, raw_genotypes=coll
+        )
+
+        # Oriented observed = 0*0.1 + 2*0.2 = 0.4 (allele-blind would give 0.6).
+        np.testing.assert_allclose(
+            result.prs_observed_component, 0.4, rtol=0, atol=1e-12
+        )
+        # Imputed component identical to the dosage-dict baseline (1.4 * 0.05).
+        np.testing.assert_allclose(
+            result.prs_imputed_component, 0.07, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(result.prs, 0.47, rtol=0, atol=1e-12)
+        assert result.n_observed_scored_direct == 2
+        assert result.unresolved_observed_ids == ()
+        assert result.n_variants_used == 3
 
     def test_all_observed_variants_no_imputation(self):
         """All observed variants, no imputation needed."""
