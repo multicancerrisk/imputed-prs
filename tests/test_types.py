@@ -63,6 +63,7 @@ class TestVariantInfo:
             "effect_allele": "T",
             "other_allele": "A",
             "beta": 0.1,
+            "fallback": None,
         }
 
 

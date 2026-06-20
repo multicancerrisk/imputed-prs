@@ -12,6 +12,7 @@ from imputed_prs.io.user_genotypes import load_raw_user_genotypes
 from imputed_prs.models.predictor import (
     ObservedScore,
     PRSPredictor,
+    _predict_model_dosage,
     compute_imputed_prs,
     compute_imputed_prs_oriented,
     compute_observed_prs,
@@ -1256,3 +1257,214 @@ class TestPRSPredictor:
         assert result.se_scaled is None
         assert result.ci_lower_scaled is None
         assert result.ci_upper_scaled is None
+
+def _intercept_only_fallback(variant_id, beta, intercept, residual_variance=0.1):
+    """An intercept-only ImputedVariantModel usable as an observed fallback (P1.8).
+
+    Predicts ``clip(intercept)`` copies of the effect allele regardless of the
+    upload, so tests can pin the recovered contribution to ``clip(intercept)*beta``.
+    """
+    return _imputed_model(
+        variant_id=variant_id,
+        effect_allele="A",
+        other_allele="G",
+        beta=beta,
+        intercept=intercept,
+        residual_variance=residual_variance,
+        is_intercept_only=True,
+        predictor_variant_ids=[],
+    )
+
+
+class TestObservedFallback:
+    """P1.8 — observed variants recovered via per-variant fallback models."""
+
+    def test_direct_scoring_ignores_biased_fallback(self):
+        """A resolvable variant is scored direct; its (biased) fallback is unused."""
+        # The biased fallback predicts dosage 0 -> would contribute 0.0 if used;
+        # the direct "AA" count contributes 2*0.1 = 0.2. They differ, so the
+        # asserted 0.2 proves the fallback was not consulted.
+        fb = _intercept_only_fallback("rs1", beta=0.1, intercept=0.0)
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.1, fallback=fb)]
+        coll = _collection([("rs1", "1", 100, "AA")])
+        r = compute_observed_prs_oriented(coll, observed, allow_ambiguous=True)
+        np.testing.assert_allclose(r.prs, 0.2, rtol=0, atol=1e-12)
+        assert r.n_scored_direct == 1
+        assert r.n_scored_fallback == 0
+        assert r.fallback_variance == 0.0
+        assert r.unresolved_ids == ()
+
+    def test_homozygous_other_allele_is_direct_not_fallback(self):
+        """A 0.0 direct dosage (homozygous other allele) is a score, not a failure."""
+        fb = _intercept_only_fallback("rs1", beta=0.1, intercept=2.0)  # would be 0.2
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.1, fallback=fb)]
+        coll = _collection([("rs1", "1", 100, "GG")])  # zero copies of A
+        r = compute_observed_prs_oriented(coll, observed, allow_ambiguous=True)
+        assert r.prs == 0.0
+        assert r.n_scored_direct == 1
+        assert r.n_scored_fallback == 0
+
+    def test_no_call_recovered_via_fallback(self):
+        """A no-call observed genotype is recovered via fallback, not dropped."""
+        fb = _intercept_only_fallback("rs_big", beta=1.5, intercept=0.6)
+        observed = [VariantInfo("rs_big", "1", 100, "A", "G", 1.5, fallback=fb)]
+        coll = _collection([("rs_big", "1", 100, "--")])
+        r = compute_observed_prs_oriented(coll, observed, allow_ambiguous=True)
+        assert r.n_scored_direct == 0
+        assert r.n_scored_fallback == 1
+        assert r.unresolved_ids == ()
+        # intercept-only fallback predicts clip(0.6) = 0.6 -> 0.6 * 1.5
+        np.testing.assert_allclose(r.prs, 0.6 * 1.5, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(r.weighted_beta_fallback, 1.5, rtol=0, atol=1e-12)
+        assert r.fallback_variance > 0.0
+
+    def test_no_fallback_stays_unresolved(self):
+        """Without a fallback model, a no-call variant is reported unresolved."""
+        observed = [VariantInfo("rs_big", "1", 100, "A", "G", 1.5)]
+        coll = _collection([("rs_big", "1", 100, "--")])
+        r = compute_observed_prs_oriented(coll, observed, allow_ambiguous=True)
+        assert r.n_scored_fallback == 0
+        assert r.unresolved_ids == ("rs_big",)
+        assert r.prs == 0.0
+        assert r.fallback_variance == 0.0
+
+    def test_partial_overlap_routes_to_fallback(self):
+        """A genotype partially overlapping the allele pair routes to fallback."""
+        fb = _intercept_only_fallback("rs1", beta=0.7, intercept=0.6)
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.7, fallback=fb)]
+        coll = _collection([("rs1", "1", 100, "AC")])  # C not in {A, G}
+        r = compute_observed_prs_oriented(coll, observed, allow_ambiguous=True)
+        assert r.n_scored_direct == 0
+        assert r.n_scored_fallback == 1
+        assert r.unresolved_ids == ()
+
+    def test_duplicate_conflict_routes_to_fallback(self):
+        """A duplicate-conflict (same id, conflicting genotype) routes to fallback."""
+        fb = _intercept_only_fallback("rs1", beta=0.7, intercept=0.6)
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.7, fallback=fb)]
+        coll = _collection([("rs1", "1", 100, "AA"), ("rs1", "1", 100, "GG")])
+        r = compute_observed_prs_oriented(coll, observed, allow_ambiguous=True)
+        assert r.n_scored_direct == 0
+        assert r.n_scored_fallback == 1
+        assert r.unresolved_ids == ()
+
+    def test_weighted_beta_via_fallback_sums_absolute_betas(self):
+        """weighted_beta_fallback = sum of |beta| over fallback-scored variants."""
+        observed = [
+            VariantInfo("rs_a", "1", 100, "A", "G", 0.1),  # scored direct
+            VariantInfo("rs_b", "1", 200, "A", "G", -2.0,
+                        fallback=_intercept_only_fallback("rs_b", -2.0, 0.6)),
+            VariantInfo("rs_c", "1", 300, "A", "G", 0.5,
+                        fallback=_intercept_only_fallback("rs_c", 0.5, 0.6)),
+        ]
+        coll = _collection([
+            ("rs_a", "1", 100, "AA"),
+            ("rs_b", "1", 200, "--"),
+            ("rs_c", "1", 300, "--"),
+        ])
+        r = compute_observed_prs_oriented(coll, observed, allow_ambiguous=True)
+        assert r.n_scored_direct == 1
+        assert r.n_scored_fallback == 2
+        # |-2.0| + |0.5| = 2.5 (a signed sum would be -1.5).
+        np.testing.assert_allclose(r.weighted_beta_fallback, 2.5, rtol=0, atol=1e-12)
+
+    def test_fallback_with_predictors_mean_substitutes_missing(self):
+        """A fallback's missing predictor is mean-substituted (2*AF), matching the
+        imputed scorer; the present predictor uses its real counted dosage."""
+        fb = _imputed_model(
+            variant_id="rs_t", effect_allele="A", other_allele="G", beta=1.0,
+            intercept=0.1, residual_variance=0.05, is_intercept_only=False,
+            predictor_variant_ids=["rs_p0", "rs_p1"],
+            coefficients=np.array([0.3, 0.4]),
+            predictor_chromosomes=["1", "1"],
+            predictor_positions=[1000, 2000],
+            predictor_counted_alleles=["A", "A"],
+            predictor_other_alleles=["G", "G"],
+            predictor_allele_frequencies=np.array([0.4, 0.4]),
+        )
+        observed = [VariantInfo("rs_t", "1", 5000, "A", "G", 1.0, fallback=fb)]
+        # rs_t no-call -> fallback; rs_p0 "AA" -> 2 copies of A; rs_p1 omitted -> 2*0.4.
+        coll = _collection([
+            ("rs_t", "1", 5000, "--"),
+            ("rs_p0", "1", 1000, "AA"),
+        ])
+        r = compute_observed_prs_oriented(coll, observed, allow_ambiguous=True)
+        # raw = 2.0*0.3 + (2*0.4)*0.4 + 0.1 = 0.6 + 0.32 + 0.1 = 1.02; clip -> 1.02.
+        np.testing.assert_allclose(r.prs, 1.02, rtol=0, atol=1e-12)
+        assert r.n_scored_fallback == 1
+
+    def test_predict_model_dosage_matches_imputed_scorer(self):
+        """_predict_model_dosage is the per-model body of compute_imputed_prs_oriented."""
+        model = _imputed_model(beta=0.05)
+        coll = _collection([
+            ("rs_p0", "1", 1000, "AA"),
+            ("rs_p1", "1", 1100, "AG"),
+        ])
+        dosage, var, trunc = _predict_model_dosage(
+            model, coll, allow_ambiguous=True, allow_strand_flip=True
+        )
+        prs, total_var, _, n_trunc = compute_imputed_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        np.testing.assert_allclose(prs, dosage * model.beta, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(
+            total_var, (model.beta ** 2) * var, rtol=0, atol=1e-12
+        )
+        assert n_trunc == (1 if trunc else 0)
+
+
+class TestPRSPredictorFallback:
+    """P1.8 fallback wired through the full PRSPredictor.predict path."""
+
+    def test_fallback_variance_reaches_se_and_ci(self):
+        fb = _intercept_only_fallback("rs1", beta=1.0, intercept=0.6)
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 1.0, fallback=fb)]
+        predictor = PRSPredictor(observed, imputed_models=[])
+        coll = _collection([("rs1", "1", 100, "--")])
+        r = predictor.predict({}, apply_calibration=False, raw_genotypes=coll)
+        assert r.n_observed_scored_direct == 0
+        assert r.n_observed_scored_via_fallback == 1
+        assert r.unresolved_observed_ids == ()
+        assert r.se > 0.0
+        assert r.ci_lower < r.prs < r.ci_upper
+        assert r.n_variants_used == 1
+
+    def test_no_fallback_control_has_zero_se(self):
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 1.0)]
+        predictor = PRSPredictor(observed, imputed_models=[])
+        coll = _collection([("rs1", "1", 100, "--")])
+        r = predictor.predict({}, apply_calibration=False, raw_genotypes=coll)
+        assert r.se == 0.0
+        assert r.unresolved_observed_ids == ("rs1",)
+        assert r.n_observed_scored_via_fallback == 0
+
+    def test_direct_unchanged_with_fallback_present(self):
+        fb = _intercept_only_fallback("rs1", beta=0.1, intercept=0.0)  # biased
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.1, fallback=fb)]
+        predictor = PRSPredictor(observed, imputed_models=[])
+        coll = _collection([("rs1", "1", 100, "AA")])
+        r = predictor.predict({}, apply_calibration=False, raw_genotypes=coll)
+        np.testing.assert_allclose(r.prs_observed_component, 0.2, rtol=0, atol=1e-12)
+        assert r.n_observed_scored_via_fallback == 0
+        assert r.se == 0.0  # exact integer count
+
+    def test_calibration_applies_on_top_of_fallback(self):
+        calib = CalibrationParams(
+            scaling_factor=2.0, scaling_factor_se=0.1, calibration_intercept=0.5,
+            calibration_r2=0.9, sd_cv_predicted=1.0, sd_true=1.0, sd_scaled=1.0,
+            attenuation_factor=1.0, n_calibration=100,
+        )
+        fb = _intercept_only_fallback("rs1", beta=1.0, intercept=0.6)
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 1.0, fallback=fb)]
+        predictor = PRSPredictor(observed, imputed_models=[], calibration_params=calib)
+        coll = _collection([("rs1", "1", 100, "--")])
+        r = predictor.predict({}, apply_calibration=True, raw_genotypes=coll)
+        np.testing.assert_allclose(r.prs_scaled, 2.0 * r.prs + 0.5, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(r.se_scaled, 2.0 * r.se, rtol=0, atol=1e-12)
+
+    def test_legacy_dict_path_leaves_fallback_fields_none(self):
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.1)]
+        predictor = PRSPredictor(observed, imputed_models=[])
+        r = predictor.predict({"rs1": 2.0}, apply_calibration=False)
+        assert r.n_observed_scored_via_fallback is None
+        assert r.weighted_beta_via_fallback is None

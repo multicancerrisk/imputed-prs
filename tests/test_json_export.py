@@ -756,6 +756,37 @@ class TestSchemaValidation:
         assert all("residual_variance" not in m for m in data["imputed_variants"])
         imputation_v2_validator.validate(data)
 
+    def test_observed_fallback_validates(
+        self, imputation_v2_validator, sample_imputed_models
+    ):
+        """An observed variant carrying a populated fallback model conforms (P1.8)."""
+        observed = [
+            VariantInfo(
+                "rs1", "1", 100, "A", "G", 0.1, fallback=sample_imputed_models[0]
+            ),
+            VariantInfo("rs2", "1", 200, "C", "T", 0.2),  # fallback=None -> null
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._export(tmpdir, observed, [])
+        assert data["observed_variants"][0]["fallback"] is not None
+        assert data["observed_variants"][1]["fallback"] is None
+        imputation_v2_validator.validate(data)
+
+    def test_malformed_fallback_is_rejected(
+        self, jsonschema_mod, imputation_v2_validator, sample_imputed_models
+    ):
+        """A fallback block missing a required predictor field fails validation."""
+        observed = [
+            VariantInfo(
+                "rs1", "1", 100, "A", "G", 0.1, fallback=sample_imputed_models[0]
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._export(tmpdir, observed, [])
+        data["observed_variants"][0]["fallback"]["predictors"][0].pop("counted_allele")
+        with pytest.raises(jsonschema_mod.ValidationError):
+            imputation_v2_validator.validate(data)
+
     @pytest.mark.parametrize(
         "mutate",
         [

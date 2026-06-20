@@ -1443,7 +1443,16 @@ class TestLinearImputationPRSExport:
         df = pd.read_csv(paths["csv"])
         assert "variant_id" in df.columns
         assert "status" in df.columns
-        assert len(df) == len(fitted_model.observed_variants) + len(fitted_model.imputed_models)
+        # One row per observed + imputed variant, plus one per observed-variant
+        # fallback model (P1.8), which is serialized as its own status row.
+        n_fallback = sum(
+            1 for v in fitted_model.observed_variants if v.fallback is not None
+        )
+        assert len(df) == (
+            len(fitted_model.observed_variants)
+            + len(fitted_model.imputed_models)
+            + n_fallback
+        )
 
     @pytest.mark.skipif(
         not Path("/usr/bin/python3").exists(),
@@ -1775,3 +1784,104 @@ class TestVariantDispositionsAndCoverage:
         vt = model.variant_table
         assert len(vt) == len(synthetic_prs_df)
         assert sorted(vt["variant_id"]) == sorted(synthetic_prs_df["variant_id"])
+
+
+class TestObservedFallbackTraining:
+    """P1.8 — per-observed-variant fallback models trained at fit time."""
+
+    def _fit(self, vcf, prs_df, platform, **kwargs):
+        pytest.importorskip("cyvcf2")
+        model = LinearImputationPRS(
+            window_size=500_000, cv_folds=3, tuning_scope="none",
+            verbose=0, random_state=42, **kwargs,
+        )
+        model.fit(reference_genotypes=vcf, prs_definition=prs_df,
+                  platform_variants=platform)
+        return model
+
+    def test_observed_variants_get_fallbacks(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """Every in-reference observed variant carries a trained fallback model."""
+        model = self._fit(synthetic_vcf_file, synthetic_prs_df,
+                          platform_variants_partial)
+        assert model.observed_variants
+        assert all(v.fallback is not None for v in model.observed_variants)
+        assert model.summary["n_observed_with_fallback"] == len(
+            model.observed_variants
+        )
+        disp = model.variant_dispositions.set_index("variant_id")
+        for vid in ["rs1", "rs2", "rs3"]:
+            assert bool(disp.loc[vid, "has_fallback"]) is True
+            assert disp.loc[vid, "fallback_reason"] is None
+
+    def test_fallback_training_is_deterministic(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """Two fits with the same random_state produce identical fallback models."""
+        m1 = self._fit(synthetic_vcf_file, synthetic_prs_df,
+                       platform_variants_partial)
+        m2 = self._fit(synthetic_vcf_file, synthetic_prs_df,
+                       platform_variants_partial)
+        fb1 = {v.variant_id: v.fallback for v in m1.observed_variants}
+        fb2 = {v.variant_id: v.fallback for v in m2.observed_variants}
+        assert fb1.keys() == fb2.keys()
+        for vid in fb1:
+            np.testing.assert_array_equal(
+                fb1[vid].coefficients, fb2[vid].coefficients
+            )
+            assert fb1[vid].intercept == fb2[vid].intercept
+            assert fb1[vid].predictor_variant_ids == fb2[vid].predictor_variant_ids
+
+    def test_no_call_observed_recovered_end_to_end(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """A no-call observed variant is recovered via its fallback, not dropped."""
+        model = self._fit(synthetic_vcf_file, synthetic_prs_df,
+                          platform_variants_partial)
+        upload = pd.DataFrame(
+            {"rsid": ["rs1", "rs2", "rs3"], "genotype": ["AG", "--", "AA"]}
+        )
+        r = model.predict(upload, apply_calibration=False)
+        assert r.n_observed_scored_direct == 2  # rs1, rs3 counted directly
+        assert r.n_observed_scored_via_fallback == 1  # rs2 recovered
+        assert "rs2" not in (r.unresolved_observed_ids or ())
+        assert r.weighted_beta_via_fallback == 0.05  # |beta(rs2)| = 0.05
+
+    def test_fully_resolvable_upload_uses_no_fallback(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """When every observed variant resolves, scoring is direct and exact."""
+        model = self._fit(synthetic_vcf_file, synthetic_prs_df,
+                          platform_variants_partial)
+        upload = pd.DataFrame(
+            {"rsid": ["rs1", "rs2", "rs3"], "genotype": ["AG", "CC", "AA"]}
+        )
+        r = model.predict(upload, apply_calibration=False)
+        assert r.n_observed_scored_direct == 3
+        assert r.n_observed_scored_via_fallback == 0
+        # rs1 "AG" counts 1 G (effect=G, beta 0.1); rs2 "CC" counts 0 T
+        # (effect=T, beta -0.05); rs3 "AA" counts 2 A (effect=A, beta 0.2).
+        np.testing.assert_allclose(
+            r.prs_observed_component, 1 * 0.1 + 0 * -0.05 + 2 * 0.2,
+            rtol=0, atol=1e-12,
+        )
+
+    def test_observed_absent_from_reference_has_no_fallback(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        """An observed variant whose locus is absent from the reference gets no
+        fallback (no training target) and is recorded, not silently."""
+        prs = pd.concat([synthetic_prs_df, pd.DataFrame([{
+            "variant_id": "rs999", "chromosome": "1", "position": 5000,
+            "effect_allele": "A", "other_allele": "G", "beta": 0.3,
+        }])], ignore_index=True)
+        platform = platform_variants_partial + ["rs999"]
+        model = self._fit(synthetic_vcf_file, prs, platform)
+        by_id = {v.variant_id: v for v in model.observed_variants}
+        assert "rs999" in by_id
+        assert by_id["rs999"].fallback is None
+        disp = model.variant_dispositions.set_index("variant_id")
+        assert disp.loc["rs999", "status"] == "observed"
+        assert bool(disp.loc["rs999", "has_fallback"]) is False
+        assert disp.loc["rs999", "fallback_reason"] == "no_reference_target"

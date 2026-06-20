@@ -202,6 +202,64 @@ class TestImputationRoundTrip:
             for m in fitted_imputation_model.imputed_models
         )
 
+    def test_fitted_model_trains_observed_fallbacks(self, fitted_imputation_model):
+        # Guards the fallback round trip below: every in-reference observed
+        # variant (rs1-rs3) must carry a per-variant fallback model (P1.8).
+        observed = fitted_imputation_model.observed_variants
+        assert observed, "expected observed variants"
+        assert all(v.fallback is not None for v in observed)
+        assert fitted_imputation_model.summary["n_observed_with_fallback"] == len(
+            observed
+        )
+
+    @pytest.mark.parametrize(
+        "fmt,dep",
+        [
+            ("json", None),
+            ("hdf5", "h5py"),
+            ("arrow", "pyarrow"),
+            ("parquet", "pyarrow"),
+            ("csv", None),
+        ],
+    )
+    def test_round_trip_recovers_observed_fallback(
+        self, fitted_imputation_model, tmp_path, fmt, dep
+    ):
+        """An upload that no-calls an observed variant recovers it via fallback,
+        and that recovery survives export->load for *every* format (P1.8)."""
+        if dep is not None:
+            pytest.importorskip(dep)
+        model = fitted_imputation_model
+        # rs2 is a no-call; rs1/rs3 are called so rs2's fallback can use them.
+        upload = pd.DataFrame(
+            {
+                "rsid": ["rs1", "rs2", "rs3"],
+                "chromosome": ["1", "1", "1"],
+                "position": [100000, 100500, 101000],
+                "genotype": ["AG", "--", "AA"],
+            }
+        )
+        paths = model.export(tmp_path, model_name="fb", formats=[fmt])
+        loaded = LinearImputationPRS.load(paths[fmt])
+
+        r0 = model.predict(upload, apply_calibration=False, genome_build="GRCh37")
+        r1 = loaded.predict(upload, apply_calibration=False, genome_build="GRCh37")
+
+        # rs2 recovered via fallback (not dropped), both in-memory and loaded.
+        assert r0.n_observed_scored_via_fallback == 1, fmt
+        assert r1.n_observed_scored_via_fallback == 1, fmt
+        assert r0.unresolved_observed_ids == (), fmt
+        assert r1.unresolved_observed_ids == (), fmt
+        # The fallback recovery survives the round trip to float tolerance, so the
+        # serialized fallback block (JSON nest / flat observed_fallbacks) is exact.
+        np.testing.assert_allclose(
+            [r1.prs, r1.prs_observed_component, r1.se],
+            [r0.prs, r0.prs_observed_component, r0.se],
+            rtol=0,
+            atol=1e-12,
+            err_msg=f"format={fmt}",
+        )
+
 
 # =============================================================================
 # Golden: numeric path == rendered-string path on integer dosages
