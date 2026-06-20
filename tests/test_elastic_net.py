@@ -2,11 +2,13 @@
 
 import numpy as np
 import pytest
+from sklearn.linear_model import ElasticNet
 
 from imputed_prs.models.elastic_net import (
     _fit_intercept_only_model,
     fit_single_variant_model,
 )
+from imputed_prs.models.metrics import standardize_columns
 from imputed_prs.core.types import SingleVariantModelResult
 
 
@@ -448,3 +450,125 @@ class TestToDict:
         assert isinstance(d["cv_mse"], float)
         assert isinstance(d["cv_r2"], float)
         assert isinstance(d["is_intercept_only"], bool)
+
+
+class TestStandardization:
+    """Predictors are standardized before fitting; coefficients are back-transformed
+    to the raw-dosage scale so storage and inference are unchanged."""
+
+    def test_fold_scaler_fit_on_training_only(self):
+        """standardize_columns derives stats from the rows it is given; applying those
+        stats to differently-distributed rows does not re-center them (no leakage)."""
+        rng = np.random.default_rng(0)
+        X_train = rng.binomial(2, 0.3, (100, 4)).astype(float)
+        X_val = rng.binomial(2, 0.5, (40, 4)).astype(float)  # different distribution
+
+        X_train_std, mean, scale = standardize_columns(X_train)
+
+        # Scaler fit on the training rows only.
+        np.testing.assert_allclose(mean, X_train.mean(axis=0), atol=1e-12)
+        np.testing.assert_allclose(scale, X_train.std(axis=0), atol=1e-12)
+        np.testing.assert_allclose(X_train_std.mean(axis=0), 0.0, atol=1e-10)
+        np.testing.assert_allclose(X_train_std.std(axis=0), 1.0, atol=1e-10)
+
+        # Applying train stats to a differently-distributed val set does NOT
+        # zero-center it (the val mean leaks nothing into the train scaler).
+        X_val_std = (X_val - mean) / scale
+        assert np.any(np.abs(X_val_std.mean(axis=0)) > 0.05)
+
+        # Integration: a full fit still produces finite OOF predictions.
+        target = X_train[:, 0] * 0.7 + rng.normal(0, 0.1, 100)
+        result = fit_single_variant_model(target, X_train, random_state=42)
+        assert not np.any(np.isnan(result.cv_predictions))
+
+    def test_zero_variance_predictor_column_handled(self):
+        """A constant (zero-variance) predictor column yields no NaN coefficients."""
+        rng = np.random.default_rng(1)
+        n_samples = 200
+        signal = rng.binomial(2, 0.3, n_samples).astype(float)
+        constant = np.full(n_samples, 1.0)
+        predictors = np.column_stack([signal, constant])
+        target = 0.8 * signal + 0.3 + rng.normal(0, 0.1, n_samples)
+
+        result = fit_single_variant_model(target, predictors, random_state=42)
+
+        assert np.isfinite(result.coefficients).all()
+        assert np.isfinite(result.intercept)
+        assert not np.any(np.isnan(result.cv_predictions))
+        # Constant column carries no signal -> coefficient is exactly ~0.
+        assert abs(result.coefficients[1]) < 1e-6
+
+    def test_backtransform_predictions_match_standardized(self):
+        """The stored raw model predicts identically to the standardized final model."""
+        rng = np.random.default_rng(2)
+        n_samples = 300
+        predictors = rng.binomial(2, 0.3, (n_samples, 5)).astype(float)
+        target = (
+            predictors @ np.array([0.5, 0.3, 0.0, 0.2, 0.0])
+            + 0.4
+            + rng.normal(0, 0.2, n_samples)
+        )
+
+        result = fit_single_variant_model(
+            target, predictors, alpha=0.01, l1_ratio=0.5, random_state=42
+        )
+
+        # Reconstruct the standardized final model the function fit internally.
+        X_std, mean, scale = standardize_columns(predictors)
+        m = ElasticNet(
+            alpha=0.01, l1_ratio=0.5, fit_intercept=True, max_iter=10000, random_state=42
+        )
+        m.fit(X_std, target)
+
+        raw_pred = predictors @ result.coefficients + result.intercept
+        std_pred = m.predict((predictors - mean) / scale)
+        np.testing.assert_allclose(raw_pred, std_pred, rtol=1e-9, atol=1e-9)
+
+    def test_cv_predictions_invariant_under_positive_rescaling(self):
+        """CV predictions are invariant when a predictor column is positively rescaled.
+
+        This FAILS on the pre-fix raw-dosage fit (the L1/L2 penalty depended on each
+        column's scale) and PASSES once predictors are standardized before fitting.
+        """
+        rng = np.random.default_rng(3)
+        n_samples = 300
+        predictors = rng.binomial(2, 0.3, (n_samples, 5)).astype(float)
+        target = (
+            predictors @ np.array([0.5, -0.3, 0.2, 0.0, 0.1])
+            + 0.4
+            + rng.normal(0, 0.2, n_samples)
+        )
+
+        result_a = fit_single_variant_model(target, predictors, random_state=7)
+
+        rescaled = predictors.copy()
+        rescaled[:, 0] *= 4.0  # power of two -> clean float cancellation
+        result_b = fit_single_variant_model(target, rescaled, random_state=7)
+
+        np.testing.assert_allclose(
+            result_a.cv_predictions,
+            result_b.cv_predictions,
+            rtol=1e-7,
+            atol=1e-9,
+            equal_nan=True,
+        )
+        assert result_a.cv_r2 == pytest.approx(result_b.cv_r2, rel=1e-6)
+        assert result_a.cv_mse == pytest.approx(result_b.cv_mse, rel=1e-6)
+        # The raw-scale coefficient for the rescaled column scales by 1/4.
+        assert result_b.coefficients[0] == pytest.approx(
+            result_a.coefficients[0] / 4.0, rel=1e-6
+        )
+
+    def test_is_intercept_only_consistent_after_backtransform(self):
+        """High regularization zeros every coefficient; the flag and the stored raw
+        coefficients agree (0 / scale stays 0)."""
+        rng = np.random.default_rng(4)
+        predictors = rng.binomial(2, 0.3, (200, 5)).astype(float)
+        target = rng.normal(0, 0.01, 200)  # negligible signal
+
+        result = fit_single_variant_model(
+            target, predictors, alpha=100.0, random_state=42
+        )
+
+        assert result.is_intercept_only
+        assert np.allclose(result.coefficients, 0, atol=1e-12)

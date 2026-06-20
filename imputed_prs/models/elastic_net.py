@@ -7,7 +7,11 @@ from sklearn.linear_model import ElasticNet
 from sklearn.model_selection import KFold
 
 from imputed_prs.core.types import SingleVariantModelResult
-from imputed_prs.models.metrics import compute_cv_r2
+from imputed_prs.models.metrics import (
+    backtransform_linear_model,
+    compute_cv_r2,
+    standardize_columns,
+)
 
 
 def _fit_intercept_only_model(
@@ -154,6 +158,11 @@ def fit_single_variant_model(
         X_train, X_val = X_valid[train_idx], X_valid[val_idx]
         y_train, y_val = y_valid[train_idx], y_valid[val_idx]
 
+        # Standardize predictors using training-fold statistics only (no leakage
+        # from the validation fold), so the penalty is scale-free across predictors.
+        X_train_std, mean_fold, scale_fold = standardize_columns(X_train)
+        X_val_std = (X_val - mean_fold) / scale_fold
+
         # Fit ElasticNet on training fold
         model = ElasticNet(
             alpha=alpha,
@@ -162,10 +171,10 @@ def fit_single_variant_model(
             max_iter=10000,
             random_state=random_state,
         )
-        model.fit(X_train, y_train)
+        model.fit(X_train_std, y_train)
 
-        # Predict on validation fold
-        y_pred = model.predict(X_val)
+        # Predict on validation fold (predictions are already in target space)
+        y_pred = model.predict(X_val_std)
 
         # Store out-of-fold predictions at original indices
         original_val_indices = valid_indices[val_idx]
@@ -175,7 +184,8 @@ def fit_single_variant_model(
         fold_mse = np.mean((y_val - y_pred) ** 2)
         fold_mses.append(fold_mse)
 
-    # Fit final model on all valid data
+    # Fit final model on all valid data, standardizing predictors first
+    X_valid_std, mean_all, scale_all = standardize_columns(X_valid)
     final_model = ElasticNet(
         alpha=alpha,
         l1_ratio=l1_ratio,
@@ -183,7 +193,13 @@ def fit_single_variant_model(
         max_iter=10000,
         random_state=random_state,
     )
-    final_model.fit(X_valid, y_valid)
+    final_model.fit(X_valid_std, y_valid)
+
+    # Back-transform coefficients to the raw-dosage scale so that storage,
+    # export, and inference (z @ coef + intercept) are unchanged.
+    coef_raw, intercept_raw = backtransform_linear_model(
+        final_model.coef_, final_model.intercept_, mean_all, scale_all
+    )
 
     # Compute metrics
     cv_mse = float(np.mean(fold_mses))
@@ -192,12 +208,13 @@ def fit_single_variant_model(
     valid_cv_preds = cv_predictions[valid_mask]
     cv_r2 = compute_cv_r2(y_valid, valid_cv_preds)
 
-    # Check if all coefficients were shrunk to zero
+    # Check if all coefficients were shrunk to zero (on the standardized fit,
+    # where ElasticNet produces exact zeros; coef_raw preserves the zero set).
     is_intercept_only = np.allclose(final_model.coef_, 0, atol=1e-10)
 
     return SingleVariantModelResult(
-        coefficients=final_model.coef_.copy(),
-        intercept=float(final_model.intercept_),
+        coefficients=coef_raw.copy(),
+        intercept=intercept_raw,
         cv_predictions=cv_predictions,
         cv_mse=cv_mse,
         cv_r2=cv_r2,

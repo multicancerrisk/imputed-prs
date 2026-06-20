@@ -3,10 +3,12 @@
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.linear_model import ElasticNet
 
 from imputed_prs.core.exceptions import ValidationError
 from imputed_prs.core.regions import merge_variant_windows
 from imputed_prs.core.types import ProjectionRegionModel, ProjectionTrainingResult
+from imputed_prs.models.metrics import standardize_columns
 from imputed_prs.models.projection import (
     SingleRegionModelResult,
     fit_single_region_model,
@@ -422,3 +424,122 @@ class TestProjectionRegionTrainer:
         X_bad = X[:, :5]
         with pytest.raises(ValidationError, match="Variant count mismatch"):
             trainer.fit_all_regions(Z, X_bad, prs_variants, platform_info)
+
+
+class TestRegionStandardization:
+    """Predictors are standardized before fitting; coefficients are back-transformed
+    to the raw-dosage scale (mirror of the imputation standardization tests)."""
+
+    def test_zero_variance_predictor_column_handled(self):
+        """A constant (zero-variance) predictor column yields no NaN coefficients."""
+        rng = np.random.default_rng(1)
+        n_samples = 200
+        signal = rng.binomial(2, 0.3, n_samples).astype(float)
+        constant = np.full(n_samples, 2.0)
+        predictors = np.column_stack([signal, constant])
+        target = 0.8 * signal - 0.5 + rng.normal(0, 0.1, n_samples)
+
+        result = fit_single_region_model(target, predictors, random_state=42)
+
+        assert np.isfinite(result.coefficients).all()
+        assert np.isfinite(result.intercept)
+        assert not np.any(np.isnan(result.cv_predictions))
+        assert abs(result.coefficients[1]) < 1e-6
+
+    def test_backtransform_predictions_match_standardized(self):
+        """The stored raw model predicts identically to the standardized final model."""
+        rng = np.random.default_rng(2)
+        n_samples = 300
+        predictors = rng.binomial(2, 0.3, (n_samples, 5)).astype(float)
+        target = (
+            predictors @ np.array([0.5, -0.3, 0.2, 0.0, 0.1])
+            - 1.0
+            + rng.normal(0, 0.2, n_samples)
+        )
+
+        result = fit_single_region_model(
+            target, predictors, alpha=0.01, l1_ratio=0.5, random_state=42
+        )
+
+        X_std, mean, scale = standardize_columns(predictors)
+        m = ElasticNet(
+            alpha=0.01, l1_ratio=0.5, fit_intercept=True, max_iter=10000, random_state=42
+        )
+        m.fit(X_std, target)
+
+        raw_pred = predictors @ result.coefficients + result.intercept
+        std_pred = m.predict((predictors - mean) / scale)
+        np.testing.assert_allclose(raw_pred, std_pred, rtol=1e-9, atol=1e-9)
+
+    def test_cv_predictions_invariant_under_positive_rescaling(self):
+        """CV predictions are invariant when a predictor column is positively rescaled.
+
+        Fails on the pre-fix raw-dosage fit; passes once predictors are standardized.
+        """
+        rng = np.random.default_rng(3)
+        n_samples = 300
+        predictors = rng.binomial(2, 0.3, (n_samples, 5)).astype(float)
+        target = (
+            predictors @ np.array([0.5, -0.3, 0.2, 0.0, 0.1])
+            - 1.0
+            + rng.normal(0, 0.2, n_samples)
+        )
+
+        result_a = fit_single_region_model(target, predictors, random_state=7)
+
+        rescaled = predictors.copy()
+        rescaled[:, 0] *= 4.0  # power of two -> clean float cancellation
+        result_b = fit_single_region_model(target, rescaled, random_state=7)
+
+        np.testing.assert_allclose(
+            result_a.cv_predictions,
+            result_b.cv_predictions,
+            rtol=1e-7,
+            atol=1e-9,
+            equal_nan=True,
+        )
+        assert result_a.cv_r2 == pytest.approx(result_b.cv_r2, rel=1e-6)
+        assert result_b.coefficients[0] == pytest.approx(
+            result_a.coefficients[0] / 4.0, rel=1e-6
+        )
+
+    def test_standardization_preserves_negative_targets(self):
+        """X is standardized but y is not, so negative PRS contributions flow through
+        unclipped and the back-transform identity still holds for a sign-mixed target."""
+        rng = np.random.default_rng(5)
+        n_samples = 200
+        predictors = rng.binomial(2, 0.3, (n_samples, 5)).astype(float)
+        target = predictors @ np.array([0.5, -0.8, 0.3, -0.2, 0.1]) - 1.0
+        assert np.any(target < 0), "Test setup: target should have negative values"
+
+        result = fit_single_region_model(
+            target, predictors, alpha=0.001, random_state=42
+        )
+
+        valid_preds = result.cv_predictions[~np.isnan(result.cv_predictions)]
+        assert np.any(valid_preds < 0), "Predictions should not be clipped to [0, 2]"
+
+        # Back-transform identity holds on a negative/continuous target.
+        X_std, mean, scale = standardize_columns(predictors)
+        m = ElasticNet(
+            alpha=0.001, l1_ratio=0.5, fit_intercept=True, max_iter=10000, random_state=42
+        )
+        m.fit(X_std, target)
+        raw_pred = predictors @ result.coefficients + result.intercept
+        np.testing.assert_allclose(
+            raw_pred, m.predict((predictors - mean) / scale), rtol=1e-9, atol=1e-9
+        )
+
+    def test_is_intercept_only_consistent_after_backtransform(self):
+        """High regularization zeros every coefficient; the flag and the stored raw
+        coefficients agree (0 / scale stays 0)."""
+        rng = np.random.default_rng(4)
+        predictors = rng.binomial(2, 0.3, (200, 5)).astype(float)
+        target = rng.normal(0, 0.01, 200)
+
+        result = fit_single_region_model(
+            target, predictors, alpha=100.0, random_state=42
+        )
+
+        assert result.is_intercept_only
+        assert np.allclose(result.coefficients, 0, atol=1e-12)
