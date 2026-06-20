@@ -36,6 +36,7 @@ from imputed_prs.io.user_genotypes import (
     load_raw_user_genotypes,
     load_user_genotypes,
 )
+from imputed_prs.io.exporters.projection_json_export import export_projection_to_json
 from imputed_prs.models.projection_predictor import ProjectionPredictor
 from imputed_prs.models.projection_trainer import ProjectionRegionTrainer
 
@@ -116,6 +117,14 @@ class LinearProjectionPRS:
         self._genome_build: Optional[str] = None
         self._model_name: Optional[str] = None
 
+        # Provenance for the deployable v2 export (consumed by the build/platform
+        # compatibility check). Reference panel / ancestry are set at fit(); the
+        # ambiguity policy default follows the deploy decision (training-side
+        # exclude_ambiguous stays False, so the model still carries palindromes).
+        self._reference_panel_id: Optional[str] = None
+        self._training_ancestry: Optional[str] = None
+        self._ambiguous_policy: str = "exclude_unless_platform_strand_known"
+
     def fit(
         self,
         reference_genotypes: Union[str, Path],
@@ -126,6 +135,8 @@ class LinearProjectionPRS:
         genome_build: Optional[str] = None,
         prs_id: Optional[str] = None,
         model_name: Optional[str] = None,
+        reference_panel_id: Optional[str] = None,
+        training_ancestry: Optional[str] = None,
     ) -> "LinearProjectionPRS":
         """Train projection models on reference genotype data.
 
@@ -139,6 +150,10 @@ class LinearProjectionPRS:
             genome_build: Reference genome build (e.g., "GRCh37").
             prs_id: PRS identifier for metadata.
             model_name: Model name for metadata.
+            reference_panel_id: Provenance — reference panel used for training
+                (e.g., "1000G_phase3_EUR"). Recorded in the deployable export.
+            training_ancestry: Provenance — ancestry of the training cohort
+                (e.g., "EUR"). Recorded in the deployable export.
 
         Returns:
             self (for method chaining).
@@ -571,6 +586,8 @@ class LinearProjectionPRS:
         self._platform_name = effective_platform_name
         self._genome_build = effective_genome_build
         self._model_name = model_name
+        self._reference_panel_id = reference_panel_id
+        self._training_ancestry = training_ancestry
 
         if self.verbose >= 1:
             print(
@@ -866,6 +883,83 @@ class LinearProjectionPRS:
             })
 
         return pd.DataFrame(rows)
+
+    def export(
+        self,
+        output_dir: Union[str, Path],
+        model_name: Optional[str] = None,
+        formats: Optional[List[str]] = None,
+        include_variance_scaling: bool = True,
+    ) -> Dict[str, Path]:
+        """Export trained projection model to portable formats.
+
+        Args:
+            output_dir: Directory for output files.
+            model_name: Base name for output files. Uses self._model_name if None.
+            formats: List of formats to export. Only "json" is supported (the
+                browser-deployable artifact). Default: ["json"].
+            include_variance_scaling: Accepted for parity with the imputation
+                exporter; projection has no per-region residual-variance field.
+
+        Returns:
+            Dict mapping format name to output file path.
+
+        Raises:
+            ModelNotFittedError: If fit() has not been called.
+            ValueError: If an unsupported format is requested.
+        """
+        if not self._is_fitted:
+            raise ModelNotFittedError(
+                "Model has not been fitted. Call fit() before export()."
+            )
+
+        if formats is None:
+            formats = ["json"]
+
+        effective_model_name = (
+            model_name or self._model_name or "projection_prs_model"
+        )
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        training_summary = None
+        if self._training_result is not None:
+            training_summary = self._training_result.training_summary
+
+        common_kwargs = {
+            "observed_variants": self._observed_variants or [],
+            "region_models": self._region_models or [],
+            "calibration_params": self._calibration_params,
+            "platform_name": self._platform_name,
+            "prs_id": self._prs_id,
+            "genome_build": self._genome_build,
+            "model_name": effective_model_name,
+            "include_variance_scaling": include_variance_scaling,
+            "training_summary": training_summary,
+            "reference_panel_id": self._reference_panel_id,
+            "training_ancestry": self._training_ancestry,
+            "ambiguous_policy": self._ambiguous_policy,
+        }
+
+        # JSON is the only projection format today (HDF5/Arrow/CSV are imputation-
+        # only; a projection loader arrives in P2.2).
+        valid_formats = {"json"}
+        invalid_formats = set(formats) - valid_formats
+        if invalid_formats:
+            raise ValueError(
+                f"Unsupported export formats: {invalid_formats}. "
+                f"Valid formats: {valid_formats}"
+            )
+
+        output_paths: Dict[str, Path] = {}
+        for fmt in formats:
+            if fmt == "json":
+                output_path = output_dir / f"{effective_model_name}.json"
+                export_projection_to_json(output_path=output_path, **common_kwargs)
+                output_paths["json"] = output_path
+
+        return output_paths
 
     def __repr__(self) -> str:
         """String representation of the model."""
