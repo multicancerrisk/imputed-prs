@@ -423,3 +423,86 @@ class TestCalibrationMeanImputation:
         assert not np.isclose(
             calib_fix.scaling_factor, calib_buggy.scaling_factor, atol=1e-3
         )
+
+
+class TestEmpiricalResidualSds:
+    """Empirical score-level residual SDs added in P4.1."""
+
+    def test_residual_sds_match_manual(self):
+        """Both residual SDs equal the std (ddof=1) of their residual arrays."""
+        rng = np.random.default_rng(7)
+        n = 600
+        s_true = rng.normal(0, 1, n)
+        s_cv = 0.8 * s_true + rng.normal(0, 0.25, n)
+
+        params = estimate_cv_calibration(s_cv, s_true)
+
+        expected_raw = np.std(s_true - s_cv, ddof=1)
+        fitted = params.calibration_intercept + params.scaling_factor * s_cv
+        expected_calibrated = np.std(s_true - fitted, ddof=1)
+
+        np.testing.assert_allclose(
+            params.raw_empirical_residual_sd, expected_raw, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            params.calibrated_empirical_residual_sd,
+            expected_calibrated,
+            rtol=0,
+            atol=1e-12,
+        )
+
+    def test_calibrated_equals_sd_true_sqrt_1_minus_r2(self):
+        """Calibrated residual SD == sd_true * sqrt(1 - r^2) (free cross-check)."""
+        rng = np.random.default_rng(11)
+        n = 800
+        s_true = rng.normal(0, 1.5, n)
+        s_cv = 0.7 * s_true + rng.normal(0, 0.3, n)
+
+        params = estimate_cv_calibration(s_cv, s_true)
+
+        expected = params.sd_true * np.sqrt(1.0 - params.calibration_r2)
+        np.testing.assert_allclose(
+            params.calibrated_empirical_residual_sd, expected, rtol=1e-9, atol=1e-12
+        )
+
+    def test_calibrated_never_exceeds_raw(self):
+        """Calibration minimizes residual SSE, so calibrated SD <= raw SD."""
+        rng = np.random.default_rng(13)
+        n = 500
+        s_true = rng.normal(0, 1, n)
+        # Attenuated and shifted: a=0,b=1 is a valid-but-suboptimal fit, so the
+        # OLS calibrated residual must be no larger than the raw residual.
+        s_cv = 0.5 * s_true + 2.0 + rng.normal(0, 0.4, n)
+
+        params = estimate_cv_calibration(s_cv, s_true)
+
+        assert (
+            params.calibrated_empirical_residual_sd
+            <= params.raw_empirical_residual_sd + 1e-12
+        )
+
+    def test_perfect_prediction_zero_residual(self):
+        """Perfect prediction => both residual SDs are zero."""
+        rng = np.random.default_rng(17)
+        s_true = rng.normal(0, 1, 200)
+        s_cv = s_true.copy()
+
+        params = estimate_cv_calibration(s_cv, s_true)
+
+        np.testing.assert_allclose(params.raw_empirical_residual_sd, 0.0, atol=1e-10)
+        np.testing.assert_allclose(
+            params.calibrated_empirical_residual_sd, 0.0, atol=1e-10
+        )
+
+    def test_diagonal_lower_bound_left_none(self):
+        """estimate_cv_calibration leaves diagonal_model_se_lower_bound None — it
+        needs per-variant model variances, so the orchestrator injects it."""
+        rng = np.random.default_rng(19)
+        s_true = rng.normal(0, 1, 100)
+        s_cv = 0.9 * s_true + rng.normal(0, 0.2, 100)
+
+        params = estimate_cv_calibration(s_cv, s_true)
+
+        assert params.diagonal_model_se_lower_bound is None
+        assert params.raw_empirical_residual_sd is not None
+        assert params.calibrated_empirical_residual_sd is not None

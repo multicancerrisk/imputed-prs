@@ -109,7 +109,10 @@
         "sd_true": { "type": "number" },
         "sd_scaled": { "type": "number" },
         "attenuation_factor": { "type": "number" },
-        "n_calibration": { "type": "integer" }
+        "n_calibration": { "type": "integer" },
+        "raw_empirical_residual_sd": { "type": ["number", "null"] },
+        "calibrated_empirical_residual_sd": { "type": ["number", "null"] },
+        "diagonal_model_se_lower_bound": { "type": ["number", "null"] }
       }
     },
     "evaluationMetrics": {

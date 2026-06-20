@@ -1080,3 +1080,66 @@ class TestRealDataValidation:
 
         # Standard error should be small relative to estimate
         assert calib.scaling_factor_se < 0.5 * abs(calib.scaling_factor)
+
+
+class TestEmpiricalResidualCoverageUnderLD:
+    """P4.1 gate: the empirical score-level residual SD restores ~nominal coverage
+    where the LD-blind diagonal SE under-covers.
+
+    The error of an imputed PRS is ``error = (X_imputed - X_true) @ betas``. The
+    diagonal SE models the per-variant imputation residuals as independent, so it
+    reports ``sqrt(Σ beta_j^2 * sigma_j^2)`` and structurally omits the off-diagonal
+    LD covariance. We inject positive equicorrelation across same-signed-beta
+    residuals so the true score-error variance ``beta^T Sigma beta`` greatly exceeds
+    the diagonal, then show the empirical residual SD — measured on a train split,
+    evaluated out-of-sample — recovers nominal coverage. (Working in score space
+    keeps the error exactly Gaussian, so the contrast is robust; the genotype-level
+    diagonal coverage is already covered by ``TestConfidenceIntervalCoverage``.)
+    """
+
+    @staticmethod
+    def _draw_score_errors(rng, n, p, betas, rho, sigma):
+        # Equicorrelated per-variant residuals: a shared common factor (g) plus an
+        # idiosyncratic part (e) => Cov = sigma^2[(1-rho) I + rho 11^T]. The
+        # score-level error is the beta-weighted sum, a sum of Gaussians => Gaussian.
+        g = rng.standard_normal(n)
+        e = rng.standard_normal((n, p))
+        residuals = sigma * (np.sqrt(rho) * g[:, None] + np.sqrt(1.0 - rho) * e)
+        return residuals @ betas
+
+    def test_empirical_beats_diagonal_under_ld(self):
+        rng = np.random.default_rng(20260620)
+        n_train, n_eval, p = 4000, 4000, 30
+        rho, sigma = 0.6, 0.30
+        betas = np.abs(rng.normal(0.0, 0.10, p)) + 0.02  # same-signed
+
+        err_train = self._draw_score_errors(rng, n_train, p, betas, rho, sigma)
+        emp_sd = np.std(err_train, ddof=1)  # raw_empirical_residual_sd
+        diag_se = np.sqrt(np.sum(betas**2 * sigma**2))  # LD-blind diagonal SE
+
+        err_eval = self._draw_score_errors(rng, n_eval, p, betas, rho, sigma)
+        cov_diag = np.mean(np.abs(err_eval) <= 1.96 * diag_se)
+        cov_emp = np.mean(np.abs(err_eval) <= 1.96 * emp_sd)
+
+        # The diagonal SE is far too small under LD => severe under-coverage.
+        assert cov_diag < 0.90, f"diagonal should under-cover, got {cov_diag:.3f}"
+        assert emp_sd > 1.3 * diag_se, (emp_sd, diag_se)
+        # The empirical residual SD restores ~nominal coverage, out-of-sample.
+        assert 0.93 <= cov_emp <= 0.975, f"empirical coverage {cov_emp:.3f}"
+        assert cov_emp > cov_diag + 0.05
+
+    def test_estimate_cv_calibration_reports_raw_residual_sd(self):
+        """Wiring lock-in: raw_empirical_residual_sd == std(s_true - s_cv, ddof=1)."""
+        rng = np.random.default_rng(20260620)
+        n, p = 4000, 30
+        rho, sigma = 0.6, 0.30
+        betas = np.abs(rng.normal(0.0, 0.10, p)) + 0.02
+
+        err = self._draw_score_errors(rng, n, p, betas, rho, sigma)
+        s_true = rng.standard_normal(n)
+        s_cv = s_true - err
+
+        params = estimate_cv_calibration(s_cv, s_true)
+        assert params.raw_empirical_residual_sd == pytest.approx(
+            np.std(s_true - s_cv, ddof=1), rel=1e-12
+        )

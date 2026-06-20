@@ -304,8 +304,26 @@ class ProjectionPredictor:
         # Step 3: Combine components
         prs_raw = prs_observed + prs_projected
 
-        # Step 4: Compute standard error and confidence intervals
-        se = np.sqrt(total_variance) if total_variance > 0 else 0.0
+        # Step 4: Compute the standard error and confidence interval (P4.1).
+        # se_diagonal sums each region's CV MSE (with P3.3 interpolation toward
+        # target_variance already folded into total_variance) — the optimistic,
+        # LD-blind diagonal SE, retained as a per-user lower bound. When the model
+        # carries an empirical residual SD (the LD-aware, panel-wide approximation
+        # error), the reported SE is the max of the two: the empirical SD is the
+        # baseline for a typical full-data user, and the per-user diagonal becomes
+        # the binding floor only when this upload is missing enough predictors that
+        # its diagonal exceeds the baseline. Falls back to the diagonal SE for
+        # uncalibrated / pre-P4.1 models.
+        se_diagonal = np.sqrt(total_variance) if total_variance > 0 else 0.0
+        params = self.calibration_params
+        use_empirical = (
+            params is not None and params.raw_empirical_residual_sd is not None
+        )
+        se = (
+            max(params.raw_empirical_residual_sd, se_diagonal)
+            if use_empirical
+            else se_diagonal
+        )
         ci_lower = prs_raw - 1.96 * se
         ci_upper = prs_raw + 1.96 * se
 
@@ -321,10 +339,19 @@ class ProjectionPredictor:
         ci_lower_scaled = None
         ci_upper_scaled = None
 
-        if apply_calibration and self.calibration_params is not None:
-            params = self.calibration_params
+        if apply_calibration and params is not None:
             prs_scaled = params.scaling_factor * prs_raw + params.calibration_intercept
-            se_scaled = abs(params.scaling_factor) * se
+            # Calibrated interval: the empirical post-calibration residual SD,
+            # floored by the slope-scaled diagonal SE (same max() rationale). On
+            # the legacy path (no empirical SD) this is abs(slope) * se_diagonal,
+            # identical to the pre-P4.1 behavior since se == se_diagonal there.
+            if use_empirical and params.calibrated_empirical_residual_sd is not None:
+                se_scaled = max(
+                    params.calibrated_empirical_residual_sd,
+                    abs(params.scaling_factor) * se_diagonal,
+                )
+            else:
+                se_scaled = abs(params.scaling_factor) * se
             ci_lower_scaled = prs_scaled - 1.96 * se_scaled
             ci_upper_scaled = prs_scaled + 1.96 * se_scaled
 
@@ -348,4 +375,5 @@ class ProjectionPredictor:
             n_observed_scored_via_fallback=n_observed_scored_via_fallback,
             weighted_beta_via_fallback=weighted_beta_via_fallback,
             unresolved_observed_ids=unresolved_observed_ids,
+            se_diagonal_lower_bound=se_diagonal,
         )

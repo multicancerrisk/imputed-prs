@@ -261,12 +261,23 @@ class TestImputationRoundTrip:
         # The fallback recovery survives the round trip to float tolerance, so the
         # serialized fallback block (JSON nest / flat observed_fallbacks) is exact.
         np.testing.assert_allclose(
-            [r1.prs, r1.prs_observed_component, r1.se],
-            [r0.prs, r0.prs_observed_component, r0.se],
+            [r1.prs, r1.prs_observed_component],
+            [r0.prs, r0.prs_observed_component],
             rtol=0,
             atol=1e-12,
             err_msg=f"format={fmt}",
         )
+        # SE round trip (P4.1): calibration-carrying formats reproduce the
+        # empirical-floored SE exactly. CSV carries no calibration, so its SE
+        # falls back to the per-user diagonal — which must still equal the
+        # in-memory diagonal lower bound, proving the fallback variance (the only
+        # SE input CSV preserves) round-tripped.
+        if fmt == "csv":
+            np.testing.assert_allclose(
+                r1.se, r0.se_diagonal_lower_bound, rtol=0, atol=1e-12
+            )
+        else:
+            np.testing.assert_allclose(r1.se, r0.se, rtol=0, atol=1e-12, err_msg=fmt)
 
 
 class TestProjectionRoundTrip:
@@ -495,3 +506,63 @@ class TestDosageModeDispatch:
             rtol=0,
             atol=1e-12,
         )
+
+
+class TestEmpiricalResidualCalibration:
+    """P4.1 end-to-end: a fitted model carries the empirical residual SDs and
+    ``predict`` reports the empirical-floored SE (rule B), for both products."""
+
+    def _upload(self):
+        return pd.DataFrame(
+            {
+                "rsid": ["rs1", "rs2", "rs3"],
+                "chromosome": ["1", "1", "1"],
+                "position": [100000, 100500, 101000],
+                "genotype": ["AG", "CT", "AA"],
+            }
+        )
+
+    def _check(self, model):
+        cp = model.calibration_params
+        assert cp is not None
+        # All three P4.1 fields populated and finite on a real fit.
+        for field in (
+            "raw_empirical_residual_sd",
+            "calibrated_empirical_residual_sd",
+            "diagonal_model_se_lower_bound",
+        ):
+            val = getattr(cp, field)
+            assert val is not None and np.isfinite(val) and val >= 0.0, field
+
+        r = model.predict(
+            self._upload(), apply_calibration=True, genome_build="GRCh37"
+        )
+        assert r.se_diagonal_lower_bound is not None
+        # Rule (B) identity: reported SE == max(empirical baseline, per-user diagonal).
+        np.testing.assert_allclose(
+            r.se,
+            max(cp.raw_empirical_residual_sd, r.se_diagonal_lower_bound),
+            rtol=0,
+            atol=1e-12,
+        )
+        assert r.se >= cp.raw_empirical_residual_sd - 1e-12
+        assert r.se >= r.se_diagonal_lower_bound - 1e-12
+        # Calibrated SE == max(calibrated empirical, |slope| * per-user diagonal).
+        np.testing.assert_allclose(
+            r.se_scaled,
+            max(
+                cp.calibrated_empirical_residual_sd,
+                abs(cp.scaling_factor) * r.se_diagonal_lower_bound,
+            ),
+            rtol=0,
+            atol=1e-12,
+        )
+        # CI uses the reported SE.
+        np.testing.assert_allclose(r.ci_lower, r.prs - 1.96 * r.se, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(r.ci_upper, r.prs + 1.96 * r.se, rtol=0, atol=1e-12)
+
+    def test_imputation_reports_empirical_se(self, fitted_imputation_model):
+        self._check(fitted_imputation_model)
+
+    def test_projection_reports_empirical_se(self, fitted_projection_model):
+        self._check(fitted_projection_model)

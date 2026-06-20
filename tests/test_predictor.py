@@ -1644,3 +1644,112 @@ class TestMissingnessAwareVariance:
             rtol=0,
             atol=1e-12,
         )
+
+
+class TestEmpiricalResidualSE:
+    """P4.1: reported SE = max(empirical residual SD, per-user diagonal SE).
+
+    The empirical SD is the LD-aware, panel-wide baseline; the per-user diagonal is
+    a lower bound that becomes the binding floor only under heavy user missingness.
+    These cases drive the max() both directions deterministically.
+    """
+
+    def _observed(self):
+        return [
+            VariantInfo("rs1", "1", 100, "A", "G", 0.1),
+            VariantInfo("rs2", "1", 200, "C", "T", 0.2),
+        ]
+
+    def _imputed(self):
+        # Small per-user diagonal: beta=0.05, residual_variance=0.1, prediction
+        # 0.3*2 + 0.2*1 + 0.6 = 1.4 (within [0, 2], no truncation), so the diagonal
+        # SE is sqrt(0.05**2 * 0.1) ~= 0.0158.
+        return [
+            ImputedVariantModel(
+                variant_id="rs3",
+                chromosome="1",
+                position=300,
+                effect_allele="A",
+                other_allele="G",
+                beta=0.05,
+                allele_frequency=0.3,
+                imputation_r2=0.8,
+                residual_variance=0.1,
+                intercept=0.6,
+                predictor_variant_ids=["rs1", "rs2"],
+                coefficients=np.array([0.3, 0.2]),
+                is_intercept_only=False,
+            )
+        ]
+
+    def _calib(self, raw_sd, calibrated_sd, diag_lb=0.5):
+        # diag_lb is the stored full-data scalar; predict() must NOT read it (it
+        # recomputes the per-user diagonal), so its value here is intentionally
+        # large and irrelevant to the assertions below.
+        return CalibrationParams(
+            scaling_factor=1.1,
+            scaling_factor_se=0.05,
+            calibration_intercept=0.01,
+            calibration_r2=0.95,
+            sd_cv_predicted=0.5,
+            sd_true=0.55,
+            sd_scaled=0.55,
+            attenuation_factor=0.91,
+            n_calibration=500,
+            raw_empirical_residual_sd=raw_sd,
+            calibrated_empirical_residual_sd=calibrated_sd,
+            diagonal_model_se_lower_bound=diag_lb,
+        )
+
+    def test_empirical_dominates_full_data(self):
+        """A large empirical SD (LD baseline) overrides the tiny per-user diagonal."""
+        predictor = PRSPredictor(self._observed(), self._imputed(), self._calib(5.0, 4.0))
+        result = predictor.predict({"rs1": 2.0, "rs2": 1.0}, apply_calibration=True)
+
+        assert result.se_diagonal_lower_bound < 0.1  # tiny per-user diagonal
+        assert abs(result.se - 5.0) < 1e-10  # empirical baseline reported
+        assert result.se >= result.se_diagonal_lower_bound
+        assert abs(result.se_scaled - 4.0) < 1e-10  # calibrated empirical reported
+
+    def test_diagonal_floor_binds_under_missingness(self):
+        """A near-zero empirical SD is floored by the per-user diagonal SE."""
+        predictor = PRSPredictor(
+            self._observed(), self._imputed(), self._calib(1e-9, 1e-9)
+        )
+        result = predictor.predict({"rs1": 2.0, "rs2": 1.0}, apply_calibration=True)
+
+        assert result.se_diagonal_lower_bound > 1e-9
+        assert abs(result.se - result.se_diagonal_lower_bound) < 1e-12
+        # Scaled floor is the slope-scaled per-user diagonal.
+        assert abs(result.se_scaled - 1.1 * result.se_diagonal_lower_bound) < 1e-12
+
+    def test_ci_uses_reported_se(self):
+        """CI is always prs +/- 1.96 * the reported (empirical-or-floor) se."""
+        predictor = PRSPredictor(self._observed(), self._imputed(), self._calib(2.0, 1.5))
+        result = predictor.predict({"rs1": 2.0, "rs2": 1.0}, apply_calibration=True)
+
+        assert abs(result.ci_lower - (result.prs - 1.96 * result.se)) < 1e-10
+        assert abs(result.ci_upper - (result.prs + 1.96 * result.se)) < 1e-10
+        assert abs(
+            result.ci_lower_scaled - (result.prs_scaled - 1.96 * result.se_scaled)
+        ) < 1e-10
+
+    def test_legacy_calibration_without_empirical_uses_diagonal(self):
+        """Pre-P4.1 calibration (no empirical fields) falls back to the diagonal SE,
+        preserving the old se_scaled == |slope| * se relationship."""
+        legacy = CalibrationParams(
+            scaling_factor=1.1,
+            scaling_factor_se=0.05,
+            calibration_intercept=0.01,
+            calibration_r2=0.95,
+            sd_cv_predicted=0.5,
+            sd_true=0.55,
+            sd_scaled=0.55,
+            attenuation_factor=0.91,
+            n_calibration=500,
+        )
+        predictor = PRSPredictor(self._observed(), self._imputed(), legacy)
+        result = predictor.predict({"rs1": 2.0, "rs2": 1.0}, apply_calibration=True)
+
+        assert abs(result.se - result.se_diagonal_lower_bound) < 1e-12
+        assert abs(result.se_scaled - 1.1 * result.se) < 1e-10

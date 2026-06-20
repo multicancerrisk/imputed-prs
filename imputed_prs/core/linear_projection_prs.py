@@ -1,5 +1,6 @@
 """Main LinearProjectionPRS class for training and prediction."""
 
+import dataclasses
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Union
 
@@ -596,6 +597,19 @@ class LinearProjectionPRS:
 
                     # Estimate calibration parameters
                     calibration_params = estimate_cv_calibration(s_cv, s_true)
+
+                    # Inject the full-data (no-missingness) diagonal SE — the
+                    # optimistic lower bound the empirical residual SD replaces
+                    # (P4.1). Projection sums each region's out-of-fold CV MSE.
+                    diag_var = 0.0
+                    for region_id in training_result.cv_predictions:
+                        region = training_result.region_models.get(region_id)
+                        if region is not None:
+                            diag_var += region.cv_mse
+                    calibration_params = dataclasses.replace(
+                        calibration_params,
+                        diagonal_model_se_lower_bound=float(np.sqrt(diag_var)),
+                    )
 
                     if self.verbose >= 2:
                         print(

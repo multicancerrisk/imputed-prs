@@ -106,7 +106,10 @@ def estimate_cv_calibration(
         s_true: True PRS values (n_samples,). NaN values are excluded.
 
     Returns:
-        CalibrationParams with regression results and summary statistics.
+        CalibrationParams with regression results and summary statistics, including
+        the empirical score-level residual SDs (P4.1). ``diagonal_model_se_lower_bound``
+        is left ``None`` here — it depends on the per-variant model variances and is
+        injected by the orchestrator after the fit.
 
     Raises:
         ValueError: If fewer than 3 valid (non-NaN) samples remain after filtering.
@@ -135,6 +138,26 @@ def estimate_cv_calibration(
     # Attenuation factor: how much variance is attenuated
     attenuation = sd_cv / sd_true if sd_true > 0 else 0.0
 
+    # Empirical, score-level residual SDs (P4.1). s_cv is out-of-fold, so
+    # s_true - s_cv is the honest raw-scale approximation error — a scalar per
+    # sample, so it captures the full beta^T Sigma beta residual covariance
+    # (LD off-diagonals included) that the diagonal SE structurally omits. The
+    # calibrated residual is the calibration regression's own residual SD.
+    # ddof=1 throughout: the 2-parameter in-sample optimism of the calibrated
+    # term is negligible (~(n-2)/(n-1)) and matched against the raw term.
+    raw_resid = s_true_valid - s_cv_valid
+    calibrated_resid = s_true_valid - (intercept + slope * s_cv_valid)
+    raw_empirical_residual_sd = float(np.std(raw_resid, ddof=1))
+    calibrated_empirical_residual_sd = float(np.std(calibrated_resid, ddof=1))
+    # Degenerate-regression guards: a non-finite calibrated SD (e.g. nan slope
+    # leaking from a pathological fit) falls back to the raw SD; a non-finite raw
+    # SD becomes None so predict() reverts to the diagonal SE.
+    if not np.isfinite(calibrated_empirical_residual_sd):
+        calibrated_empirical_residual_sd = raw_empirical_residual_sd
+    if not np.isfinite(raw_empirical_residual_sd):
+        raw_empirical_residual_sd = None
+        calibrated_empirical_residual_sd = None
+
     return CalibrationParams(
         scaling_factor=slope,
         scaling_factor_se=std_err,
@@ -145,4 +168,6 @@ def estimate_cv_calibration(
         sd_scaled=sd_scaled,
         attenuation_factor=attenuation,
         n_calibration=n,
+        raw_empirical_residual_sd=raw_empirical_residual_sd,
+        calibrated_empirical_residual_sd=calibrated_empirical_residual_sd,
     )

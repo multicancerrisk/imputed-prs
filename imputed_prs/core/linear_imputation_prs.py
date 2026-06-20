@@ -1,5 +1,6 @@
 """Main LinearImputationPRS class for training and prediction."""
 
+import dataclasses
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Union
 
@@ -668,6 +669,21 @@ class LinearImputationPRS:
 
                     # Estimate calibration parameters
                     calibration_params = estimate_cv_calibration(s_cv, s_true)
+
+                    # Inject the full-data (no-missingness) diagonal SE — the
+                    # optimistic lower bound the empirical residual SD replaces
+                    # (P4.1). Only imputed terms carry variance; exact observed
+                    # terms contribute zero.
+                    diag_var = 0.0
+                    for var_id in training_result.cv_predictions:
+                        model = training_result.models.get(var_id)
+                        if model is not None and var_id in id_to_col:
+                            beta = float(all_betas[id_to_col[var_id]])
+                            diag_var += beta**2 * model.residual_variance
+                    calibration_params = dataclasses.replace(
+                        calibration_params,
+                        diagonal_model_se_lower_bound=float(np.sqrt(diag_var)),
+                    )
 
                     if self.verbose >= 2:
                         print(

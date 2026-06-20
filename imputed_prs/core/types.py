@@ -197,6 +197,15 @@ class PredictionResult:
         unresolved_observed_ids: variant_ids of observed variants that could be scored
             neither directly nor via fallback (never silently dropped — surfaced
             here). ``None`` on the legacy allele-blind path.
+        se_diagonal_lower_bound: The per-prediction diagonal SE,
+            ``sqrt(Σ beta² · effective_residual_variance)`` for *this* user (inflated by
+            P3.3 mean-substitution as predictors go missing). Since P4.1 the reported
+            ``se`` is ``max(empirical_residual_sd, se_diagonal_lower_bound)``: the
+            empirical SD is the LD-aware panel-wide baseline, and this diagonal value is
+            a genuine lower bound that becomes the binding floor under heavy user
+            missingness. Distinct from the fit-time, full-data
+            ``CalibrationParams.diagonal_model_se_lower_bound``. ``None`` until set by
+            ``predict`` (always populated on the predict path).
     """
 
     prs: float
@@ -218,6 +227,7 @@ class PredictionResult:
     n_observed_scored_via_fallback: Optional[int] = None
     weighted_beta_via_fallback: Optional[float] = None
     unresolved_observed_ids: Optional[Tuple[str, ...]] = None
+    se_diagonal_lower_bound: Optional[float] = None
 
 
 @dataclass
@@ -234,6 +244,23 @@ class CalibrationParams:
         sd_scaled: SD of scaled predictions.
         attenuation_factor: Ratio of sd_cv/sd_true.
         n_calibration: Sample size used for calibration.
+        raw_empirical_residual_sd: Empirical, score-level approximation error on the
+            *raw* scale, ``std(s_true - s_cv, ddof=1)`` over out-of-fold CV scores.
+            Because ``prs_raw`` is built exactly like ``s_cv`` (exact observed dosages
+            plus CV-predicted imputed/projected terms), this is the honest SD for the
+            raw interval — it captures the full ``betaᵀ Σ beta`` residual covariance
+            (including LD off-diagonals) that the diagonal SE omits. ``None`` on
+            artifacts predating P4.1 (forces the diagonal-SE fallback in ``predict``).
+        calibrated_empirical_residual_sd: Empirical residual SD after the calibration
+            transform, ``std(s_true - (intercept + slope * s_cv), ddof=1)`` — the SD
+            for the ``prs_scaled`` interval. ``None`` on pre-P4.1 artifacts.
+        diagonal_model_se_lower_bound: The *full-data* (no-missingness) diagonal SE
+            scalar measured at fit time — imputation ``sqrt(Σ beta² · residual_var)``,
+            projection ``sqrt(Σ cv_mse)``. A reference/QC lower bound on the model SE.
+            NOTE: this is distinct from ``PredictionResult.se_diagonal_lower_bound``,
+            which is the *per-prediction*, user-specific diagonal SE (inflated by P3.3
+            missingness). ``predict`` recomputes the per-user value and must NOT read
+            this stored scalar. ``None`` on pre-P4.1 artifacts.
     """
 
     scaling_factor: float
@@ -245,6 +272,9 @@ class CalibrationParams:
     sd_scaled: float
     attenuation_factor: float
     n_calibration: int
+    raw_empirical_residual_sd: Optional[float] = None
+    calibrated_empirical_residual_sd: Optional[float] = None
+    diagonal_model_se_lower_bound: Optional[float] = None
 
 
 @dataclass
