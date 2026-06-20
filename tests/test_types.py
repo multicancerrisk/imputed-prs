@@ -9,6 +9,7 @@ from imputed_prs.core.types import (
     ImputedVariantModel,
     PlatformInfo,
     PredictionResult,
+    ProjectionRegionModel,
     VariantInfo,
 )
 
@@ -403,3 +404,36 @@ class TestPlatformInfo:
         assert d["name"] == "test_platform"
         assert d["n_variants"] == 500000
         assert d["date_introduced"] == "2020-01"
+
+
+class TestProjectionRegionModel:
+    """Tests for the ProjectionRegionModel dataclass."""
+
+    def _model(self, **overrides):
+        kwargs = dict(
+            region_id="chr1:1-2",
+            chromosome="1",
+            start=1,
+            end=2,
+            prs_variant_ids=["rs2000"],
+            betas=np.array([0.3]),
+            predictor_variant_ids=["rs1000"],
+            coefficients=np.array([0.2]),
+            intercept=0.1,
+            cv_mse=0.01,
+            cv_r2=0.8,
+            is_intercept_only=False,
+            mean_prs_contribution=0.5,
+            predictor_allele_frequencies=np.array([0.3]),
+        )
+        kwargs.update(overrides)
+        return ProjectionRegionModel(**kwargs)
+
+    def test_target_variance_defaults_to_zero(self):
+        """target_variance (P3.3) is optional and defaults to 0.0 for back-compat."""
+        assert self._model().target_variance == 0.0
+
+    def test_target_variance_round_trips_through_to_dict(self):
+        """to_dict carries target_variance (a plain float handled by asdict)."""
+        d = self._model(target_variance=0.42).to_dict()
+        assert d["target_variance"] == 0.42

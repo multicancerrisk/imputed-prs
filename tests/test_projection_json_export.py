@@ -58,6 +58,7 @@ def _make_region_model(
     prs_positions=None,
     prs_effect_alleles=None,
     prs_other_alleles=None,
+    target_variance=0.5,
 ):
     """Build a ProjectionRegionModel with sensible, index-aligned defaults.
 
@@ -112,6 +113,7 @@ def _make_region_model(
         prs_positions=prs_positions,
         prs_effect_alleles=prs_effect_alleles,
         prs_other_alleles=prs_other_alleles,
+        target_variance=target_variance,
     )
 
 
@@ -263,6 +265,7 @@ class TestProjectionExportStructure:
             predictor_chromosomes=["1"],
             predictor_counted_alleles=["C"],
             predictor_other_alleles=["G"],
+            target_variance=0.37,
         )
         data = _export(_make_observed_variants(), [region])
         r = data["region_models"][0]
@@ -280,6 +283,8 @@ class TestProjectionExportStructure:
             pred["allele_frequency"], 0.33, rtol=0, atol=1e-12
         )
         np.testing.assert_allclose(pv["beta"], 0.42, rtol=0, atol=1e-12)
+        # target_variance (P3.3 intercept-only variance) is exported per region.
+        np.testing.assert_allclose(r["target_variance"], 0.37, rtol=0, atol=1e-12)
 
     def test_metadata_counts(self):
         regions = [

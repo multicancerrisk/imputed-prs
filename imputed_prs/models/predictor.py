@@ -24,6 +24,7 @@ from imputed_prs.io.user_genotypes import (
     resolve_counted_dosage,
 )
 from imputed_prs.models.bounding import clip_and_adjust_variance
+from imputed_prs.utils.helpers import hardy_weinberg_variance
 
 
 def compute_observed_prs(
@@ -58,6 +59,33 @@ def compute_observed_prs(
     return total, n_used
 
 
+def _effective_residual_variance(
+    model: ImputedVariantModel, n_substituted: int
+) -> float:
+    """Missingness-aware residual variance for one imputed/fallback model (P3.3).
+
+    Interpolates from the full-model ``residual_variance`` toward the
+    intercept-only Hardy-Weinberg variance ``2q(1-q)`` in proportion to how many
+    predictors were mean-substituted::
+
+        f         = n_substituted / n_predictors
+        effective = residual_variance * (1 - f) + 2q(1-q) * f
+
+    With no predictors (intercept-only model) or none substituted, returns
+    ``residual_variance`` unchanged — so a fully-observed prediction keeps its
+    full-model confidence. Because the trainer sets ``residual_variance =
+    2q(1-q)*(1 - r2)`` with ``r2 in [0, 1]``, the Hardy-Weinberg term is always
+    ``>=`` the full-model term, so the effective variance grows monotonically
+    with the substituted fraction.
+    """
+    n_pred = len(model.predictor_variant_ids)
+    if n_pred == 0 or n_substituted == 0:
+        return model.residual_variance
+    f = n_substituted / n_pred
+    intercept_only_variance = hardy_weinberg_variance(model.allele_frequency)
+    return model.residual_variance * (1.0 - f) + intercept_only_variance * f
+
+
 def _predict_model_dosage(
     model: ImputedVariantModel,
     raw_genotypes: RawUserGenotypeCollection,
@@ -80,6 +108,7 @@ def _predict_model_dosage(
     Returns:
         Tuple of (clipped_dosage, adjusted_variance, was_truncated).
     """
+    n_substituted = 0
     if model.is_intercept_only:
         raw_prediction = model.intercept
     else:
@@ -99,14 +128,17 @@ def _predict_model_dosage(
             )
             if dosage is None:
                 dosage = 2.0 * model.predictor_allele_frequencies[i]
+                n_substituted += 1
             predictor_dosages.append(dosage)
 
         predictor_array = np.array(predictor_dosages)
         raw_prediction = np.dot(predictor_array, model.coefficients) + model.intercept
 
-    # Target is a dosage in [0, 2]: clip and adjust the residual variance.
+    # Target is a dosage in [0, 2]: clip and adjust the missingness-aware residual
+    # variance (P3.3). Inflating the variance never moves the clipped point
+    # estimate — clip_and_adjust_variance hard-clips raw_prediction.
     clipped_dosage, adjusted_variance = clip_and_adjust_variance(
-        raw_prediction, model.residual_variance
+        raw_prediction, _effective_residual_variance(model, n_substituted)
     )
     return clipped_dosage, adjusted_variance, clipped_dosage != raw_prediction
 
@@ -313,7 +345,12 @@ def compute_imputed_prs(
     n_truncated = 0
 
     for model in imputed_models:
-        # Compute raw prediction
+        # Compute raw prediction. This legacy allele-blind path is all-or-nothing:
+        # any missing predictor collapses the model to its intercept (the mean
+        # prediction), so on collapse the reported uncertainty is the
+        # intercept-only Hardy-Weinberg variance 2q(1-q), not the full-model
+        # residual variance (P3.3, the f=1 endpoint of the inflation formula).
+        residual_variance = model.residual_variance
         if model.is_intercept_only:
             raw_prediction = model.intercept
         else:
@@ -330,6 +367,7 @@ def compute_imputed_prs(
             if not all_predictors_available:
                 # Fall back to intercept-only (mean imputation)
                 raw_prediction = model.intercept
+                residual_variance = hardy_weinberg_variance(model.allele_frequency)
             else:
                 # Compute: x̂ = z' @ w + γ
                 predictor_array = np.array(predictor_dosages)
@@ -337,7 +375,7 @@ def compute_imputed_prs(
 
         # Apply clipping and variance adjustment
         clipped_dosage, adjusted_variance = clip_and_adjust_variance(
-            raw_prediction, model.residual_variance
+            raw_prediction, residual_variance
         )
 
         # Track truncation
@@ -372,9 +410,12 @@ def compute_imputed_prs_oriented(
     allele. A predictor that is missing or unresolvable is mean-substituted with
     ``2 * AF`` per predictor, bringing imputation in line with the projection
     scorer (the legacy scorer instead collapsed the whole model to its intercept
-    if *any* single predictor was missing). Uncertainty is unchanged from
-    :func:`compute_imputed_prs` (full-model ``residual_variance``);
-    missingness-aware inflation is deferred to P3.3.
+    if *any* single predictor was missing). Uncertainty is missingness-aware
+    (P3.3): each model's residual variance is inflated from the full-model value
+    toward its intercept-only Hardy-Weinberg variance in proportion to the
+    fraction of predictors that were mean-substituted (see
+    :func:`_effective_residual_variance`). This changes only the variance, never
+    the point estimate.
 
     This is the canonical imputed-scoring path for real uploads; the legacy
     :func:`compute_imputed_prs` (dosage-dict, allele-blind) is retained only for

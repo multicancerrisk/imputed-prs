@@ -115,6 +115,7 @@ def _serialize_region_model(
         "cv_r2": float(region.cv_r2),
         "is_intercept_only": bool(region.is_intercept_only),
         "mean_prs_contribution": float(region.mean_prs_contribution),
+        "target_variance": float(region.target_variance),
         "predictors": predictors,
         "prs_variants": prs_variants,
     }

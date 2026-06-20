@@ -216,6 +216,7 @@ def _fit_one_region(
             cv_r2=result.cv_r2,
             is_intercept_only=result.is_intercept_only,
             mean_prs_contribution=float(np.nanmean(target)),
+            target_variance=float(np.nanvar(target)),
             predictor_allele_frequencies=predictor_afs,
             predictor_chromosomes=predictor_chromosomes,
             predictor_positions=predictor_positions,

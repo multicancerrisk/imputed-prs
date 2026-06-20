@@ -20,6 +20,32 @@ from imputed_prs.models.predictor import (
 )
 
 
+def _region_effective_variance(
+    model: ProjectionRegionModel, n_substituted: int
+) -> float:
+    """Missingness-aware region variance (P3.3).
+
+    Interpolates from the full-model ``cv_mse`` toward the intercept-only error
+    variance (``target_variance``) in proportion to how many of the region's
+    predictors were mean-substituted::
+
+        f         = n_substituted / n_predictors
+        effective = cv_mse * (1 - f) + target_variance * f
+
+    With no predictors (intercept-only region) or none substituted, returns
+    ``cv_mse`` unchanged — so a fully-observed score is scored exactly as before.
+    Note: this grows with missingness only when ``target_variance >= cv_mse``
+    (non-negative CV R²); a region whose model predicts worse out-of-fold than
+    its own mean (cv_mse > target_variance) correctly interpolates *downward*
+    toward the better intercept-only fallback.
+    """
+    n_pred = len(model.predictor_variant_ids)
+    if n_pred == 0 or n_substituted == 0:
+        return model.cv_mse
+    f = n_substituted / n_pred
+    return model.cv_mse * (1.0 - f) + model.target_variance * f
+
+
 def compute_projected_prs(
     user_dosages: Dict[str, Optional[float]],
     region_models: List[ProjectionRegionModel],
@@ -49,6 +75,7 @@ def compute_projected_prs(
     n_predictors_substituted = 0
 
     for model in region_models:
+        n_sub_region = 0
         if model.is_intercept_only:
             prediction = model.intercept
         else:
@@ -59,13 +86,14 @@ def compute_projected_prs(
                 if dosage is None:
                     dosage = 2.0 * model.predictor_allele_frequencies[i]
                     n_predictors_substituted += 1
+                    n_sub_region += 1
                 predictor_dosages.append(dosage)
 
             predictor_array = np.array(predictor_dosages)
             prediction = np.dot(predictor_array, model.coefficients) + model.intercept
 
         total_prs += prediction
-        total_variance += model.cv_mse
+        total_variance += _region_effective_variance(model, n_sub_region)
         n_regions_used += 1
 
     return (total_prs, total_variance, n_regions_used, n_predictors_substituted)
@@ -117,6 +145,7 @@ def compute_projected_prs_oriented(
     n_predictors_substituted = 0
 
     for model in region_models:
+        n_sub_region = 0
         if model.is_intercept_only:
             prediction = model.intercept
         else:
@@ -137,13 +166,14 @@ def compute_projected_prs_oriented(
                 if dosage is None:
                     dosage = 2.0 * model.predictor_allele_frequencies[i]
                     n_predictors_substituted += 1
+                    n_sub_region += 1
                 predictor_dosages.append(dosage)
 
             predictor_array = np.array(predictor_dosages)
             prediction = np.dot(predictor_array, model.coefficients) + model.intercept
 
         total_prs += prediction
-        total_variance += model.cv_mse
+        total_variance += _region_effective_variance(model, n_sub_region)
         n_regions_used += 1
 
     return (total_prs, total_variance, n_regions_used, n_predictors_substituted)

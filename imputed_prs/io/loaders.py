@@ -365,6 +365,7 @@ def parse_projection_region_model(r: Dict[str, Any]) -> ProjectionRegionModel:
         cv_r2=r["cv_r2"],
         is_intercept_only=r["is_intercept_only"],
         mean_prs_contribution=r["mean_prs_contribution"],
+        target_variance=r.get("target_variance", 0.0),
         predictor_allele_frequencies=np.array(
             [p["allele_frequency"] for p in predictors], dtype=np.float64
         ),

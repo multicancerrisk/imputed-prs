@@ -1131,6 +1131,7 @@ def _projection_regions():
         prs_positions=[300],
         prs_effect_alleles=["A"],
         prs_other_alleles=["G"],
+        target_variance=0.6,
     )
     intercept_only = ProjectionRegionModel(
         region_id="chr2:1-500000",
@@ -1154,6 +1155,7 @@ def _projection_regions():
         prs_positions=[400],
         prs_effect_alleles=["T"],
         prs_other_alleles=[None],  # PRS source lacked other_allele
+        target_variance=0.02,
     )
     return [full, intercept_only]
 
@@ -1218,11 +1220,43 @@ class TestProjectionJSONRoundTrip:
             atol=1e-12,
         )
         np.testing.assert_allclose(
-            [lf.intercept, lf.cv_mse, lf.cv_r2, lf.mean_prs_contribution],
-            [of.intercept, of.cv_mse, of.cv_r2, of.mean_prs_contribution],
+            [
+                lf.intercept,
+                lf.cv_mse,
+                lf.cv_r2,
+                lf.mean_prs_contribution,
+                lf.target_variance,
+            ],
+            [
+                of.intercept,
+                of.cv_mse,
+                of.cv_r2,
+                of.mean_prs_contribution,
+                of.target_variance,
+            ],
             rtol=0,
             atol=1e-12,
         )
+
+    def test_target_variance_defaults_to_zero_when_absent(self):
+        """A pre-P3.3 artifact lacking ``target_variance`` loads with 0.0."""
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.1)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "proj.json"
+            export_projection_to_json(
+                require_provenance=False,
+                output_path=json_path,
+                observed_variants=observed,
+                region_models=_projection_regions(),
+            )
+            with open(json_path) as f:
+                data = json.load(f)
+            for region in data["region_models"]:
+                region.pop("target_variance", None)
+            with open(json_path, "w") as f:
+                json.dump(data, f)
+            loaded = LinearProjectionPRS.load(json_path)
+        assert all(r.target_variance == 0.0 for r in loaded._region_models)
 
     def test_intercept_only_region_round_trip(self):
         """Empty predictor arrays and a null PRS other_allele survive the trip."""

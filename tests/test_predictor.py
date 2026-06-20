@@ -9,14 +9,20 @@ from imputed_prs.core.types import (
     VariantInfo,
 )
 from imputed_prs.io.user_genotypes import load_raw_user_genotypes
+from imputed_prs.models.bounding import clip_and_adjust_variance
 from imputed_prs.models.predictor import (
     ObservedScore,
     PRSPredictor,
+    _effective_residual_variance,
     _predict_model_dosage,
     compute_imputed_prs,
     compute_imputed_prs_oriented,
     compute_observed_prs,
     compute_observed_prs_oriented,
+)
+from imputed_prs.utils.helpers import (
+    compute_residual_variance,
+    hardy_weinberg_variance,
 )
 
 
@@ -1468,3 +1474,173 @@ class TestPRSPredictorFallback:
         r = predictor.predict({"rs1": 2.0}, apply_calibration=False)
         assert r.n_observed_scored_via_fallback is None
         assert r.weighted_beta_via_fallback is None
+
+
+class TestMissingnessAwareVariance:
+    """P3.3: a model's residual variance is inflated from the full-model value
+    toward the intercept-only Hardy-Weinberg variance 2q(1-q) in proportion to the
+    fraction of predictors that were mean-substituted. This affects only the
+    reported variance, never the point estimate.
+    """
+
+    def test_effective_residual_variance_formula(self):
+        """The helper interpolates residual_variance -> 2q(1-q) by f = n_sub/n_pred."""
+        af = 0.3
+        residual = compute_residual_variance(af, 0.5)  # 0.42 * 0.5 = 0.21
+        hw = hardy_weinberg_variance(af)  # 0.42
+        model = _imputed_model(
+            allele_frequency=af,
+            residual_variance=residual,
+            predictor_variant_ids=["rs_p0", "rs_p1"],
+        )
+        for n_sub in (0, 1, 2):
+            f = n_sub / 2
+            np.testing.assert_allclose(
+                _effective_residual_variance(model, n_sub),
+                residual * (1 - f) + hw * f,
+                rtol=0,
+                atol=1e-12,
+            )
+
+    def test_effective_residual_variance_endpoints(self):
+        """f=0 -> residual_variance (unchanged); f=1 -> Hardy-Weinberg variance."""
+        af = 0.3
+        residual = compute_residual_variance(af, 0.5)
+        model = _imputed_model(
+            allele_frequency=af,
+            residual_variance=residual,
+            predictor_variant_ids=["rs_p0", "rs_p1"],
+        )
+        np.testing.assert_allclose(
+            _effective_residual_variance(model, 0), residual, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            _effective_residual_variance(model, 2),
+            hardy_weinberg_variance(af),
+            rtol=0,
+            atol=1e-12,
+        )
+
+    def test_effective_residual_variance_monotonic(self):
+        """Effective variance is non-decreasing in the substituted fraction.
+
+        Guaranteed because the trainer sets residual = 2q(1-q)*(1-r2) with
+        r2 in [0,1], so 2q(1-q) >= residual_variance always.
+        """
+        af = 0.3
+        residual = compute_residual_variance(af, 0.8)
+        model = _imputed_model(
+            allele_frequency=af,
+            residual_variance=residual,
+            predictor_variant_ids=["rs_p0", "rs_p1", "rs_p2", "rs_p3"],
+            coefficients=np.full(4, 0.2),
+            predictor_allele_frequencies=np.full(4, 0.4),
+        )
+        variances = [_effective_residual_variance(model, k) for k in range(5)]
+        assert all(
+            variances[i] <= variances[i + 1] + 1e-12
+            for i in range(len(variances) - 1)
+        )
+
+    def test_intercept_only_model_variance_unchanged(self):
+        """An intercept-only model (no predictors) keeps its full residual variance."""
+        model = _imputed_model(
+            residual_variance=0.07,
+            is_intercept_only=True,
+            predictor_variant_ids=[],
+            coefficients=np.array([]),
+            predictor_allele_frequencies=np.array([]),
+        )
+        np.testing.assert_allclose(
+            _effective_residual_variance(model, 0), 0.07, rtol=0, atol=1e-12
+        )
+
+    def test_oriented_scorer_passes_effective_variance(self):
+        """compute_imputed_prs_oriented feeds the inflated variance into clipping;
+        the point estimate is unchanged by the inflation."""
+        af = 0.3
+        residual = compute_residual_variance(af, 0.5)  # 0.21
+        beta = 0.1
+        model = _imputed_model(
+            beta=beta,
+            intercept=0.2,
+            allele_frequency=af,
+            residual_variance=residual,
+            predictor_variant_ids=["rs_p0", "rs_p1"],
+            coefficients=np.array([0.5, -0.3]),
+            predictor_chromosomes=["1", "1"],
+            predictor_positions=[1000, 1100],
+            predictor_counted_alleles=["A", "A"],
+            predictor_other_alleles=["G", "G"],
+            predictor_allele_frequencies=np.array([0.4, 0.4]),
+        )
+        # rs_p0 present ("AA" -> 2); rs_p1 omitted -> 2*0.4 = 0.8. One of two missing.
+        coll = _collection([("rs_p0", "1", 1000, "AA")])
+        prs, total_var, n_imputed, _ = compute_imputed_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        raw = 2 * 0.5 + 0.8 * (-0.3) + 0.2  # 0.96 (interior of [0, 2])
+        effective = residual * 0.5 + hardy_weinberg_variance(af) * 0.5  # 0.315
+        np.testing.assert_allclose(prs, raw * beta, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(
+            total_var,
+            beta**2 * clip_and_adjust_variance(raw, effective)[1],
+            rtol=0,
+            atol=1e-12,
+        )
+        # The inflation genuinely changed the variance vs the un-inflated residual.
+        uninflated = beta**2 * clip_and_adjust_variance(raw, residual)[1]
+        assert total_var > uninflated
+        assert n_imputed == 1
+
+    def test_legacy_collapse_uses_hw_variance(self):
+        """Legacy all-or-nothing collapse to intercept now reports the intercept-only
+        Hardy-Weinberg variance, not the full-model residual variance (P3.3 f=1)."""
+        af = 0.3
+        residual = compute_residual_variance(af, 0.5)  # 0.21 < HW = 0.42
+        beta = 0.1
+        intercept = 0.2
+        model = _imputed_model(
+            beta=beta,
+            intercept=intercept,
+            allele_frequency=af,
+            residual_variance=residual,
+            predictor_variant_ids=["rs_p0", "rs_p1"],
+            coefficients=np.array([0.5, -0.3]),
+        )
+        # rs_p1 missing -> collapse to intercept (allele-blind dosage-dict path).
+        prs, variance, _, _ = compute_imputed_prs({"rs_p0": 2.0}, [model])
+        np.testing.assert_allclose(prs, intercept * beta, rtol=0, atol=1e-12)
+        hw = hardy_weinberg_variance(af)
+        np.testing.assert_allclose(
+            variance,
+            beta**2 * clip_and_adjust_variance(intercept, hw)[1],
+            rtol=0,
+            atol=1e-12,
+        )
+        # Strictly larger than the old (buggy) full-residual-variance report.
+        old = beta**2 * clip_and_adjust_variance(intercept, residual)[1]
+        assert variance > old
+
+    def test_legacy_all_present_variance_unchanged(self):
+        """Legacy path with every predictor present keeps the full residual variance."""
+        af = 0.3
+        residual = compute_residual_variance(af, 0.5)
+        beta = 0.1
+        model = _imputed_model(
+            beta=beta,
+            intercept=0.2,
+            allele_frequency=af,
+            residual_variance=residual,
+            predictor_variant_ids=["rs_p0", "rs_p1"],
+            coefficients=np.array([0.5, -0.3]),
+        )
+        prs, variance, _, _ = compute_imputed_prs({"rs_p0": 2.0, "rs_p1": 1.0}, [model])
+        raw = 2 * 0.5 + 1 * (-0.3) + 0.2  # 0.9
+        np.testing.assert_allclose(prs, raw * beta, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(
+            variance,
+            beta**2 * clip_and_adjust_variance(raw, residual)[1],
+            rtol=0,
+            atol=1e-12,
+        )

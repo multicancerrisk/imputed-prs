@@ -381,6 +381,30 @@ class TestProjectionRegionTrainer:
 
             assert model.mean_prs_contribution == pytest.approx(expected_mean, rel=1e-10)
 
+    def test_target_variance_stored(self):
+        """target_variance == var(S_R) across samples — the intercept-only error
+        variance used for missingness-aware uncertainty (P3.3)."""
+        Z, X, prs_variants, platform_info = create_projection_test_data(
+            n_samples=50, n_missing_variants=3,
+        )
+        trainer = ProjectionRegionTrainer(window_size=1_000_000, random_state=42)
+        result = trainer.fit_all_regions(Z, X, prs_variants, platform_info)
+
+        prs_variants_reset = prs_variants.reset_index(drop=True)
+        decomposition = merge_variant_windows(prs_variants_reset, window_size=1_000_000)
+
+        for region in decomposition.regions:
+            region_id = f"chr{region.chromosome}:{region.start}-{region.end}"
+            if region_id not in result.region_models:
+                continue
+            model = result.region_models[region_id]
+            indices = region.prs_variant_indices
+            betas = prs_variants_reset.iloc[indices]["beta"].values
+            expected_target = X[:, indices] @ betas
+            assert model.target_variance == pytest.approx(
+                float(np.nanvar(expected_target)), rel=1e-10
+            )
+
     def test_predictor_allele_frequencies_stored(self):
         """predictor_allele_frequencies matches manual AF computation."""
         Z, X, prs_variants, platform_info = create_projection_test_data()

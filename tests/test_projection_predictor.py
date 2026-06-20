@@ -62,6 +62,7 @@ def _make_region_model(
     prs_positions=None,
     prs_effect_alleles=None,
     prs_other_alleles=None,
+    target_variance=0.5,
 ):
     """Helper to create a ProjectionRegionModel with sensible defaults.
 
@@ -117,6 +118,7 @@ def _make_region_model(
         prs_positions=prs_positions,
         prs_effect_alleles=prs_effect_alleles,
         prs_other_alleles=prs_other_alleles,
+        target_variance=target_variance,
     )
 
 
@@ -622,3 +624,110 @@ class TestProjectionPredictor:
         predictor = ProjectionPredictor([], [])
         result = predictor.predict({}, apply_calibration=False)
         assert isinstance(result, PredictionResult)
+
+
+class TestMissingnessAwareVariance:
+    """P3.3: per-region variance interpolates cv_mse -> target_variance with the
+    fraction of predictors that were mean-substituted.
+    """
+
+    def test_one_missing_predictor_formula_legacy(self):
+        """Legacy dict scorer: one of three predictors missing -> f = 1/3."""
+        model = _make_region_model(cv_mse=0.2, target_variance=0.5)  # rs1000/1/2
+        _, variance, _, n_sub = compute_projected_prs(
+            {"rs1000": 1.0, "rs1001": 1.0}, [model]  # rs1002 missing
+        )
+        expected = 0.2 * (2 / 3) + 0.5 * (1 / 3)
+        np.testing.assert_allclose(variance, expected, rtol=0, atol=1e-12)
+        assert n_sub == 1
+
+    def test_one_missing_predictor_formula_oriented(self):
+        """Oriented scorer: one of three predictors missing -> f = 1/3."""
+        model = _make_region_model(
+            predictor_variant_ids=["rs_p0", "rs_p1", "rs_p2"],
+            coefficients=np.array([0.2, -0.1, 0.15]),
+            cv_mse=0.2,
+            target_variance=0.5,
+            predictor_allele_frequencies=np.array([0.3, 0.4, 0.25]),
+            predictor_chromosomes=["1", "1", "1"],
+            predictor_positions=[1_000_001, 1_000_002, 1_000_003],
+            predictor_counted_alleles=["A", "C", "T"],
+            predictor_other_alleles=["G", "T", "C"],
+        )
+        # rs_p2 omitted -> 1 of 3 substituted.
+        coll = _collection(
+            [
+                ("rs_p0", "1", 1_000_001, "AA"),
+                ("rs_p1", "1", 1_000_002, "CT"),
+            ]
+        )
+        _, variance, _, n_sub = compute_projected_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        expected = 0.2 * (2 / 3) + 0.5 * (1 / 3)
+        np.testing.assert_allclose(variance, expected, rtol=0, atol=1e-12)
+        assert n_sub == 1
+
+    def test_variance_endpoints(self):
+        """f=0 -> cv_mse (back-compat); f=1 -> target_variance."""
+        model = _make_region_model(cv_mse=0.2, target_variance=0.5)
+        _, v_full, _, n0 = compute_projected_prs(
+            {"rs1000": 1.0, "rs1001": 1.0, "rs1002": 1.0}, [model]
+        )
+        np.testing.assert_allclose(v_full, 0.2, rtol=0, atol=1e-12)
+        assert n0 == 0
+        _, v_empty, _, n_all = compute_projected_prs({}, [model])
+        np.testing.assert_allclose(v_empty, 0.5, rtol=0, atol=1e-12)
+        assert n_all == 3
+
+    def test_variance_monotonic_nondecreasing(self):
+        """With target_variance > cv_mse, effective variance grows with missingness."""
+        model = _make_region_model(cv_mse=0.2, target_variance=0.5)
+        present = [
+            {"rs1000": 1.0, "rs1001": 1.0, "rs1002": 1.0},  # 0 missing
+            {"rs1000": 1.0, "rs1001": 1.0},  # 1 missing
+            {"rs1000": 1.0},  # 2 missing
+            {},  # 3 missing
+        ]
+        variances = [compute_projected_prs(d, [model])[1] for d in present]
+        for k, v in enumerate(variances):
+            f = k / 3
+            np.testing.assert_allclose(
+                v, 0.2 * (1 - f) + 0.5 * f, rtol=0, atol=1e-12
+            )
+        assert all(
+            variances[i] <= variances[i + 1] + 1e-12
+            for i in range(len(variances) - 1)
+        )
+
+    def test_negative_r2_region_decreases_by_design(self):
+        """A region whose model predicts worse out-of-fold than its own mean
+        (cv_mse > target_variance, i.e. negative CV R²) correctly interpolates
+        DOWNWARD toward the better intercept-only fallback as predictors are
+        substituted. This is intended behavior, not a violation of the formula.
+        """
+        model = _make_region_model(cv_mse=0.5, target_variance=0.2)
+        _, v_full, _, _ = compute_projected_prs(
+            {"rs1000": 1.0, "rs1001": 1.0, "rs1002": 1.0}, [model]
+        )
+        _, v_one_missing, _, _ = compute_projected_prs(
+            {"rs1000": 1.0, "rs1001": 1.0}, [model]
+        )
+        _, v_empty, _, _ = compute_projected_prs({}, [model])
+        assert v_full == pytest.approx(0.5)
+        assert v_empty == pytest.approx(0.2)
+        assert v_one_missing < v_full
+
+    def test_intercept_only_region_uses_cv_mse_regardless(self):
+        """An intercept-only region (no predictors) reports cv_mse, not target_variance."""
+        model = _make_region_model(
+            predictor_variant_ids=[],
+            coefficients=np.array([]),
+            is_intercept_only=True,
+            predictor_allele_frequencies=np.array([]),
+            cv_mse=0.03,
+            target_variance=0.9,
+        )
+        _, variance, _, n_sub = compute_projected_prs({}, [model])
+        np.testing.assert_allclose(variance, 0.03, rtol=0, atol=1e-12)
+        assert n_sub == 0

@@ -475,6 +475,12 @@ class ProjectionRegionModel:
             Index-aligned. Together with position these let a standalone scorer
             orient the true PRS via match_oriented_dosage instead of assuming
             effect==ALT at the first reference row.
+        target_variance: Variance of the region target S_R across reference
+            samples (the error variance of predicting with the regional mean, i.e.
+            the intercept-only model). Used as the intercept_only_variance term in
+            the missingness-aware uncertainty inflation at inference time (P3.3):
+            as predictors are mean-substituted, the region's effective variance
+            interpolates from cv_mse toward target_variance.
     """
 
     region_id: str
@@ -498,6 +504,7 @@ class ProjectionRegionModel:
     prs_positions: List[int] = field(default_factory=list)
     prs_effect_alleles: List[str] = field(default_factory=list)
     prs_other_alleles: List[Optional[str]] = field(default_factory=list)
+    target_variance: float = 0.0
 
     def to_dict(self) -> dict:
         """Convert to dictionary, handling numpy arrays.
