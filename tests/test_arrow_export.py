@@ -135,7 +135,7 @@ class TestBasicArrowExport:
             with pa.ipc.open_file(str(output_path)) as reader:
                 container = reader.read_all()
 
-            assert container.num_rows == 4  # 4 tables
+            assert container.num_rows == 5  # +observed_fallbacks (P1.8)
             assert "table_name" in container.column_names
             assert "data" in container.column_names
 
@@ -144,6 +144,7 @@ class TestBasicArrowExport:
             assert "metadata" in table_names
             assert "observed_variants" in table_names
             assert "imputed_variants" in table_names
+            assert "observed_fallbacks" in table_names
             assert "coefficients" in table_names
 
     def test_arrow_export_with_calibration_params(

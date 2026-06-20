@@ -20,6 +20,46 @@ from imputed_prs.core.types import (
 DEFAULT_AMBIGUOUS_POLICY = "exclude_unless_platform_strand_known"
 
 
+def _serialize_imputed_model(
+    model: ImputedVariantModel, *, include_variance_scaling: bool
+) -> Dict[str, Any]:
+    """Serialize an ImputedVariantModel to a self-describing dict.
+
+    Each predictor is an object carrying its own allele metadata so a browser can
+    orient it without trusting cross-array index alignment. Shared by the imputed
+    variant blocks and the per-observed-variant ``fallback`` blocks (P1.8), so both
+    deserialize through the same path.
+    """
+    predictors = [
+        {
+            "variant_id": pred_id,
+            "chromosome": model.predictor_chromosomes[i],
+            "position": model.predictor_positions[i],
+            "counted_allele": model.predictor_counted_alleles[i],
+            "other_allele": model.predictor_other_alleles[i],
+            "allele_frequency": float(model.predictor_allele_frequencies[i]),
+            "coefficient": float(model.coefficients[i]),
+        }
+        for i, pred_id in enumerate(model.predictor_variant_ids)
+    ]
+    model_dict: Dict[str, Any] = {
+        "variant_id": model.variant_id,
+        "chromosome": model.chromosome,
+        "position": model.position,
+        "effect_allele": model.effect_allele,
+        "other_allele": model.other_allele,
+        "beta": model.beta,
+        "allele_frequency": model.allele_frequency,
+        "imputation_r2": model.imputation_r2,
+        "intercept": model.intercept,
+        "is_intercept_only": model.is_intercept_only,
+        "predictors": predictors,
+    }
+    if include_variance_scaling:
+        model_dict["residual_variance"] = model.residual_variance
+    return model_dict
+
+
 def export_to_json(
     output_path: Union[str, Path],
     observed_variants: List[VariantInfo],
@@ -96,6 +136,17 @@ def export_to_json(
         for v in observed_variants:
             if not v.other_allele:
                 missing.append(f"observed:{v.variant_id}")
+            # A fallback's predictors are also counted from the upload, so they
+            # need the other allele too (P1.8).
+            if v.fallback is not None:
+                for i, pred_id in enumerate(v.fallback.predictor_variant_ids):
+                    other = (
+                        v.fallback.predictor_other_alleles[i]
+                        if i < len(v.fallback.predictor_other_alleles)
+                        else None
+                    )
+                    if not other:
+                        missing.append(f"fallback:{v.variant_id}<-{pred_id}")
         for model in imputed_models:
             for i, pred_id in enumerate(model.predictor_variant_ids):
                 other = (
@@ -180,42 +231,27 @@ def export_to_json(
                 v.other_allele is not None
                 and _is_ambiguous_snp(v.effect_allele, v.other_allele)
             ),
+            # Optional per-variant fallback imputation model (P1.8) used to recover
+            # the variant when the upload cannot resolve/call it directly.
+            "fallback": (
+                _serialize_imputed_model(
+                    v.fallback, include_variance_scaling=include_variance_scaling
+                )
+                if v.fallback is not None
+                else None
+            ),
         }
         for v in observed_variants
     ]
 
     # Serialize imputed variants. Each predictor is a self-describing object so a
     # browser can orient it without trusting cross-array index alignment.
-    imputed_variants_data = []
-    for model in imputed_models:
-        predictors = [
-            {
-                "variant_id": pred_id,
-                "chromosome": model.predictor_chromosomes[i],
-                "position": model.predictor_positions[i],
-                "counted_allele": model.predictor_counted_alleles[i],
-                "other_allele": model.predictor_other_alleles[i],
-                "allele_frequency": float(model.predictor_allele_frequencies[i]),
-                "coefficient": float(model.coefficients[i]),
-            }
-            for i, pred_id in enumerate(model.predictor_variant_ids)
-        ]
-        model_dict = {
-            "variant_id": model.variant_id,
-            "chromosome": model.chromosome,
-            "position": model.position,
-            "effect_allele": model.effect_allele,
-            "other_allele": model.other_allele,
-            "beta": model.beta,
-            "allele_frequency": model.allele_frequency,
-            "imputation_r2": model.imputation_r2,
-            "intercept": model.intercept,
-            "is_intercept_only": model.is_intercept_only,
-            "predictors": predictors,
-        }
-        if include_variance_scaling:
-            model_dict["residual_variance"] = model.residual_variance
-        imputed_variants_data.append(model_dict)
+    imputed_variants_data = [
+        _serialize_imputed_model(
+            model, include_variance_scaling=include_variance_scaling
+        )
+        for model in imputed_models
+    ]
 
     # Build platform variant index (maps variant_id to position for fast lookup)
     platform_variant_index = {

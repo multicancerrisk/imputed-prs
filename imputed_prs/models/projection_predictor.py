@@ -221,7 +221,10 @@ class ProjectionPredictor:
         # Step 1: Compute observed component. With raw genotype strings, use the
         # allele-aware oriented scorer; otherwise the legacy allele-blind scorer.
         n_observed_scored_direct: Optional[int] = None
+        n_observed_scored_via_fallback: Optional[int] = None
+        weighted_beta_via_fallback: Optional[float] = None
         unresolved_observed_ids: Optional[Tuple[str, ...]] = None
+        observed_fallback_variance = 0.0
         if raw_genotypes is not None:
             observed_score = compute_observed_prs_oriented(
                 raw_genotypes,
@@ -230,9 +233,17 @@ class ProjectionPredictor:
                 allow_strand_flip=self.allow_strand_flip,
             )
             prs_observed = observed_score.prs
-            n_observed_used = observed_score.n_scored_direct
+            # Observed fallbacks are not trained for the projection product until
+            # P2.4, so these are zero today; the shared scorer surfaces them
+            # uniformly so projection and imputation report the same diagnostics.
+            n_observed_used = (
+                observed_score.n_scored_direct + observed_score.n_scored_fallback
+            )
             n_observed_scored_direct = observed_score.n_scored_direct
+            n_observed_scored_via_fallback = observed_score.n_scored_fallback
+            weighted_beta_via_fallback = observed_score.weighted_beta_fallback
             unresolved_observed_ids = observed_score.unresolved_ids
+            observed_fallback_variance = observed_score.fallback_variance
         else:
             prs_observed, n_observed_used = compute_observed_prs(
                 user_genotypes, self.observed_variants
@@ -256,6 +267,9 @@ class ProjectionPredictor:
             prs_projected, total_variance, n_regions_used, _ = compute_projected_prs(
                 user_genotypes, self.region_models
             )
+
+        # Observed fallbacks (P2.4) would contribute variance here; 0.0 today.
+        total_variance += observed_fallback_variance
 
         # Step 3: Combine components
         prs_raw = prs_observed + prs_projected
@@ -301,5 +315,7 @@ class ProjectionPredictor:
             ci_lower_scaled=ci_lower_scaled,
             ci_upper_scaled=ci_upper_scaled,
             n_observed_scored_direct=n_observed_scored_direct,
+            n_observed_scored_via_fallback=n_observed_scored_via_fallback,
+            weighted_beta_via_fallback=weighted_beta_via_fallback,
             unresolved_observed_ids=unresolved_observed_ids,
         )

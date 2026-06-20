@@ -47,6 +47,12 @@ class VariantInfo:
         effect_allele: Allele associated with the effect.
         other_allele: Reference/alternate allele (optional).
         beta: Effect size (log odds ratio or beta coefficient).
+        fallback: Optional per-variant imputation-style model (P1.8). Predicts
+            this variant's *effect-allele* dosage from local-window platform
+            predictors (excluding its own locus) so the variant can be recovered
+            when the user's upload cannot resolve/call it directly, instead of
+            being silently dropped. ``None`` when no fallback was trained (e.g.
+            locus absent from the reference, or no platform predictors in window).
     """
 
     variant_id: str
@@ -55,6 +61,10 @@ class VariantInfo:
     effect_allele: str
     other_allele: Optional[str]
     beta: float
+    # Forward reference: ImputedVariantModel is defined below and this module
+    # does not use `from __future__ import annotations`, so the annotation must
+    # stay a string to avoid evaluating the name at class-definition time.
+    fallback: Optional["ImputedVariantModel"] = None
 
 
 @dataclass(frozen=True)
@@ -178,9 +188,15 @@ class PredictionResult:
         n_observed_scored_direct: Count of observed variants scored from a direct,
             allele-oriented effect-allele dosage. ``None`` on the legacy
             allele-blind (dosage-dict) prediction path.
-        unresolved_observed_ids: variant_ids of observed variants that could not be
-            resolved/oriented at runtime (recovered via fallback in P1.8). ``None``
-            on the legacy allele-blind path.
+        n_observed_scored_via_fallback: Count of observed variants that could not be
+            scored directly and were recovered via their per-variant fallback model
+            (P1.8). ``None`` on the legacy allele-blind path.
+        weighted_beta_via_fallback: Sum of ``|beta|`` over observed variants scored
+            via fallback — a QC magnitude of how much PRS weight was recovered
+            through the lower-confidence fallback path. ``None`` on the legacy path.
+        unresolved_observed_ids: variant_ids of observed variants that could be scored
+            neither directly nor via fallback (never silently dropped — surfaced
+            here). ``None`` on the legacy allele-blind path.
     """
 
     prs: float
@@ -199,6 +215,8 @@ class PredictionResult:
     ci_lower_scaled: Optional[float] = None
     ci_upper_scaled: Optional[float] = None
     n_observed_scored_direct: Optional[int] = None
+    n_observed_scored_via_fallback: Optional[int] = None
+    weighted_beta_via_fallback: Optional[float] = None
     unresolved_observed_ids: Optional[Tuple[str, ...]] = None
 
 

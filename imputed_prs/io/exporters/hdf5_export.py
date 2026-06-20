@@ -114,9 +114,14 @@ def _write_imputed_variants(
     f: h5py.File,
     imputed_models: List[ImputedVariantModel],
     include_variance_scaling: bool,
+    group_name: str = "imputed_variants",
 ) -> None:
-    """Write imputed variants to HDF5 file."""
-    grp = f.create_group("imputed_variants")
+    """Write a variant-model group to HDF5.
+
+    Used for both the ``imputed_variants`` group and the ``observed_fallbacks``
+    group (P1.8) — identical layout, different group name.
+    """
+    grp = f.create_group(group_name)
     str_dtype = h5py.string_dtype(encoding='utf-8')
 
     n = len(imputed_models)
@@ -292,6 +297,15 @@ def export_to_hdf5(
         )
         _write_observed_variants(f, observed_variants)
         _write_imputed_variants(f, imputed_models, include_variance_scaling)
-        _write_coefficients(f, imputed_models)
+        # Per-observed-variant fallback models (P1.8): written as a parallel group
+        # with their predictors folded into the shared sparse coefficients table.
+        fallback_models = [
+            v.fallback for v in observed_variants if v.fallback is not None
+        ]
+        _write_imputed_variants(
+            f, fallback_models, include_variance_scaling,
+            group_name="observed_fallbacks",
+        )
+        _write_coefficients(f, imputed_models + fallback_models)
 
     return output_path

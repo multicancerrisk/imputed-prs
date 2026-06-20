@@ -58,24 +58,138 @@ def compute_observed_prs(
     return total, n_used
 
 
+def _predict_model_dosage(
+    model: ImputedVariantModel,
+    raw_genotypes: RawUserGenotypeCollection,
+    *,
+    allow_ambiguous: bool,
+    allow_strand_flip: bool,
+) -> Tuple[float, float, bool]:
+    """Predict one variant's effect-allele dosage from an imputation-style model.
+
+    Allele-aware: each predictor dosage counts the stored ALT allele
+    (``predictor_counted_alleles[i]``, the allele the reference ``Z`` column was
+    built from); a missing or unresolvable predictor is mean-substituted with
+    ``2 * AF``. The raw linear prediction is clipped to the valid dosage range
+    ``[0, 2]`` with a truncated-normal variance adjustment.
+
+    Shared by :func:`compute_imputed_prs_oriented` (per imputed variant) and the
+    observed-variant fallback path in :func:`compute_observed_prs_oriented`, so a
+    fallback is scored *identically* to a genuine imputation.
+
+    Returns:
+        Tuple of (clipped_dosage, adjusted_variance, was_truncated).
+    """
+    if model.is_intercept_only:
+        raw_prediction = model.intercept
+    else:
+        # Count each predictor's ALT-allele dosage; mean-substitute (2*AF) any
+        # predictor that is missing or unresolvable.
+        predictor_dosages = []
+        for i, pred_id in enumerate(model.predictor_variant_ids):
+            dosage = resolve_counted_dosage(
+                raw_genotypes,
+                variant_id=pred_id,
+                chromosome=model.predictor_chromosomes[i],
+                position=model.predictor_positions[i],
+                counted_allele=model.predictor_counted_alleles[i],
+                other_allele=model.predictor_other_alleles[i],
+                allow_ambiguous=allow_ambiguous,
+                allow_strand_flip=allow_strand_flip,
+            )
+            if dosage is None:
+                dosage = 2.0 * model.predictor_allele_frequencies[i]
+            predictor_dosages.append(dosage)
+
+        predictor_array = np.array(predictor_dosages)
+        raw_prediction = np.dot(predictor_array, model.coefficients) + model.intercept
+
+    # Target is a dosage in [0, 2]: clip and adjust the residual variance.
+    clipped_dosage, adjusted_variance = clip_and_adjust_variance(
+        raw_prediction, model.residual_variance
+    )
+    return clipped_dosage, adjusted_variance, clipped_dosage != raw_prediction
+
+
+def _direct_effect_dosage(
+    variant: VariantInfo,
+    raw_genotypes: RawUserGenotypeCollection,
+    *,
+    allow_ambiguous: bool,
+    allow_strand_flip: bool,
+) -> Optional[float]:
+    """Count the user's copies of a variant's *effect* allele.
+
+    Resolves the variant against the user collection by its several identifiers
+    (rsID plus ``chr:pos``) and counts the effect allele allele-aware. Returns
+    ``None`` when the locus cannot be resolved/oriented — missing other allele,
+    not found, duplicate-conflict, palindromic under the active policy,
+    partial-overlap, or no-call — i.e. exactly the cases that should fall through
+    to the per-variant fallback (P1.8). A return of ``0.0`` is a *valid* direct
+    score (homozygous for the other allele), not a failure.
+    """
+    # Browser-safe orientation needs both alleles of the biallelic pair.
+    if variant.other_allele is None:
+        return None
+
+    chrom = _normalize_chromosome(str(variant.chromosome))
+    identity = VariantIdentity(
+        feature_id=(
+            f"{chrom}:{variant.position}:"
+            f"{variant.other_allele}:{variant.effect_allele}"
+        ),
+        variant_id=variant.variant_id,
+        accepted_ids=(variant.variant_id, f"{chrom}:{variant.position}"),
+        chromosome=chrom,
+        position=variant.position,
+        counted_allele=variant.effect_allele,
+        other_allele=variant.other_allele,
+    )
+    resolution = raw_genotypes.resolve(identity)
+    if resolution.status != "resolved":
+        # not_found or duplicate_conflict: never score an arbitrary match.
+        return None
+
+    return count_allele(
+        resolution.genotype,
+        variant.effect_allele,
+        variant.other_allele,
+        allow_ambiguous=allow_ambiguous,
+        allow_strand_flip=allow_strand_flip,
+    )
+
+
 @dataclass(frozen=True)
 class ObservedScore:
     """Result of allele-aware observed PRS scoring.
 
     Attributes:
-        prs: Sum of (effect-allele dosage × beta) over resolved observed variants.
+        prs: Sum of (dosage × beta) over scored observed variants, combining
+            directly-counted variants and those recovered via fallback (P1.8).
         n_scored_direct: Count of observed variants scored from a direct,
             allele-oriented effect-allele dosage.
-        unresolved_ids: variant_ids of observed variants that could not be scored
+        unresolved_ids: variant_ids of observed variants that could be scored
+            neither directly nor via fallback (no fallback model was trained), in
+            ``observed_variants`` order. Never silently dropped — surfaced here.
+        n_scored_fallback: Count of observed variants that failed direct scoring
             (not found, duplicate-conflict, missing other_allele, palindromic under
-            the active policy, partial-overlap, or otherwise uncountable), in
-            ``observed_variants`` order. Recovered via per-variant fallback in P1.8;
-            never silently dropped.
+            the active policy, partial-overlap, no-call) and were recovered via
+            their per-variant fallback model.
+        weighted_beta_fallback: Sum of ``|beta|`` over fallback-scored variants —
+            a QC magnitude of how much PRS weight ran through the fallback path.
+        fallback_variance: Sum of ``beta**2 * adjusted_variance`` over
+            fallback-scored variants, to be folded into the score's total variance
+            (fallback dosages are imputed, not exact).
+        n_truncated_fallback: Count of fallback dosages clipped to ``[0, 2]``.
     """
 
     prs: float
     n_scored_direct: int
     unresolved_ids: Tuple[str, ...]
+    n_scored_fallback: int = 0
+    weighted_beta_fallback: float = 0.0
+    fallback_variance: float = 0.0
+    n_truncated_fallback: int = 0
 
 
 def compute_observed_prs_oriented(
@@ -109,53 +223,63 @@ def compute_observed_prs_oriented(
             the unconditional complement pass in ``match_oriented_dosage``.
 
     Returns:
-        An :class:`ObservedScore` with the PRS, the directly-scored count, and the
-        ids that could not be resolved (in ``observed_variants`` order).
+        An :class:`ObservedScore` with the combined PRS (direct + fallback), the
+        direct/fallback counts and weights, the variance contributed by fallback
+        terms, and the ids that could be scored by neither path (in
+        ``observed_variants`` order).
     """
     total = 0.0
     n_scored_direct = 0
+    n_scored_fallback = 0
+    weighted_beta_fallback = 0.0
+    fallback_variance = 0.0
+    n_truncated_fallback = 0
     unresolved: List[str] = []
 
     for variant in observed_variants:
-        # Browser-safe orientation needs both alleles of the biallelic pair.
-        if variant.other_allele is None:
-            unresolved.append(variant.variant_id)
-            continue
-
-        chrom = _normalize_chromosome(str(variant.chromosome))
-        identity = VariantIdentity(
-            feature_id=(
-                f"{chrom}:{variant.position}:"
-                f"{variant.other_allele}:{variant.effect_allele}"
-            ),
-            variant_id=variant.variant_id,
-            accepted_ids=(variant.variant_id, f"{chrom}:{variant.position}"),
-            chromosome=chrom,
-            position=variant.position,
-            counted_allele=variant.effect_allele,
-            other_allele=variant.other_allele,
-        )
-        resolution = raw_genotypes.resolve(identity)
-        if resolution.status != "resolved":
-            # not_found or duplicate_conflict: never score an arbitrary match.
-            unresolved.append(variant.variant_id)
-            continue
-
-        dosage = count_allele(
-            resolution.genotype,
-            variant.effect_allele,
-            variant.other_allele,
+        direct_dosage = _direct_effect_dosage(
+            variant,
+            raw_genotypes,
             allow_ambiguous=allow_ambiguous,
             allow_strand_flip=allow_strand_flip,
         )
-        if dosage is None:
-            unresolved.append(variant.variant_id)
+        if direct_dosage is not None:
+            # Resolvable & called: exact integer count. Fallback is never
+            # consulted, so a present fallback model cannot perturb the score.
+            total += direct_dosage * variant.beta
+            n_scored_direct += 1
             continue
 
-        total += dosage * variant.beta
-        n_scored_direct += 1
+        # Direct scoring failed (missing other_allele / not found /
+        # duplicate-conflict / palindromic-blocked / partial-overlap / no-call).
+        # Recover via the per-variant fallback model when one was trained, rather
+        # than silently dropping the variant.
+        if variant.fallback is not None:
+            clipped_dosage, adjusted_variance, was_truncated = _predict_model_dosage(
+                variant.fallback,
+                raw_genotypes,
+                allow_ambiguous=allow_ambiguous,
+                allow_strand_flip=allow_strand_flip,
+            )
+            total += clipped_dosage * variant.beta
+            fallback_variance += (variant.beta ** 2) * adjusted_variance
+            weighted_beta_fallback += abs(variant.beta)
+            n_scored_fallback += 1
+            if was_truncated:
+                n_truncated_fallback += 1
+            continue
 
-    return ObservedScore(total, n_scored_direct, tuple(unresolved))
+        unresolved.append(variant.variant_id)
+
+    return ObservedScore(
+        prs=total,
+        n_scored_direct=n_scored_direct,
+        unresolved_ids=tuple(unresolved),
+        n_scored_fallback=n_scored_fallback,
+        weighted_beta_fallback=weighted_beta_fallback,
+        fallback_variance=fallback_variance,
+        n_truncated_fallback=n_truncated_fallback,
+    )
 
 
 def compute_imputed_prs(
@@ -276,40 +400,14 @@ def compute_imputed_prs_oriented(
     n_truncated = 0
 
     for model in imputed_models:
-        if model.is_intercept_only:
-            raw_prediction = model.intercept
-        else:
-            # Count each predictor's ALT-allele dosage; mean-substitute (2*AF)
-            # any predictor that is missing or unresolvable.
-            predictor_dosages = []
-            for i, pred_id in enumerate(model.predictor_variant_ids):
-                dosage = resolve_counted_dosage(
-                    raw_genotypes,
-                    variant_id=pred_id,
-                    chromosome=model.predictor_chromosomes[i],
-                    position=model.predictor_positions[i],
-                    counted_allele=model.predictor_counted_alleles[i],
-                    other_allele=model.predictor_other_alleles[i],
-                    allow_ambiguous=allow_ambiguous,
-                    allow_strand_flip=allow_strand_flip,
-                )
-                if dosage is None:
-                    dosage = 2.0 * model.predictor_allele_frequencies[i]
-                predictor_dosages.append(dosage)
-
-            predictor_array = np.array(predictor_dosages)
-            raw_prediction = (
-                np.dot(predictor_array, model.coefficients) + model.intercept
-            )
-
-        # Apply clipping and variance adjustment (target is a dosage in [0, 2]).
-        clipped_dosage, adjusted_variance = clip_and_adjust_variance(
-            raw_prediction, model.residual_variance
+        clipped_dosage, adjusted_variance, was_truncated = _predict_model_dosage(
+            model,
+            raw_genotypes,
+            allow_ambiguous=allow_ambiguous,
+            allow_strand_flip=allow_strand_flip,
         )
-
-        if clipped_dosage != raw_prediction:
+        if was_truncated:
             n_truncated += 1
-
         total_prs += clipped_dosage * model.beta
         total_variance += (model.beta ** 2) * adjusted_variance
         n_imputed += 1
@@ -394,7 +492,10 @@ class PRSPredictor:
         # Step 1: Compute observed component. With raw genotype strings, use the
         # allele-aware oriented scorer; otherwise the legacy allele-blind scorer.
         n_observed_scored_direct: Optional[int] = None
+        n_observed_scored_via_fallback: Optional[int] = None
+        weighted_beta_via_fallback: Optional[float] = None
         unresolved_observed_ids: Optional[Tuple[str, ...]] = None
+        observed_fallback_variance = 0.0
         if raw_genotypes is not None:
             observed_score = compute_observed_prs_oriented(
                 raw_genotypes,
@@ -403,9 +504,15 @@ class PRSPredictor:
                 allow_strand_flip=self.allow_strand_flip,
             )
             prs_observed = observed_score.prs
-            n_observed_used = observed_score.n_scored_direct
+            # Fallback-recovered variants are used too, just not scored "direct".
+            n_observed_used = (
+                observed_score.n_scored_direct + observed_score.n_scored_fallback
+            )
             n_observed_scored_direct = observed_score.n_scored_direct
+            n_observed_scored_via_fallback = observed_score.n_scored_fallback
+            weighted_beta_via_fallback = observed_score.weighted_beta_fallback
             unresolved_observed_ids = observed_score.unresolved_ids
+            observed_fallback_variance = observed_score.fallback_variance
         else:
             prs_observed, n_observed_used = compute_observed_prs(
                 user_genotypes, self.observed_variants
@@ -429,6 +536,11 @@ class PRSPredictor:
             prs_imputed, total_variance, n_imputed, n_truncated = compute_imputed_prs(
                 user_genotypes, self.imputed_models
             )
+
+        # Fallback-scored observed variants are imputed, not exact, so their
+        # variance contributes to the score's uncertainty (0.0 on the legacy path
+        # and whenever every observed variant resolved directly).
+        total_variance += observed_fallback_variance
 
         # Step 3: Combine components
         prs_raw = prs_observed + prs_imputed
@@ -474,5 +586,7 @@ class PRSPredictor:
             ci_lower_scaled=ci_lower_scaled,
             ci_upper_scaled=ci_upper_scaled,
             n_observed_scored_direct=n_observed_scored_direct,
+            n_observed_scored_via_fallback=n_observed_scored_via_fallback,
+            weighted_beta_via_fallback=weighted_beta_via_fallback,
             unresolved_observed_ids=unresolved_observed_ids,
         )

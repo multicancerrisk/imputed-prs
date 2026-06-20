@@ -652,11 +652,84 @@ class LinearImputationPRS:
                     print(f"Warning: Could not compute calibration parameters: {e}")
                 calibration_params = None
 
-        # Step 12: Build observed VariantInfo objects (excluding QC-dropped SNPs)
-        observed_variants_list: List[VariantInfo] = []
+        # Step 12: Build observed VariantInfo objects (excluding QC-dropped SNPs),
+        # each carrying an optional per-variant fallback imputation model (P1.8) so
+        # an observed variant the user's upload cannot resolve/call is recovered
+        # rather than silently dropped.
+        #
+        # Pass 1: collect the kept observed rows and, for each whose effect-allele
+        # dosage is extractable from the reference, an effect-oriented target column
+        # to train its fallback from (local-window platform predictors, the target
+        # locus auto-excluded by filter_to_local_window).
+        kept_observed_rows: List[pd.Series] = []
+        fb_target_pos: List[int] = []  # indices into kept_observed_rows with a target
+        fb_columns: List[np.ndarray] = []
+        fallback_no_target_ids: Set[str] = set()
         for _, row in prs_df[prs_df["variant_id"].isin(observed_variant_ids)].iterrows():
             if row["variant_id"] in ambiguous_excluded_ids:
                 continue
+            pos_in_kept = len(kept_observed_rows)
+            kept_observed_rows.append(row)
+            if Z.shape[1] == 0:
+                continue
+            match = match_oriented_dosage(
+                row["chromosome"], int(row["position"]),
+                row["effect_allele"], row.get("other_allele"),
+                genotype_data.variant_info, genotype_data.dosage_matrix,
+                reference_index,
+            )
+            if match is None:
+                # Platform-measured but no reference target (locus absent): still
+                # scored directly when the upload resolves it, but there is no panel
+                # to train a fallback from.
+                fallback_no_target_ids.add(row["variant_id"])
+                continue
+            fb_target_pos.append(pos_in_kept)
+            fb_columns.append(match[1])
+
+        # Train the fallbacks with the same trainer/config as the imputed models.
+        # The trainer keys results by variant_id, which is not unique at
+        # duplicate-rsID multiallelic loci, so train against a unique synthetic key
+        # and reset each model's identity to its real variant afterwards.
+        fallback_by_pos: Dict[int, ImputedVariantModel] = {}
+        if fb_columns:
+            if self.verbose >= 1:
+                print(
+                    f"Training {len(fb_columns)} observed-variant fallback models..."
+                )
+            fb_prs_rows = []
+            for k, pos_in_kept in enumerate(fb_target_pos):
+                fb_row = kept_observed_rows[pos_in_kept].copy()
+                fb_row["variant_id"] = str(k)
+                fb_prs_rows.append(fb_row)
+            fb_prs_df = pd.DataFrame(fb_prs_rows).reset_index(drop=True)
+            X_observed = np.column_stack(fb_columns).astype(np.float32)
+            fb_trainer = ImputationModelTrainer(
+                window_size=self.window_size,
+                l1_ratio=effective_l1_ratio,
+                alpha=effective_alpha,
+                cv_folds=self.cv_folds,
+                n_jobs=self.n_jobs,
+                random_state=self.random_state,
+                max_predictors=self.max_predictors,
+                verbose=0,
+            )
+            fb_result = fb_trainer.fit_all_variants(
+                Z=Z,
+                X=X_observed,
+                prs_variants=fb_prs_df,
+                platform_variant_info=platform_variant_info,
+            )
+            for k, pos_in_kept in enumerate(fb_target_pos):
+                model = fb_result.models.get(str(k))
+                if model is None:
+                    continue
+                model.variant_id = kept_observed_rows[pos_in_kept]["variant_id"]
+                fallback_by_pos[pos_in_kept] = model
+
+        # Pass 2: build the VariantInfos, attaching each fallback by position.
+        observed_variants_list: List[VariantInfo] = []
+        for pos_in_kept, row in enumerate(kept_observed_rows):
             other_allele = row.get("other_allele")
             if pd.isna(other_allele):
                 other_allele = None
@@ -669,12 +742,14 @@ class LinearImputationPRS:
                     effect_allele=row["effect_allele"],
                     other_allele=other_allele,
                     beta=float(row["beta"]),
+                    fallback=fallback_by_pos.get(pos_in_kept),
                 )
             )
 
         # Step 12b: Record a disposition for every input PRS variant so coverage
         # is reported honestly (no silent loss).
         observed_kept_ids = {v.variant_id for v in observed_variants_list}
+        observed_fallback_ids = {m.variant_id for m in fallback_by_pos.values()}
         intercept_only_ids = {
             vid for vid, m in training_result.models.items() if m.is_intercept_only
         }
@@ -685,6 +760,8 @@ class LinearImputationPRS:
             intercept_only_ids=intercept_only_ids,
             ambiguous_excluded_ids=ambiguous_excluded_ids,
             missing_drop_reason=missing_drop_reason,
+            observed_fallback_ids=observed_fallback_ids,
+            fallback_no_target_ids=fallback_no_target_ids,
         )
 
         # Step 13: Populate instance state
@@ -723,6 +800,8 @@ class LinearImputationPRS:
         intercept_only_ids: Set[str],
         ambiguous_excluded_ids: Set[str],
         missing_drop_reason: Dict[str, str],
+        observed_fallback_ids: Optional[Set[str]] = None,
+        fallback_no_target_ids: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Build one disposition record per input PRS variant.
 
@@ -731,7 +810,14 @@ class LinearImputationPRS:
         dropped}; ``reason`` is None for placed variants, or one of
         {ambiguous_excluded, reference_contig_missing, allele_mismatch,
         not_in_reference, training_failed} for dropped ones.
+
+        For observed variants, ``has_fallback`` records whether a per-variant
+        fallback model was trained (P1.8) and ``fallback_reason`` explains its
+        absence ({no_reference_target, no_fallback_model}); both are False/None
+        for non-observed rows.
         """
+        observed_fallback_ids = observed_fallback_ids or set()
+        fallback_no_target_ids = fallback_no_target_ids or set()
         dispositions: List[Dict[str, Any]] = []
         for _, row in prs_df.iterrows():
             var_id = row["variant_id"]
@@ -752,6 +838,17 @@ class LinearImputationPRS:
                 status = "dropped"
                 reason = missing_drop_reason.get(var_id, "training_failed")
 
+            has_fallback = False
+            fallback_reason: Optional[str] = None
+            if status == "observed":
+                has_fallback = var_id in observed_fallback_ids
+                if not has_fallback:
+                    fallback_reason = (
+                        "no_reference_target"
+                        if var_id in fallback_no_target_ids
+                        else "no_fallback_model"
+                    )
+
             dispositions.append({
                 "variant_id": var_id,
                 "chromosome": str(row["chromosome"]),
@@ -761,6 +858,8 @@ class LinearImputationPRS:
                 "beta": float(row["beta"]),
                 "status": status,
                 "reason": reason,
+                "has_fallback": has_fallback,
+                "fallback_reason": fallback_reason,
             })
         return dispositions
 
@@ -1105,27 +1204,13 @@ class LinearImputationPRS:
         # Create instance with default parameters
         instance = cls()
 
-        # Parse observed variants
-        observed_variants = []
-        for v in data.get("observed_variants", []):
-            observed_variants.append(
-                VariantInfo(
-                    variant_id=v["variant_id"],
-                    chromosome=v["chromosome"],
-                    position=v["position"],
-                    effect_allele=v["effect_allele"],
-                    other_allele=v.get("other_allele"),
-                    beta=v["beta"],
-                )
-            )
-
-        # Parse imputed models. v2 emits a self-describing `predictors` list; v1.0
-        # used parallel `predictor_variant_ids`/`coefficients` arrays with no
-        # predictor allele metadata. Restoring the P1.3 metadata is essential: the
-        # oriented scorer indexes predictor_counted_alleles[i] etc., so a model
-        # reloaded without it would mis-score (or IndexError) on real uploads.
-        imputed_models = []
-        for m in data.get("imputed_variants", []):
+        # v2 emits a self-describing `predictors` list; v1.0 used parallel
+        # `predictor_variant_ids`/`coefficients` arrays with no predictor allele
+        # metadata. Restoring the P1.3 metadata is essential: the oriented scorer
+        # indexes predictor_counted_alleles[i] etc., so a model reloaded without it
+        # would mis-score (or IndexError) on real uploads. Shared by the imputed
+        # models and the per-observed-variant fallback models (P1.8).
+        def _parse_imputed_model(m: dict) -> ImputedVariantModel:
             preds = m.get("predictors")
             if preds is not None:
                 pred_ids = [p["variant_id"] for p in preds]
@@ -1151,28 +1236,47 @@ class LinearImputationPRS:
                 predictor_allele_frequencies = np.array(
                     m.get("predictor_allele_frequencies", []), dtype=np.float64
                 )
-            imputed_models.append(
-                ImputedVariantModel(
-                    variant_id=m["variant_id"],
-                    chromosome=m["chromosome"],
-                    position=m["position"],
-                    effect_allele=m["effect_allele"],
-                    other_allele=m.get("other_allele"),
-                    beta=m["beta"],
-                    allele_frequency=m["allele_frequency"],
-                    imputation_r2=m["imputation_r2"],
-                    residual_variance=m.get("residual_variance", 0.0),
-                    intercept=m["intercept"],
-                    predictor_variant_ids=pred_ids,
-                    coefficients=coefficients,
-                    is_intercept_only=m.get("is_intercept_only", False),
-                    predictor_chromosomes=predictor_chromosomes,
-                    predictor_positions=predictor_positions,
-                    predictor_counted_alleles=predictor_counted_alleles,
-                    predictor_other_alleles=predictor_other_alleles,
-                    predictor_allele_frequencies=predictor_allele_frequencies,
+            return ImputedVariantModel(
+                variant_id=m["variant_id"],
+                chromosome=m["chromosome"],
+                position=m["position"],
+                effect_allele=m["effect_allele"],
+                other_allele=m.get("other_allele"),
+                beta=m["beta"],
+                allele_frequency=m["allele_frequency"],
+                imputation_r2=m["imputation_r2"],
+                residual_variance=m.get("residual_variance", 0.0),
+                intercept=m["intercept"],
+                predictor_variant_ids=pred_ids,
+                coefficients=coefficients,
+                is_intercept_only=m.get("is_intercept_only", False),
+                predictor_chromosomes=predictor_chromosomes,
+                predictor_positions=predictor_positions,
+                predictor_counted_alleles=predictor_counted_alleles,
+                predictor_other_alleles=predictor_other_alleles,
+                predictor_allele_frequencies=predictor_allele_frequencies,
+            )
+
+        # Parse observed variants, each with an optional fallback model (P1.8).
+        observed_variants = []
+        for v in data.get("observed_variants", []):
+            fb = v.get("fallback")
+            observed_variants.append(
+                VariantInfo(
+                    variant_id=v["variant_id"],
+                    chromosome=v["chromosome"],
+                    position=v["position"],
+                    effect_allele=v["effect_allele"],
+                    other_allele=v.get("other_allele"),
+                    beta=v["beta"],
+                    fallback=_parse_imputed_model(fb) if fb else None,
                 )
             )
+
+        # Parse imputed models.
+        imputed_models = [
+            _parse_imputed_model(m) for m in data.get("imputed_variants", [])
+        ]
 
         # Parse calibration params if present
         calib_params = None
@@ -1311,6 +1415,11 @@ class LinearImputationPRS:
         n_intercept_only = sum(
             1 for m in (self._imputed_models or []) if m.is_intercept_only
         )
+        # Observed variants recoverable via a per-variant fallback model (P1.8).
+        # Computed from state so it is correct for both fitted and loaded models.
+        n_observed_with_fallback = sum(
+            1 for v in (self._observed_variants or []) if v.fallback is not None
+        )
 
         # Compute mean R² for imputed variants
         r2_values = [m.imputation_r2 for m in (self._imputed_models or [])
@@ -1338,6 +1447,7 @@ class LinearImputationPRS:
             "n_total_variants": n_definition,
             "n_definition_variants": n_definition,
             "n_observed": n_observed,
+            "n_observed_with_fallback": n_observed_with_fallback,
             "n_imputed": n_imputed,
             "n_intercept_only": n_intercept_only,
             "n_dropped": n_dropped,

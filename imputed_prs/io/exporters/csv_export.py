@@ -175,6 +175,39 @@ def export_variant_table(
             )
         rows.append(row)
 
+    # Add per-observed-variant fallback models (P1.8) as dedicated rows so the flat
+    # table round-trips them; their predictors go in the companion coefficients CSV.
+    # is_intercept_only is encoded in `status`, mirroring the imputed convention.
+    fallback_models = [v.fallback for v in observed_variants if v.fallback is not None]
+    for model in fallback_models:
+        status = (
+            "observed_fallback_intercept_only"
+            if model.is_intercept_only
+            else "observed_fallback"
+        )
+        row = {
+            "variant_id": model.variant_id,
+            "chromosome": model.chromosome,
+            "position": model.position,
+            "effect_allele": model.effect_allele,
+            "other_allele": model.other_allele,
+            "beta": model.beta,
+            "status": status,
+            "imputation_r2": model.imputation_r2,
+            "allele_frequency": model.allele_frequency,
+            "intercept": model.intercept,
+            "n_predictors": len(model.predictor_variant_ids),
+        }
+        if include_variance_scaling:
+            row["residual_variance"] = model.residual_variance
+        if include_predictor_details:
+            row["predictor_variant_ids"] = (
+                ";".join(model.predictor_variant_ids)
+                if model.predictor_variant_ids
+                else None
+            )
+        rows.append(row)
+
     # Ensure consistent column order
     base_cols = [
         "variant_id",
@@ -208,6 +241,8 @@ def export_variant_table(
     # Companion long-format coefficients table with per-predictor allele metadata
     # (schema v2) so a reloaded CSV model can orient raw genotypes. The flat
     # per-variant table above has no slot for per-predictor rows.
-    _write_coefficients_csv(coefficients_path_for(output_path), imputed_models)
+    _write_coefficients_csv(
+        coefficients_path_for(output_path), imputed_models + fallback_models
+    )
 
     return output_path

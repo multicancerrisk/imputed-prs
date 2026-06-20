@@ -273,10 +273,16 @@ def export_to_arrow(
         ambiguous_policy,
     )
     observed_table = _build_observed_variants_table(observed_variants)
+    # Per-observed-variant fallback models (P1.8): a parallel table reusing the
+    # imputed-variants layout, with predictors folded into the shared coefficients.
+    fallback_models = [v.fallback for v in observed_variants if v.fallback is not None]
     imputed_table = _build_imputed_variants_table(
         imputed_models, include_variance_scaling
     )
-    coefficients_table = _build_coefficients_table(imputed_models)
+    fallback_table = _build_imputed_variants_table(
+        fallback_models, include_variance_scaling
+    )
+    coefficients_table = _build_coefficients_table(imputed_models + fallback_models)
 
     # Store table names in custom metadata
     schema = pa.schema([
@@ -290,6 +296,7 @@ def export_to_arrow(
         ("metadata", metadata_table),
         ("observed_variants", observed_table),
         ("imputed_variants", imputed_table),
+        ("observed_fallbacks", fallback_table),
         ("coefficients", coefficients_table),
     ]:
         sink = pa.BufferOutputStream()
@@ -368,10 +375,16 @@ def export_to_parquet(
         ambiguous_policy,
     )
     observed_table = _build_observed_variants_table(observed_variants)
+    # Per-observed-variant fallback models (P1.8): a parallel table reusing the
+    # imputed-variants layout, with predictors folded into the shared coefficients.
+    fallback_models = [v.fallback for v in observed_variants if v.fallback is not None]
     imputed_table = _build_imputed_variants_table(
         imputed_models, include_variance_scaling
     )
-    coefficients_table = _build_coefficients_table(imputed_models)
+    fallback_table = _build_imputed_variants_table(
+        fallback_models, include_variance_scaling
+    )
+    coefficients_table = _build_coefficients_table(imputed_models + fallback_models)
 
     # Write each table as a separate Parquet file
     paths = {}
@@ -381,6 +394,7 @@ def export_to_parquet(
         ("metadata", metadata_table),
         ("observed_variants", observed_table),
         ("imputed_variants", imputed_table),
+        ("observed_fallbacks", fallback_table),
         ("coefficients", coefficients_table),
     ]:
         file_path = output_path / f"{name}.parquet"

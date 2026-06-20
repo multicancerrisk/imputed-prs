@@ -175,6 +175,30 @@ def _rebuild_imputed_models(
     return models
 
 
+def _attach_observed_fallbacks(
+    observed: List[VariantInfo],
+    fallback_cols: Dict[str, List[Any]],
+    coef_cols: Dict[str, List[Any]],
+) -> None:
+    """Reconstruct observed fallback models (P1.8) and attach them in place.
+
+    ``fallback_cols`` is laid out exactly like the ``imputed_variants`` columns and
+    ``coef_cols`` is the shared sparse coefficients table (imputed + fallback
+    predictors keyed by ``target_variant_id``), so the fallbacks reconstruct through
+    the same :func:`_rebuild_imputed_models` path and attach to their observed
+    VariantInfo by ``variant_id``. A no-op when no fallbacks were serialized (a
+    pre-P1.8 artifact, or a model whose observed variants all resolve directly).
+    """
+    if not fallback_cols.get("variant_id"):
+        return
+    fallback_models = _rebuild_imputed_models(fallback_cols, coef_cols)
+    by_id = {m.variant_id: m for m in fallback_models}
+    for v in observed:
+        model = by_id.get(v.variant_id)
+        if model is not None:
+            v.fallback = model
+
+
 def load_model_json(path: Union[str, Path]) -> Dict[str, Any]:
     """Load trained imputation model from JSON format.
 
@@ -232,17 +256,10 @@ def _load_observed_variants_hdf5(f: h5py.File) -> List[VariantInfo]:
     return _rebuild_observed_variants(obs_cols)
 
 
-def _load_imputed_models_hdf5(f: h5py.File) -> List[ImputedVariantModel]:
-    """Load imputed variant models from HDF5 file.
-
-    Reads the sparse ``coefficients`` group, including the per-predictor allele
-    metadata datasets when present (schema v2); v1 files without them reconstruct
-    with empty predictor metadata.
-    """
-    grp = f["imputed_variants"]
-    coef_grp = f["coefficients"]
-
-    imp_cols: Dict[str, List[Any]] = {
+def _hdf5_model_cols(grp: h5py.Group) -> Dict[str, List[Any]]:
+    """Read a variant-model HDF5 group (``imputed_variants`` or
+    ``observed_fallbacks``) into a plain column dict."""
+    cols: Dict[str, List[Any]] = {
         "variant_id": [v.decode("utf-8") for v in grp["variant_id"][:]],
         "chromosome": [v.decode("utf-8") for v in grp["chromosome"][:]],
         "position": grp["position"][:].tolist(),
@@ -255,8 +272,13 @@ def _load_imputed_models_hdf5(f: h5py.File) -> List[ImputedVariantModel]:
         "is_intercept_only": grp["is_intercept_only"][:].tolist(),
     }
     if "residual_variance" in grp:
-        imp_cols["residual_variance"] = grp["residual_variance"][:].tolist()
+        cols["residual_variance"] = grp["residual_variance"][:].tolist()
+    return cols
 
+
+def _hdf5_coef_cols(coef_grp: h5py.Group) -> Dict[str, List[Any]]:
+    """Read the sparse ``coefficients`` HDF5 group into a plain column dict,
+    including the per-predictor allele metadata when present (schema v2)."""
     coef_cols: Dict[str, List[Any]] = {
         "target_variant_id": [
             v.decode("utf-8") for v in coef_grp["target_variant_id"][:]
@@ -280,8 +302,20 @@ def _load_imputed_models_hdf5(f: h5py.File) -> List[ImputedVariantModel]:
         coef_cols["predictor_allele_frequency"] = coef_grp[
             "predictor_allele_frequency"
         ][:].tolist()
+    return coef_cols
 
-    return _rebuild_imputed_models(imp_cols, coef_cols)
+
+def _load_imputed_models_hdf5(f: h5py.File) -> List[ImputedVariantModel]:
+    """Load imputed variant models from HDF5 file.
+
+    Reads the sparse ``coefficients`` group, including the per-predictor allele
+    metadata datasets when present (schema v2); v1 files without them reconstruct
+    with empty predictor metadata.
+    """
+    return _rebuild_imputed_models(
+        _hdf5_model_cols(f["imputed_variants"]),
+        _hdf5_coef_cols(f["coefficients"]),
+    )
 
 
 def _load_calibration_params_hdf5(f: h5py.File) -> Optional[CalibrationParams]:
@@ -366,6 +400,13 @@ def load_model_hdf5(
 
         observed_variants = _load_observed_variants_hdf5(f)
         imputed_models = _load_imputed_models_hdf5(f)
+        # Attach observed fallbacks (P1.8) when present (optional group).
+        if "observed_fallbacks" in f:
+            _attach_observed_fallbacks(
+                observed_variants,
+                _hdf5_model_cols(f["observed_fallbacks"]),
+                _hdf5_coef_cols(f["coefficients"]),
+            )
         calibration_params = _load_calibration_params_hdf5(f)
         evaluation_metrics = _load_evaluation_metrics_hdf5(f)
         metadata = _load_metadata_hdf5(f)
@@ -397,10 +438,18 @@ def _assemble_from_tables(tables: Dict[str, pa.Table]) -> ModelComponents:
     Shared by the Arrow IPC and Parquet readers (identical table layout).
     """
     observed = _rebuild_observed_variants(_columns_dict(tables["observed_variants"]))
+    coef_cols = _columns_dict(tables["coefficients"])
     imputed = _rebuild_imputed_models(
         _columns_dict(tables["imputed_variants"]),
-        _columns_dict(tables["coefficients"]),
+        coef_cols,
     )
+    # Attach observed fallbacks (P1.8) when the optional table is present.
+    if "observed_fallbacks" in tables:
+        _attach_observed_fallbacks(
+            observed,
+            _columns_dict(tables["observed_fallbacks"]),
+            coef_cols,
+        )
 
     meta_cols = _columns_dict(tables["metadata"])
     metadata: Dict[str, Any] = {
@@ -479,6 +528,11 @@ def load_model_parquet(path: Union[str, Path]) -> ModelComponents:
             raise FileNotFoundError(f"Missing Parquet table: {file_path}")
         tables[name] = pq.read_table(file_path)
 
+    # Optional observed-fallback table (P1.8); absent in pre-P1.8 exports.
+    fallback_path = path / "observed_fallbacks.parquet"
+    if fallback_path.exists():
+        tables["observed_fallbacks"] = pq.read_table(fallback_path)
+
     return _assemble_from_tables(tables)
 
 
@@ -507,6 +561,11 @@ def load_model_csv(path: Union[str, Path]) -> ModelComponents:
 
     obs_df = variants[variants["status"] == "observed"]
     imp_df = variants[variants["status"].isin(["imputed", "intercept_only"])]
+    fb_df = variants[
+        variants["status"].isin(
+            ["observed_fallback", "observed_fallback_intercept_only"]
+        )
+    ]
 
     observed = _rebuild_observed_variants(
         {col: obs_df[col].tolist() for col in obs_df.columns}
@@ -530,4 +589,17 @@ def load_model_csv(path: Union[str, Path]) -> ModelComponents:
         coef_cols = {col: [] for col in COEFFICIENTS_COLUMNS}
 
     imputed = _rebuild_imputed_models(imp_cols, coef_cols)
+
+    # Attach observed fallbacks (P1.8) from their dedicated status rows; their
+    # predictors share the companion coefficients table (keyed by target id).
+    if not fb_df.empty:
+        fb_cols: Dict[str, List[Any]] = {
+            col: fb_df[col].tolist() for col in fb_df.columns
+        }
+        fb_cols["is_intercept_only"] = [
+            s == "observed_fallback_intercept_only"
+            for s in fb_df["status"].tolist()
+        ]
+        _attach_observed_fallbacks(observed, fb_cols, coef_cols)
+
     return observed, imputed, None, None, {}

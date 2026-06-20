@@ -59,7 +59,8 @@
         "other_allele": { "type": "string", "minLength": 1 },
         "beta": { "type": "number" },
         "accepted_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-        "ambiguous": { "type": "boolean" }
+        "ambiguous": { "type": "boolean" },
+        "fallback": { "anyOf": [ { "$ref": "#/$defs/imputedVariant" }, { "type": "null" } ] }
       }
     },
     "imputedVariant": {
