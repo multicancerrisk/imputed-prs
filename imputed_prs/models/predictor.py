@@ -18,7 +18,11 @@ from imputed_prs.core.types import (
     VariantIdentity,
     VariantInfo,
 )
-from imputed_prs.io.user_genotypes import RawUserGenotypeCollection, count_allele
+from imputed_prs.io.user_genotypes import (
+    RawUserGenotypeCollection,
+    count_allele,
+    resolve_counted_dosage,
+)
 from imputed_prs.models.bounding import clip_and_adjust_variance
 
 
@@ -227,6 +231,92 @@ def compute_imputed_prs(
     return total_prs, total_variance, n_imputed, n_truncated
 
 
+def compute_imputed_prs_oriented(
+    raw_genotypes: RawUserGenotypeCollection,
+    imputed_models: List[ImputedVariantModel],
+    *,
+    allow_ambiguous: bool,
+    allow_strand_flip: bool = True,
+) -> Tuple[float, float, int, int]:
+    """Allele-aware PRS contribution from imputed variants, from raw genotypes.
+
+    The browser/upload counterpart to :func:`compute_imputed_prs`. Each predictor
+    dosage is counted allele-aware — copies of the stored ALT allele
+    (``predictor_counted_alleles[i]``, the allele the reference ``Z`` column was
+    built from) — instead of read from an allele-blind homozygosity dosage dict,
+    so a ``"GG"`` call no longer contributes 2 when ``G`` is the other (REF)
+    allele. A predictor that is missing or unresolvable is mean-substituted with
+    ``2 * AF`` per predictor, bringing imputation in line with the projection
+    scorer (the legacy scorer instead collapsed the whole model to its intercept
+    if *any* single predictor was missing). Uncertainty is unchanged from
+    :func:`compute_imputed_prs` (full-model ``residual_variance``);
+    missingness-aware inflation is deferred to P3.3.
+
+    This is the canonical imputed-scoring path for real uploads; the legacy
+    :func:`compute_imputed_prs` (dosage-dict, allele-blind) is retained only for
+    the evaluator / back-compat path until P1.6.
+
+    Args:
+        raw_genotypes: User genotypes as a multi-key resolvable collection.
+        imputed_models: Imputation models carrying P1.3 predictor allele metadata
+            (counted/other alleles + allele frequencies), index-aligned with
+            ``coefficients``/``predictor_variant_ids``.
+        allow_ambiguous: Whether palindromic predictor loci may be counted. The
+            orchestrator passes ``True`` so palindromic predictors are counted
+            (not mean-substituted), matching the oriented reference computation.
+        allow_strand_flip: Whether to retry on the complementary strand.
+
+    Returns:
+        Tuple of (prs_imputed, total_variance, n_imputed, n_truncated), matching
+        the shape of :func:`compute_imputed_prs`.
+    """
+    total_prs = 0.0
+    total_variance = 0.0
+    n_imputed = 0
+    n_truncated = 0
+
+    for model in imputed_models:
+        if model.is_intercept_only:
+            raw_prediction = model.intercept
+        else:
+            # Count each predictor's ALT-allele dosage; mean-substitute (2*AF)
+            # any predictor that is missing or unresolvable.
+            predictor_dosages = []
+            for i, pred_id in enumerate(model.predictor_variant_ids):
+                dosage = resolve_counted_dosage(
+                    raw_genotypes,
+                    variant_id=pred_id,
+                    chromosome=model.predictor_chromosomes[i],
+                    position=model.predictor_positions[i],
+                    counted_allele=model.predictor_counted_alleles[i],
+                    other_allele=model.predictor_other_alleles[i],
+                    allow_ambiguous=allow_ambiguous,
+                    allow_strand_flip=allow_strand_flip,
+                )
+                if dosage is None:
+                    dosage = 2.0 * model.predictor_allele_frequencies[i]
+                predictor_dosages.append(dosage)
+
+            predictor_array = np.array(predictor_dosages)
+            raw_prediction = (
+                np.dot(predictor_array, model.coefficients) + model.intercept
+            )
+
+        # Apply clipping and variance adjustment (target is a dosage in [0, 2]).
+        clipped_dosage, adjusted_variance = clip_and_adjust_variance(
+            raw_prediction, model.residual_variance
+        )
+
+        if clipped_dosage != raw_prediction:
+            n_truncated += 1
+
+        total_prs += clipped_dosage * model.beta
+        total_variance += (model.beta ** 2) * adjusted_variance
+        n_imputed += 1
+
+    return total_prs, total_variance, n_imputed, n_truncated
+
+
 class PRSPredictor:
     """Full PRS prediction combining observed and imputed components.
 
@@ -321,10 +411,24 @@ class PRSPredictor:
                 user_genotypes, self.observed_variants
             )
 
-        # Step 2: Compute imputed component
-        prs_imputed, total_variance, n_imputed, n_truncated = compute_imputed_prs(
-            user_genotypes, self.imputed_models
-        )
+        # Step 2: Compute imputed component. With raw genotype strings, orient
+        # predictor inputs allele-aware; otherwise the legacy allele-blind scorer.
+        if raw_genotypes is not None:
+            (
+                prs_imputed,
+                total_variance,
+                n_imputed,
+                n_truncated,
+            ) = compute_imputed_prs_oriented(
+                raw_genotypes,
+                self.imputed_models,
+                allow_ambiguous=self.allow_ambiguous,
+                allow_strand_flip=self.allow_strand_flip,
+            )
+        else:
+            prs_imputed, total_variance, n_imputed, n_truncated = compute_imputed_prs(
+                user_genotypes, self.imputed_models
+            )
 
         # Step 3: Combine components
         prs_raw = prs_observed + prs_imputed

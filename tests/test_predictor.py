@@ -13,6 +13,7 @@ from imputed_prs.models.predictor import (
     ObservedScore,
     PRSPredictor,
     compute_imputed_prs,
+    compute_imputed_prs_oriented,
     compute_observed_prs,
     compute_observed_prs_oriented,
 )
@@ -29,6 +30,79 @@ def _collection(rows):
         }
     )
     return load_raw_user_genotypes(df)
+
+
+def _render_genotype(ref: str, alt: str, alt_dosage: int) -> str:
+    """Render an integer ALT dosage to a genotype string (inverse of counting ALT).
+
+    ``alt_dosage`` copies of ALT plus ``2 - alt_dosage`` copies of REF, e.g.
+    ``("G", "A", 1) -> "AG"``. Used to render reference ALT dosages to the raw
+    genotype strings the oriented scorer consumes.
+    """
+    return alt * alt_dosage + ref * (2 - alt_dosage)
+
+
+def _imputed_model(
+    variant_id="rs_target",
+    chromosome="1",
+    position=5000,
+    effect_allele="A",
+    other_allele="G",
+    beta=0.05,
+    allele_frequency=0.3,
+    imputation_r2=0.8,
+    residual_variance=0.1,
+    intercept=0.6,
+    predictor_variant_ids=None,
+    coefficients=None,
+    is_intercept_only=False,
+    predictor_chromosomes=None,
+    predictor_positions=None,
+    predictor_counted_alleles=None,
+    predictor_other_alleles=None,
+    predictor_allele_frequencies=None,
+):
+    """Build an ImputedVariantModel carrying P1.3 predictor allele metadata.
+
+    Metadata defaults are length-aligned to ``predictor_variant_ids`` so the
+    oriented scorer can resolve every predictor; override per-test to control
+    orientation (counted = ALT, other = REF).
+    """
+    if predictor_variant_ids is None:
+        predictor_variant_ids = ["rs_p0", "rs_p1"]
+    n = len(predictor_variant_ids)
+    if coefficients is None:
+        coefficients = np.full(n, 0.2)
+    if predictor_chromosomes is None:
+        predictor_chromosomes = [chromosome] * n
+    if predictor_positions is None:
+        predictor_positions = [1000 + 100 * i for i in range(n)]
+    if predictor_counted_alleles is None:
+        predictor_counted_alleles = ["A"] * n
+    if predictor_other_alleles is None:
+        predictor_other_alleles = ["G"] * n
+    if predictor_allele_frequencies is None:
+        predictor_allele_frequencies = np.full(n, allele_frequency)
+    return ImputedVariantModel(
+        variant_id=variant_id,
+        chromosome=chromosome,
+        position=position,
+        effect_allele=effect_allele,
+        other_allele=other_allele,
+        beta=beta,
+        allele_frequency=allele_frequency,
+        imputation_r2=imputation_r2,
+        residual_variance=residual_variance,
+        intercept=intercept,
+        predictor_variant_ids=predictor_variant_ids,
+        coefficients=coefficients,
+        is_intercept_only=is_intercept_only,
+        predictor_chromosomes=predictor_chromosomes,
+        predictor_positions=predictor_positions,
+        predictor_counted_alleles=predictor_counted_alleles,
+        predictor_other_alleles=predictor_other_alleles,
+        predictor_allele_frequencies=predictor_allele_frequencies,
+    )
 
 
 class TestComputeObservedPrsOriented:
@@ -607,6 +681,201 @@ class TestComputeImputedPrs:
         assert n_imputed == 1
 
 
+class TestComputeImputedPrsOriented:
+    """Allele-aware imputed scoring (P1.4): counts predictor ALT alleles."""
+
+    def test_full_predictor_set_matches_reference_dot_product(self):
+        """Genotype-string scoring equals the oriented reference ALT-dosage dot product."""
+        # Three non-palindromic predictors; reference ALT dosages [2, 1, 0].
+        model = _imputed_model(
+            beta=0.05,
+            intercept=0.1,
+            residual_variance=0.05,
+            predictor_variant_ids=["rs_p0", "rs_p1", "rs_p2"],
+            coefficients=np.array([0.3, -0.2, 0.15]),
+            predictor_chromosomes=["1", "1", "1"],
+            predictor_positions=[1000, 1100, 1200],
+            predictor_counted_alleles=["A", "C", "T"],  # ALT
+            predictor_other_alleles=["G", "T", "C"],  # REF
+            predictor_allele_frequencies=np.array([0.3, 0.4, 0.25]),
+        )
+        coll = _collection(
+            [
+                ("rs_p0", "1", 1000, _render_genotype("G", "A", 2)),  # "AA" -> 2
+                ("rs_p1", "1", 1100, _render_genotype("T", "C", 1)),  # "CT" -> 1
+                ("rs_p2", "1", 1200, _render_genotype("C", "T", 0)),  # "CC" -> 0
+            ]
+        )
+        prs, variance, n_imputed, n_truncated = compute_imputed_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        # raw = 2*0.3 + 1*(-0.2) + 0*0.15 + 0.1 = 0.5 (within [0, 2], no clipping).
+        expected_prs = 0.5 * 0.05
+        np.testing.assert_allclose(prs, expected_prs, rtol=0, atol=1e-12)
+        assert n_imputed == 1
+        assert n_truncated == 0
+        assert variance > 0
+
+    def test_alt_ref_orientation_bugfix(self):
+        """A 'GG' call with ALT=A counts 0 copies, not homozygous 2 (the bug)."""
+        model = _imputed_model(
+            beta=1.0,
+            intercept=0.0,
+            residual_variance=0.0,
+            predictor_variant_ids=["rs_p0"],
+            coefficients=np.array([1.0]),
+            predictor_chromosomes=["1"],
+            predictor_positions=[1000],
+            predictor_counted_alleles=["A"],
+            predictor_other_alleles=["G"],
+            predictor_allele_frequencies=np.array([0.1]),
+        )
+        coll = _collection([("rs_p0", "1", 1000, "GG")])
+        prs, _, n_imputed, _ = compute_imputed_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        # Oriented: 0 copies of ALT A -> raw 0 -> prs 0.
+        np.testing.assert_allclose(prs, 0.0, rtol=0, atol=1e-12)
+        assert n_imputed == 1
+        # Contrast: the allele-blind dosage-dict path counts "GG" homozygous -> 2.
+        blind_prs, _, _, _ = compute_imputed_prs({"rs_p0": 2.0}, [model])
+        np.testing.assert_allclose(blind_prs, 2.0, rtol=0, atol=1e-12)
+
+    def test_missing_predictor_mean_substitution(self):
+        """A missing predictor uses 2*AF; the model does NOT collapse to intercept."""
+        model = _imputed_model(
+            beta=0.1,
+            intercept=0.2,
+            residual_variance=0.05,
+            predictor_variant_ids=["rs_p0", "rs_p1"],
+            coefficients=np.array([0.5, -0.3]),
+            predictor_chromosomes=["1", "1"],
+            predictor_positions=[1000, 1100],
+            predictor_counted_alleles=["A", "C"],
+            predictor_other_alleles=["G", "T"],
+            predictor_allele_frequencies=np.array([0.3, 0.4]),
+        )
+        # rs_p0 present (dosage 2 -> "AA"); rs_p1 omitted -> 2*0.4 = 0.8.
+        coll = _collection([("rs_p0", "1", 1000, "AA")])
+        prs, _, n_imputed, n_truncated = compute_imputed_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        # raw = 2*0.5 + 0.8*(-0.3) + 0.2 = 0.96  (NOT the intercept fallback 0.2*0.1).
+        np.testing.assert_allclose(prs, 0.96 * 0.1, rtol=0, atol=1e-12)
+        assert n_imputed == 1
+        assert n_truncated == 0
+
+    def test_unresolved_predictor_substitutes(self):
+        """A duplicate-conflict locus is unresolved and mean-substituted, not guessed."""
+        model = _imputed_model(
+            beta=0.1,
+            intercept=0.2,
+            residual_variance=0.05,
+            predictor_variant_ids=["rs_p0"],
+            coefficients=np.array([0.5]),
+            predictor_chromosomes=["1"],
+            predictor_positions=[1000],
+            predictor_counted_alleles=["A"],
+            predictor_other_alleles=["G"],
+            predictor_allele_frequencies=np.array([0.3]),
+        )
+        # Two conflicting genotype calls at the same locus -> duplicate_conflict.
+        coll = _collection(
+            [("rs_p0", "1", 1000, "AA"), ("rs_p0", "1", 1000, "GG")]
+        )
+        prs, _, _, _ = compute_imputed_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        # Unresolved -> 2*0.3 = 0.6: raw = 0.6*0.5 + 0.2 = 0.5.
+        np.testing.assert_allclose(prs, 0.5 * 0.1, rtol=0, atol=1e-12)
+
+    def test_palindromic_predictor_counted_when_allow_ambiguous(self):
+        """A palindromic (A/T) predictor is counted with allow_ambiguous, else substituted."""
+        model = _imputed_model(
+            beta=0.1,
+            intercept=0.0,
+            residual_variance=0.0,
+            predictor_variant_ids=["rs_p0"],
+            coefficients=np.array([1.0]),
+            predictor_chromosomes=["1"],
+            predictor_positions=[1000],
+            predictor_counted_alleles=["A"],
+            predictor_other_alleles=["T"],  # A/T palindrome
+            predictor_allele_frequencies=np.array([0.2]),
+        )
+        coll = _collection([("rs_p0", "1", 1000, "AA")])
+        # allow_ambiguous=True: counted -> 2 copies -> prs = 2*1.0*0.1 = 0.2.
+        prs, _, _, _ = compute_imputed_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        np.testing.assert_allclose(prs, 0.2, rtol=0, atol=1e-12)
+        # allow_ambiguous=False: palindrome unresolved -> 2*0.2 = 0.4 -> prs = 0.04.
+        prs_blocked, _, _, _ = compute_imputed_prs_oriented(
+            coll, [model], allow_ambiguous=False
+        )
+        np.testing.assert_allclose(prs_blocked, 0.04, rtol=0, atol=1e-12)
+
+    def test_clipping_applies_to_raw_prediction(self):
+        """The imputed dosage is clipped to [0, 2] before * beta, with truncation count."""
+        model = _imputed_model(
+            beta=0.1,
+            intercept=1.0,
+            residual_variance=0.1,
+            predictor_variant_ids=["rs_p0"],
+            coefficients=np.array([2.0]),
+            predictor_chromosomes=["1"],
+            predictor_positions=[1000],
+            predictor_counted_alleles=["A"],
+            predictor_other_alleles=["G"],
+            predictor_allele_frequencies=np.array([0.3]),
+        )
+        coll = _collection([("rs_p0", "1", 1000, "AA")])  # dosage 2
+        prs, _, _, n_truncated = compute_imputed_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        # raw = 2*2.0 + 1.0 = 5.0 -> clipped to 2.0 -> prs = 2.0 * 0.1 = 0.2.
+        np.testing.assert_allclose(prs, 0.2, rtol=0, atol=1e-12)
+        assert n_truncated == 1
+
+    def test_heterozygote_order_invariant(self):
+        """'AG' and 'GA' both count one copy of the ALT allele."""
+        model = _imputed_model(
+            beta=0.1,
+            intercept=0.0,
+            residual_variance=0.0,
+            predictor_variant_ids=["rs_p0"],
+            coefficients=np.array([1.0]),
+            predictor_chromosomes=["1"],
+            predictor_positions=[1000],
+            predictor_counted_alleles=["A"],
+            predictor_other_alleles=["G"],
+            predictor_allele_frequencies=np.array([0.3]),
+        )
+        for geno in ("AG", "GA"):
+            coll = _collection([("rs_p0", "1", 1000, geno)])
+            prs, _, _, _ = compute_imputed_prs_oriented(
+                coll, [model], allow_ambiguous=True
+            )
+            np.testing.assert_allclose(prs, 0.1, rtol=0, atol=1e-12)
+
+    def test_intercept_only_unchanged(self):
+        """An intercept-only model scores its intercept and reads no metadata."""
+        model = _imputed_model(
+            beta=0.1,
+            intercept=0.8,
+            is_intercept_only=True,
+            predictor_variant_ids=[],
+            coefficients=np.array([]),
+        )
+        coll = _collection([("rs_x", "1", 999, "AA")])  # irrelevant
+        prs, _, n_imputed, n_truncated = compute_imputed_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        np.testing.assert_allclose(prs, 0.08, rtol=0, atol=1e-12)
+        assert n_imputed == 1
+        assert n_truncated == 0
+
+
 class TestPRSPredictor:
     """Tests for PRSPredictor class."""
 
@@ -699,25 +968,45 @@ class TestPRSPredictor:
         assert abs(result.prs - 0.47) < 1e-10
 
     def test_oriented_observed_via_raw_genotypes(self):
-        """raw_genotypes routes observed scoring through the allele-aware path."""
+        """raw_genotypes routes observed AND predictor scoring through the oriented path."""
         observed = self._create_observed_variants()  # rs1=(A,G,0.1), rs2=(C,T,0.2)
-        imputed = [self._create_imputed_model()]
+        # Distinct predictor loci (rs10, rs11) so the observed and predictor roles do
+        # not collide; metadata + rendered collection reproduce predictor dosages 2, 1.
+        imputed = [
+            _imputed_model(
+                variant_id="rs3",
+                beta=0.05,
+                intercept=0.6,
+                residual_variance=0.1,
+                predictor_variant_ids=["rs10", "rs11"],
+                coefficients=np.array([0.3, 0.2]),
+                predictor_chromosomes=["1", "1"],
+                predictor_positions=[1000, 1100],
+                predictor_counted_alleles=["A", "C"],
+                predictor_other_alleles=["G", "T"],
+                predictor_allele_frequencies=np.array([0.3, 0.3]),
+            )
+        ]
         predictor = PRSPredictor(observed, imputed)
 
-        # Imputed component still reads the legacy dosage dict (unchanged in P1.2).
-        user_dosages = {"rs1": 2.0, "rs2": 1.0}
-        # Observed scored from strings: rs1 "GG" -> 0 copies of effect A (NOT 2),
-        # rs2 "CC" -> 2 copies of effect C.
-        coll = _collection([("rs1", "1", 100, "GG"), ("rs2", "1", 200, "CC")])
-        result = predictor.predict(
-            user_dosages, apply_calibration=False, raw_genotypes=coll
+        # With raw_genotypes the dosage dict is ignored; everything is scored from
+        # strings: observed rs1 "GG" -> 0 copies of effect A, rs2 "CC" -> 2 copies of
+        # effect C; predictors rs10 "AA" -> 2 copies of ALT A, rs11 "CT" -> 1 copy of C.
+        coll = _collection(
+            [
+                ("rs1", "1", 100, "GG"),
+                ("rs2", "1", 200, "CC"),
+                ("rs10", "1", 1000, "AA"),
+                ("rs11", "1", 1100, "CT"),
+            ]
         )
+        result = predictor.predict({}, apply_calibration=False, raw_genotypes=coll)
 
         # Oriented observed = 0*0.1 + 2*0.2 = 0.4 (allele-blind would give 0.6).
         np.testing.assert_allclose(
             result.prs_observed_component, 0.4, rtol=0, atol=1e-12
         )
-        # Imputed component identical to the dosage-dict baseline (1.4 * 0.05).
+        # Oriented imputed raw = 2*0.3 + 1*0.2 + 0.6 = 1.4 -> 1.4 * 0.05 = 0.07.
         np.testing.assert_allclose(
             result.prs_imputed_component, 0.07, rtol=0, atol=1e-12
         )
@@ -725,6 +1014,36 @@ class TestPRSPredictor:
         assert result.n_observed_scored_direct == 2
         assert result.unresolved_observed_ids == ()
         assert result.n_variants_used == 3
+
+    def test_predict_imputed_via_raw_genotypes_matches_oriented(self):
+        """predict() routes the imputed component through the oriented scorer."""
+        # A 'GG' predictor with ALT=A: oriented counts 0; the blind dict counts 2.
+        imputed = [
+            _imputed_model(
+                variant_id="rs_t",
+                beta=0.1,
+                intercept=0.0,
+                residual_variance=0.0,
+                predictor_variant_ids=["rs_p0"],
+                coefficients=np.array([1.0]),
+                predictor_chromosomes=["1"],
+                predictor_positions=[1000],
+                predictor_counted_alleles=["A"],
+                predictor_other_alleles=["G"],
+                predictor_allele_frequencies=np.array([0.1]),
+            )
+        ]
+        predictor = PRSPredictor([], imputed)
+        coll = _collection([("rs_p0", "1", 1000, "GG")])
+        result = predictor.predict({}, apply_calibration=False, raw_genotypes=coll)
+        np.testing.assert_allclose(
+            result.prs_imputed_component, 0.0, rtol=0, atol=1e-12
+        )
+        # The legacy dosage-dict path (no raw_genotypes) counts "GG" homozygous -> 2.
+        blind = predictor.predict({"rs_p0": 2.0}, apply_calibration=False)
+        np.testing.assert_allclose(
+            blind.prs_imputed_component, 0.2, rtol=0, atol=1e-12
+        )
 
     def test_all_observed_variants_no_imputation(self):
         """All observed variants, no imputation needed."""

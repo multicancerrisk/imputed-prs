@@ -10,7 +10,10 @@ from imputed_prs.core.types import (
     ProjectionRegionModel,
     VariantInfo,
 )
-from imputed_prs.io.user_genotypes import RawUserGenotypeCollection
+from imputed_prs.io.user_genotypes import (
+    RawUserGenotypeCollection,
+    resolve_counted_dosage,
+)
 from imputed_prs.models.predictor import (
     compute_observed_prs,
     compute_observed_prs_oriented,
@@ -53,6 +56,84 @@ def compute_projected_prs(
             predictor_dosages = []
             for i, pred_id in enumerate(model.predictor_variant_ids):
                 dosage = user_dosages.get(pred_id)
+                if dosage is None:
+                    dosage = 2.0 * model.predictor_allele_frequencies[i]
+                    n_predictors_substituted += 1
+                predictor_dosages.append(dosage)
+
+            predictor_array = np.array(predictor_dosages)
+            prediction = np.dot(predictor_array, model.coefficients) + model.intercept
+
+        total_prs += prediction
+        total_variance += model.cv_mse
+        n_regions_used += 1
+
+    return (total_prs, total_variance, n_regions_used, n_predictors_substituted)
+
+
+def compute_projected_prs_oriented(
+    raw_genotypes: RawUserGenotypeCollection,
+    region_models: List[ProjectionRegionModel],
+    *,
+    allow_ambiguous: bool,
+    allow_strand_flip: bool = True,
+) -> Tuple[float, float, int, int]:
+    """Allele-aware PRS contribution from projection regions, from raw genotypes.
+
+    The browser/upload counterpart to :func:`compute_projected_prs`. Each region
+    predictor dosage is counted allele-aware — copies of the stored ALT allele
+    (``predictor_counted_alleles[i]``, the allele the reference ``Z`` column was
+    built from) — instead of read from an allele-blind homozygosity dosage dict,
+    so a ``"GG"`` call no longer contributes 2 when ``G`` is the other (REF)
+    allele. A predictor that is missing or unresolvable is mean-substituted with
+    ``2 * AF`` (population mean dosage), exactly as :func:`compute_projected_prs`
+    already does for missing ids. No dosage clipping (the target is a PRS
+    contribution, not a dosage).
+
+    This is the canonical projected-scoring path for real uploads; the legacy
+    :func:`compute_projected_prs` (dosage-dict, allele-blind) is retained only for
+    the evaluator / back-compat path until P1.6.
+
+    Args:
+        raw_genotypes: User genotypes as a multi-key resolvable collection.
+        region_models: Region models carrying P1.3 predictor allele metadata
+            (counted/other alleles + allele frequencies), index-aligned with
+            ``coefficients``/``predictor_variant_ids``.
+        allow_ambiguous: Whether palindromic predictor loci may be counted. The
+            orchestrator passes ``True`` so palindromic predictors are counted
+            (not mean-substituted), matching the oriented reference computation.
+        allow_strand_flip: Whether to retry on the complementary strand.
+
+    Returns:
+        Tuple of (prs_projected, total_variance, n_regions_used,
+        n_predictors_substituted), matching :func:`compute_projected_prs`.
+    """
+    if not region_models:
+        return (0.0, 0.0, 0, 0)
+
+    total_prs = 0.0
+    total_variance = 0.0
+    n_regions_used = 0
+    n_predictors_substituted = 0
+
+    for model in region_models:
+        if model.is_intercept_only:
+            prediction = model.intercept
+        else:
+            # Count each predictor's ALT-allele dosage, substituting 2*AF for any
+            # missing or unresolvable predictor.
+            predictor_dosages = []
+            for i, pred_id in enumerate(model.predictor_variant_ids):
+                dosage = resolve_counted_dosage(
+                    raw_genotypes,
+                    variant_id=pred_id,
+                    chromosome=model.predictor_chromosomes[i],
+                    position=model.predictor_positions[i],
+                    counted_allele=model.predictor_counted_alleles[i],
+                    other_allele=model.predictor_other_alleles[i],
+                    allow_ambiguous=allow_ambiguous,
+                    allow_strand_flip=allow_strand_flip,
+                )
                 if dosage is None:
                     dosage = 2.0 * model.predictor_allele_frequencies[i]
                     n_predictors_substituted += 1
@@ -157,10 +238,24 @@ class ProjectionPredictor:
                 user_genotypes, self.observed_variants
             )
 
-        # Step 2: Compute projected component
-        prs_projected, total_variance, n_regions_used, _ = compute_projected_prs(
-            user_genotypes, self.region_models
-        )
+        # Step 2: Compute projected component. With raw genotype strings, orient
+        # predictor inputs allele-aware; otherwise the legacy allele-blind scorer.
+        if raw_genotypes is not None:
+            (
+                prs_projected,
+                total_variance,
+                n_regions_used,
+                _,
+            ) = compute_projected_prs_oriented(
+                raw_genotypes,
+                self.region_models,
+                allow_ambiguous=self.allow_ambiguous,
+                allow_strand_flip=self.allow_strand_flip,
+            )
+        else:
+            prs_projected, total_variance, n_regions_used, _ = compute_projected_prs(
+                user_genotypes, self.region_models
+            )
 
         # Step 3: Combine components
         prs_raw = prs_observed + prs_projected

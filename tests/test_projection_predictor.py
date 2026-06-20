@@ -14,6 +14,7 @@ from imputed_prs.io.user_genotypes import load_raw_user_genotypes
 from imputed_prs.models.projection_predictor import (
     ProjectionPredictor,
     compute_projected_prs,
+    compute_projected_prs_oriented,
 )
 
 
@@ -28,6 +29,15 @@ def _collection(rows):
         }
     )
     return load_raw_user_genotypes(df)
+
+
+def _render_genotype(ref: str, alt: str, alt_dosage: int) -> str:
+    """Render an integer ALT dosage to a genotype string (inverse of counting ALT).
+
+    ``alt_dosage`` copies of ALT plus ``2 - alt_dosage`` copies of REF, e.g.
+    ``("G", "A", 1) -> "AG"``.
+    """
+    return alt * alt_dosage + ref * (2 - alt_dosage)
 
 
 def _make_region_model(
@@ -45,8 +55,17 @@ def _make_region_model(
     is_intercept_only=False,
     mean_prs_contribution=0.5,
     predictor_allele_frequencies=None,
+    predictor_chromosomes=None,
+    predictor_positions=None,
+    predictor_counted_alleles=None,
+    predictor_other_alleles=None,
 ):
-    """Helper to create a ProjectionRegionModel with sensible defaults."""
+    """Helper to create a ProjectionRegionModel with sensible defaults.
+
+    P1.3 predictor allele metadata defaults are length-aligned to
+    ``predictor_variant_ids`` (counted = ALT, other = REF) so the oriented scorer
+    can resolve every predictor; override per-test to control orientation.
+    """
     if prs_variant_ids is None:
         prs_variant_ids = ["rs2000"]
     if betas is None:
@@ -57,6 +76,15 @@ def _make_region_model(
         coefficients = np.array([0.2, -0.1, 0.15])
     if predictor_allele_frequencies is None:
         predictor_allele_frequencies = np.array([0.3, 0.4, 0.25])
+    n = len(predictor_variant_ids)
+    if predictor_chromosomes is None:
+        predictor_chromosomes = [chromosome] * n
+    if predictor_positions is None:
+        predictor_positions = [start + 1000 * (i + 1) for i in range(n)]
+    if predictor_counted_alleles is None:
+        predictor_counted_alleles = ["A"] * n
+    if predictor_other_alleles is None:
+        predictor_other_alleles = ["G"] * n
     return ProjectionRegionModel(
         region_id=region_id,
         chromosome=chromosome,
@@ -72,6 +100,10 @@ def _make_region_model(
         is_intercept_only=is_intercept_only,
         mean_prs_contribution=mean_prs_contribution,
         predictor_allele_frequencies=predictor_allele_frequencies,
+        predictor_chromosomes=predictor_chromosomes,
+        predictor_positions=predictor_positions,
+        predictor_counted_alleles=predictor_counted_alleles,
+        predictor_other_alleles=predictor_other_alleles,
     )
 
 
@@ -256,6 +288,144 @@ class TestComputeProjectedPrs:
         assert variance == pytest.approx(0.01 + 0.02 + 0.03)
 
 
+class TestComputeProjectedPrsOriented:
+    """Allele-aware projected scoring (P1.4): counts predictor ALT alleles, no clip."""
+
+    def test_full_predictor_set_matches_reference_dot_product(self):
+        """Genotype-string scoring equals the oriented reference ALT-dosage dot product."""
+        model = _make_region_model(
+            predictor_variant_ids=["rs_p0", "rs_p1", "rs_p2"],
+            coefficients=np.array([0.2, -0.1, 0.15]),
+            intercept=0.05,
+            cv_mse=0.02,
+            predictor_allele_frequencies=np.array([0.3, 0.4, 0.25]),
+            predictor_chromosomes=["1", "1", "1"],
+            predictor_positions=[1_000_001, 1_000_002, 1_000_003],
+            predictor_counted_alleles=["A", "C", "T"],  # ALT
+            predictor_other_alleles=["G", "T", "C"],  # REF
+        )
+        # Reference ALT dosages [2, 1, 0].
+        coll = _collection(
+            [
+                ("rs_p0", "1", 1_000_001, _render_genotype("G", "A", 2)),  # "AA"
+                ("rs_p1", "1", 1_000_002, _render_genotype("T", "C", 1)),  # "CT"
+                ("rs_p2", "1", 1_000_003, _render_genotype("C", "T", 0)),  # "CC"
+            ]
+        )
+        prs, variance, n_regions, n_sub = compute_projected_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        # 2*0.2 + 1*(-0.1) + 0*0.15 + 0.05 = 0.35 (no clipping on the projection path).
+        np.testing.assert_allclose(prs, 0.35, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(variance, 0.02, rtol=0, atol=1e-12)
+        assert n_regions == 1
+        assert n_sub == 0
+
+    def test_alt_ref_orientation_bugfix(self):
+        """A 'GG' call with ALT=A counts 0 copies, not homozygous 2 (the bug)."""
+        model = _make_region_model(
+            predictor_variant_ids=["rs_p0"],
+            coefficients=np.array([1.0]),
+            intercept=0.0,
+            cv_mse=0.01,
+            predictor_allele_frequencies=np.array([0.1]),
+            predictor_chromosomes=["1"],
+            predictor_positions=[1_000_001],
+            predictor_counted_alleles=["A"],
+            predictor_other_alleles=["G"],
+        )
+        coll = _collection([("rs_p0", "1", 1_000_001, "GG")])
+        prs, _, _, n_sub = compute_projected_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        np.testing.assert_allclose(prs, 0.0, rtol=0, atol=1e-12)
+        assert n_sub == 0  # resolved to 0 copies, not substituted
+        # Contrast: the allele-blind dosage-dict path counts "GG" homozygous -> 2.
+        blind, _, _, _ = compute_projected_prs({"rs_p0": 2.0}, [model])
+        np.testing.assert_allclose(blind, 2.0, rtol=0, atol=1e-12)
+
+    def test_missing_predictor_mean_substitution(self):
+        """A missing predictor is substituted with 2*AF and counted in n_substituted."""
+        model = _make_region_model(
+            predictor_variant_ids=["rs_p0", "rs_p1"],
+            coefficients=np.array([0.5, -0.2]),
+            intercept=0.1,
+            cv_mse=0.01,
+            predictor_allele_frequencies=np.array([0.3, 0.4]),
+            predictor_chromosomes=["1", "1"],
+            predictor_positions=[1_000_001, 1_000_002],
+            predictor_counted_alleles=["A", "C"],
+            predictor_other_alleles=["G", "T"],
+        )
+        # rs_p0 present (dosage 2 -> "AA"); rs_p1 omitted -> 2*0.4 = 0.8.
+        coll = _collection([("rs_p0", "1", 1_000_001, "AA")])
+        prs, _, _, n_sub = compute_projected_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        # 2*0.5 + 0.8*(-0.2) + 0.1 = 0.94.
+        np.testing.assert_allclose(prs, 0.94, rtol=0, atol=1e-12)
+        assert n_sub == 1
+
+    def test_no_clipping_projection(self):
+        """A prediction above 2 is NOT clipped (target is a PRS contribution)."""
+        model = _make_region_model(
+            predictor_variant_ids=["rs_p0"],
+            coefficients=np.array([3.0]),
+            intercept=1.0,
+            cv_mse=0.01,
+            predictor_allele_frequencies=np.array([0.3]),
+            predictor_chromosomes=["1"],
+            predictor_positions=[1_000_001],
+            predictor_counted_alleles=["A"],
+            predictor_other_alleles=["G"],
+        )
+        coll = _collection([("rs_p0", "1", 1_000_001, "AA")])  # dosage 2
+        prs, _, _, _ = compute_projected_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        # raw = 2*3.0 + 1.0 = 7.0, left unclipped.
+        np.testing.assert_allclose(prs, 7.0, rtol=0, atol=1e-12)
+
+    def test_heterozygote_order_invariant(self):
+        """'AG' and 'GA' both count one copy of the ALT allele."""
+        model = _make_region_model(
+            predictor_variant_ids=["rs_p0"],
+            coefficients=np.array([1.0]),
+            intercept=0.0,
+            cv_mse=0.01,
+            predictor_allele_frequencies=np.array([0.3]),
+            predictor_chromosomes=["1"],
+            predictor_positions=[1_000_001],
+            predictor_counted_alleles=["A"],
+            predictor_other_alleles=["G"],
+        )
+        for geno in ("AG", "GA"):
+            coll = _collection([("rs_p0", "1", 1_000_001, geno)])
+            prs, _, _, _ = compute_projected_prs_oriented(
+                coll, [model], allow_ambiguous=True
+            )
+            np.testing.assert_allclose(prs, 1.0, rtol=0, atol=1e-12)
+
+    def test_intercept_only_unchanged(self):
+        """An intercept-only region scores its intercept and reads no metadata."""
+        model = _make_region_model(
+            predictor_variant_ids=[],
+            coefficients=np.array([]),
+            intercept=0.42,
+            cv_mse=0.01,
+            is_intercept_only=True,
+            predictor_allele_frequencies=np.array([]),
+        )
+        coll = _collection([("rs_x", "1", 999, "AA")])  # irrelevant
+        prs, variance, n_regions, n_sub = compute_projected_prs_oriented(
+            coll, [model], allow_ambiguous=True
+        )
+        np.testing.assert_allclose(prs, 0.42, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(variance, 0.01, rtol=0, atol=1e-12)
+        assert n_regions == 1
+        assert n_sub == 0
+
+
 class TestProjectionPredictor:
     """Tests for the ProjectionPredictor class."""
 
@@ -291,38 +461,71 @@ class TestProjectionPredictor:
         assert result.unresolved_observed_ids is None
 
     def test_oriented_observed_via_raw_genotypes(self):
-        """raw_genotypes routes observed scoring through the allele-aware path."""
+        """raw_genotypes routes observed AND predictor scoring through the oriented path."""
         observed = _make_observed_variants()  # rs100=(A,G,0.5), rs101=(C,T,-0.3)
         model = _make_region_model(
             coefficients=np.array([0.4]),
             intercept=0.05,
             predictor_variant_ids=["rs500"],
             predictor_allele_frequencies=np.array([0.3]),
+            predictor_chromosomes=["1"],
+            predictor_positions=[2_000_000],
+            predictor_counted_alleles=["A"],
+            predictor_other_alleles=["G"],
             cv_mse=0.01,
         )
         predictor = ProjectionPredictor(observed, [model])
 
-        # Projected component still reads the legacy dosage dict (unchanged in P1.2).
-        user_dosages = {"rs500": 1.0}
-        # Observed scored from strings: rs100 "GG" -> 0 copies of effect A (NOT 2),
-        # rs101 "CC" -> 2 copies of effect C.
+        # With raw_genotypes the dosage dict is ignored; everything is scored from
+        # strings: observed rs100 "GG" -> 0 copies of effect A, rs101 "CC" -> 2 copies
+        # of effect C; predictor rs500 "AG" -> 1 copy of ALT A.
         coll = _collection(
-            [("rs100", "1", 500_000, "GG"), ("rs101", "1", 600_000, "CC")]
+            [
+                ("rs100", "1", 500_000, "GG"),
+                ("rs101", "1", 600_000, "CC"),
+                ("rs500", "1", 2_000_000, "AG"),
+            ]
         )
-        result = predictor.predict(
-            user_dosages, apply_calibration=False, raw_genotypes=coll
-        )
+        result = predictor.predict({}, apply_calibration=False, raw_genotypes=coll)
 
         # Oriented observed = 0*0.5 + 2*(-0.3) = -0.6 (allele-blind would give 0.4).
         np.testing.assert_allclose(
             result.prs_observed_component, -0.6, rtol=0, atol=1e-12
         )
+        # Oriented projected = 1*0.4 + 0.05 = 0.45.
         np.testing.assert_allclose(
             result.prs_imputed_component, 0.45, rtol=0, atol=1e-12
         )
         np.testing.assert_allclose(result.prs, -0.15, rtol=0, atol=1e-12)
         assert result.n_observed_scored_direct == 2
         assert result.unresolved_observed_ids == ()
+
+    def test_predict_projected_via_raw_genotypes_matches_oriented(self):
+        """predict() routes the projected component through the oriented scorer."""
+        # A 'GG' predictor with ALT=A: oriented counts 0; the blind dict counts 2.
+        model = _make_region_model(
+            predictor_variant_ids=["rs_p0"],
+            coefficients=np.array([1.0]),
+            intercept=0.0,
+            cv_mse=0.0,
+            predictor_allele_frequencies=np.array([0.1]),
+            predictor_chromosomes=["1"],
+            predictor_positions=[1_000_001],
+            predictor_counted_alleles=["A"],
+            predictor_other_alleles=["G"],
+        )
+        predictor = ProjectionPredictor([], [model])
+        coll = _collection([("rs_p0", "1", 1_000_001, "GG")])
+        result = predictor.predict({}, apply_calibration=False, raw_genotypes=coll)
+        # Projected component is exposed as prs_imputed_component.
+        np.testing.assert_allclose(
+            result.prs_imputed_component, 0.0, rtol=0, atol=1e-12
+        )
+        # The legacy dosage-dict path (no raw_genotypes) counts "GG" homozygous -> 2.
+        blind = predictor.predict({"rs_p0": 2.0}, apply_calibration=False)
+        np.testing.assert_allclose(
+            blind.prs_imputed_component, 2.0, rtol=0, atol=1e-12
+        )
 
     def test_all_observed_no_projection(self):
         """No region models: PRS == observed component."""

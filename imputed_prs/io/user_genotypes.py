@@ -539,6 +539,67 @@ class RawUserGenotypeCollection:
         return GenotypeResolution(chosen.genotype, "resolved", chosen.raw_id)
 
 
+def resolve_counted_dosage(
+    raw_genotypes: RawUserGenotypeCollection,
+    *,
+    variant_id: str,
+    chromosome: str,
+    position: int,
+    counted_allele: str,
+    other_allele: str,
+    allow_ambiguous: bool,
+    allow_strand_flip: bool,
+) -> Optional[float]:
+    """Resolve one locus against the user collection and count the named allele.
+
+    Combines the two primitives every oriented scorer needs: build a multi-key
+    :class:`~imputed_prs.core.types.VariantIdentity` (matched by ``variant_id``
+    plus ``chr:pos``), resolve it via :meth:`RawUserGenotypeCollection.resolve`,
+    then count copies of ``counted_allele`` with :func:`count_allele`. This is the
+    resolve→count dance inlined in ``compute_observed_prs_oriented``; predictor
+    scorers (imputed and projected) reuse it so a missing/unresolvable predictor
+    can be detected (``None``) and mean-substituted by the caller.
+
+    Args:
+        raw_genotypes: User genotypes as a multi-key resolvable collection.
+        variant_id: Predictor identifier (rsID or source id).
+        chromosome: Predictor chromosome; normalized with ``_normalize_chromosome``.
+        position: Predictor genomic position.
+        counted_allele: Allele whose copies are counted (for predictors, the ALT
+            allele the reference ``Z`` column was built from).
+        other_allele: The complementary allele of the biallelic pair (REF).
+        allow_ambiguous: Whether palindromic (A/T, C/G) loci may be counted.
+        allow_strand_flip: Whether to retry on the complementary strand.
+
+    Returns:
+        ``0.0`` / ``1.0`` / ``2.0`` copies of ``counted_allele``, or ``None`` when
+        the locus is unresolved (not found / duplicate-conflict) or uncountable
+        (missing/invalid/partial-overlap/palindromic under the active policy).
+    """
+    chrom = _normalize_chromosome(str(chromosome))
+    identity = VariantIdentity(
+        feature_id=f"{chrom}:{position}:{other_allele}:{counted_allele}",
+        variant_id=variant_id,
+        accepted_ids=(variant_id, f"{chrom}:{position}"),
+        chromosome=chrom,
+        position=position,
+        counted_allele=counted_allele,
+        other_allele=other_allele,
+    )
+    resolution = raw_genotypes.resolve(identity)
+    if resolution.status != "resolved":
+        # not_found or duplicate_conflict: never count an arbitrary match.
+        return None
+
+    return count_allele(
+        resolution.genotype,
+        counted_allele,
+        other_allele,
+        allow_ambiguous=allow_ambiguous,
+        allow_strand_flip=allow_strand_flip,
+    )
+
+
 def _safe_int(value: object) -> Optional[int]:
     """Best-effort int conversion for a position cell; None when not parseable."""
     if value is None:
