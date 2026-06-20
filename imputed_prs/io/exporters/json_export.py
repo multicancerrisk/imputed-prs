@@ -36,6 +36,7 @@ def export_to_json(
     training_ancestry: Optional[str] = None,
     ambiguous_policy: str = DEFAULT_AMBIGUOUS_POLICY,
     require_other_allele: bool = True,
+    require_provenance: bool = True,
 ) -> Path:
     """Export trained imputation model to portable JSON (schema v2.0).
 
@@ -69,13 +70,19 @@ def export_to_json(
             any scored variant (observed term or predictor) lacks ``other_allele``,
             which the browser needs for strand-safe orientation. Pass False for a
             non-deployable research export.
+        require_provenance: Deploy gate. When True (default) the export raises if
+            ``genome_build``, ``reference_panel_id``, or ``training_ancestry`` is
+            missing, since the scorer needs them to validate that an upload is
+            compatible with the trained model. Pass False for a non-deployable
+            research export.
 
     Returns:
         Path to the created JSON file.
 
     Raises:
         ValueError: If ``require_other_allele`` is True and any observed variant or
-            predictor lacks ``other_allele``.
+            predictor lacks ``other_allele``; or if ``require_provenance`` is True
+            and a required provenance field is missing.
     """
     output_path = Path(output_path)
 
@@ -103,6 +110,29 @@ def export_to_json(
                 "Deployable JSON export requires 'other_allele' for every scored "
                 f"variant; {len(missing)} are missing it (e.g. {missing[:5]}). "
                 "Pass require_other_allele=False for a non-deployable research export."
+            )
+
+    # Deploy gate: a deployable artifact must carry the provenance the scorer
+    # uses to validate that an upload is compatible with the trained model (the
+    # build/platform hard-check, P1.7). These are recorded but allowed to be null
+    # by the schema, so they are enforced here rather than in the schema.
+    if require_provenance:
+        missing_provenance = [
+            name
+            for name, value in (
+                ("genome_build", genome_build),
+                ("reference_panel_id", reference_panel_id),
+                ("training_ancestry", training_ancestry),
+            )
+            if not value
+        ]
+        if missing_provenance:
+            raise ValueError(
+                "Deployable JSON export requires provenance fields "
+                f"{missing_provenance} to be set (non-null); they identify the "
+                "build, reference panel, and training ancestry the scorer needs to "
+                "validate compatibility. Pass require_provenance=False for a "
+                "non-deployable research export."
             )
 
     # Build metadata section. All v1.0 keys are retained for continuity; the

@@ -985,6 +985,35 @@ def fitted_model(synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
 
 
 @pytest.fixture
+def deployable_model(synthetic_vcf_file, synthetic_prs_df, platform_variants_partial):
+    """A fitted model carrying provenance, so export() passes the deploy gate (P1.7).
+
+    Kept separate from ``fitted_model`` so build-less predict tests stay quiet:
+    a model with a known build warns when predicted on a build-less dict/frame.
+    """
+    pytest.importorskip("cyvcf2")
+
+    model = LinearImputationPRS(
+        window_size=500_000,
+        cv_folds=3,
+        tuning_scope="none",
+        verbose=0,
+        random_state=42,
+    )
+
+    model.fit(
+        reference_genotypes=synthetic_vcf_file,
+        prs_definition=synthetic_prs_df,
+        platform_variants=platform_variants_partial,
+        genome_build="GRCh37",
+        reference_panel_id="1000G_phase3_EUR",
+        training_ancestry="EUR",
+    )
+
+    return model
+
+
+@pytest.fixture
 def fitted_model_all_observed(synthetic_vcf_file, synthetic_prs_df, platform_variants_all):
     """Create a fitted model where all variants are observed (no imputation)."""
     cyvcf2 = pytest.importorskip("cyvcf2")
@@ -1302,6 +1331,12 @@ class TestLinearImputationPRSGetExpectedVariants:
 class TestLinearImputationPRSExport:
     """Test export() method."""
 
+    @pytest.fixture
+    def fitted_model(self, deployable_model):
+        # export() enforces the provenance deploy gate (P1.7), so these tests run
+        # against a model that declares build + reference panel + ancestry.
+        return deployable_model
+
     @pytest.mark.skipif(
         not Path("/usr/bin/python3").exists(),
         reason="VCF parsing requires cyvcf2"
@@ -1525,8 +1560,11 @@ class TestLinearImputationPRSLoad:
         not Path("/usr/bin/python3").exists(),
         reason="VCF parsing requires cyvcf2"
     )
-    def test_load_json_roundtrip(self, fitted_model, tmp_path, user_dosages_dict):
+    def test_load_json_roundtrip(self, deployable_model, tmp_path, user_dosages_dict):
         """Test save to JSON and load roundtrip."""
+        # JSON export enforces the provenance deploy gate (P1.7), so use a model
+        # that declares build + provenance.
+        fitted_model = deployable_model
         # Export to JSON
         paths = fitted_model.export(tmp_path, formats=["json"])
 
@@ -1540,9 +1578,9 @@ class TestLinearImputationPRSLoad:
         assert len(loaded_model.observed_variants) == len(fitted_model.observed_variants)
         assert len(loaded_model.imputed_models) == len(fitted_model.imputed_models)
 
-        # Verify predictions match
-        original_result = fitted_model.predict(user_dosages_dict)
-        loaded_result = loaded_model.predict(user_dosages_dict)
+        # Verify predictions match (pass the model's build so the guard is silent)
+        original_result = fitted_model.predict(user_dosages_dict, genome_build="GRCh37")
+        loaded_result = loaded_model.predict(user_dosages_dict, genome_build="GRCh37")
 
         assert np.isclose(original_result.prs, loaded_result.prs)
         assert np.isclose(original_result.se, loaded_result.se)

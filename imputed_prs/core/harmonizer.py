@@ -7,13 +7,19 @@ This module provides functions to harmonize variants across different data sourc
 - Filter variants to local genomic windows
 """
 
+import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
 
-from imputed_prs.core.exceptions import IncompatibleBuildError
+from imputed_prs.core.exceptions import (
+    DataLoadError,
+    IncompatibleBuildError,
+    IncompatiblePlatformError,
+)
 from imputed_prs.core.types import GenotypeData
 
 
@@ -358,6 +364,141 @@ def validate_genome_build(
         genotype_build=genotype_normalized,
         warning=None,
     )
+
+
+# Map the integer build numbers returned by user_genotypes.detect_genome_build
+# onto the canonical build names understood by validate_genome_build.
+_BUILD_NUMBER_TO_NAME = {37: "GRCh37", 38: "GRCh38"}
+
+
+def check_predict_compatibility(
+    model_build: Optional[str],
+    model_platform: Optional[str],
+    user_input,
+    declared_build: Optional[str] = None,
+    declared_platform: Optional[str] = None,
+    strict: bool = True,
+) -> None:
+    """Guard ``predict`` against an incompatible genome build / platform.
+
+    Enforces, at the scoring boundary, that a deployable model is not silently
+    applied to an upload on a different genome build or genotyping array.
+
+    Genome build
+        The user build is taken from ``declared_build`` if given; otherwise, when
+        the model declares a build *and* ``user_input`` is a file path, it is
+        auto-detected with :func:`imputed_prs.io.user_genotypes.detect_genome_build`.
+        DataFrame/dict inputs carry no build and are never auto-detected.
+
+        - A *known mismatch* against ``model_build`` raises
+          :class:`IncompatibleBuildError` when ``strict`` (the default), or emits a
+          blocking ``UserWarning`` when ``strict=False``.
+        - An *unknown* user build, when the model build is known, emits a blocking
+          ``UserWarning`` and scoring proceeds.
+        - When the model build itself is unknown, no check is possible and nothing
+          is emitted (research models without a declared build stay quiet).
+
+    Platform
+        Only checked when the caller declares ``declared_platform`` and the model
+        records one. A mismatch raises :class:`IncompatiblePlatformError` when
+        ``strict``, else emits a blocking ``UserWarning``.
+
+    Parameters
+    ----------
+    model_build : str or None
+        Genome build recorded on the model (e.g. ``"GRCh37"``).
+    model_platform : str or None
+        Genotyping platform recorded on the model (e.g. ``"23andme_v5"``).
+    user_input : str, pathlib.Path, pandas.DataFrame, or dict
+        The raw value passed to ``predict``; used to auto-detect the build for
+        file-path inputs.
+    declared_build : str or None
+        Build explicitly declared by the caller; overrides auto-detection.
+    declared_platform : str or None
+        Platform explicitly declared by the caller.
+    strict : bool
+        If True (default), a known build/platform mismatch raises. If False, the
+        mismatch is downgraded to a blocking ``UserWarning`` and scoring proceeds.
+
+    Raises
+    ------
+    IncompatibleBuildError
+        If ``strict`` and the user build is known and mismatches ``model_build``.
+    IncompatiblePlatformError
+        If ``strict`` and ``declared_platform`` mismatches ``model_platform``.
+    """
+    # Resolve the user's genome build. Auto-detection is bounded to the case
+    # where it can actually help: the model declares a build and the input is a
+    # file path (DataFrames and dicts carry no build to detect). This also keeps
+    # the extra full-file parse off the in-memory research paths.
+    resolved_build = declared_build
+    if (
+        resolved_build is None
+        and model_build is not None
+        and isinstance(user_input, (str, Path))
+    ):
+        # Function-local import: harmonizer lives in ``core`` and
+        # detect_genome_build in ``io`` (which imports ``core``), so a
+        # module-level import would create a cycle.
+        from imputed_prs.io.user_genotypes import detect_genome_build
+
+        try:
+            build_number = detect_genome_build(user_input)
+        except DataLoadError:
+            # The build probe failed (e.g. the optional ``snps`` package is not
+            # installed, or the file is unreadable). Degrade to unknown; the
+            # genotype loaders re-parse the file next and raise their own clear
+            # error if it is genuinely bad.
+            build_number = None
+        resolved_build = _BUILD_NUMBER_TO_NAME.get(build_number)
+
+    # Genome build compatibility. validate_genome_build raises on a known
+    # mismatch when strict=True; otherwise it returns is_compatible=False with no
+    # warning text, and we surface the blocking warning ourselves.
+    result = validate_genome_build(model_build, resolved_build, strict=strict)
+    if not result.is_compatible:
+        # Only reachable with strict=False (strict=True has already raised).
+        warnings.warn(
+            f"Genome build mismatch: model is {result.prs_build}, user data is "
+            f"{result.genotype_build}. Proceeding because strict=False; results "
+            "may be unreliable.",
+            UserWarning,
+            stacklevel=2,
+        )
+    elif resolved_build is None and model_build is not None:
+        # The user build could not be determined but the model declares one.
+        # Block loudly, then score. (Silent when the model build is also unknown.)
+        warnings.warn(
+            "Could not determine the genome build of the user genotypes; the "
+            f"model was trained on {model_build}. Pass genome_build= to verify "
+            "compatibility. Proceeding, but results may be unreliable if the "
+            "builds differ.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    # Platform compatibility (only when both sides are known). Platform names are
+    # controlled free-form values, so an exact string comparison is used.
+    if (
+        declared_platform is not None
+        and model_platform is not None
+        and declared_platform != model_platform
+    ):
+        message = (
+            f"Genotyping platform mismatch: model was trained for "
+            f"'{model_platform}', but '{declared_platform}' was declared."
+        )
+        if strict:
+            raise IncompatiblePlatformError(
+                message + " Use strict=False to skip this check, but results may "
+                "be unreliable."
+            )
+        warnings.warn(
+            message + " Proceeding because strict=False; results may be "
+            "unreliable.",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def partition_variants(

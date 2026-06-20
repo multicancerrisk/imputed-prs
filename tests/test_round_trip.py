@@ -75,7 +75,13 @@ def fitted_imputation_model(vcf_file):
         window_size=500_000, cv_folds=3, tuning_scope="none", verbose=0, random_state=42
     )
     model.fit(
-        reference_genotypes=vcf_file, prs_definition=_PRS_DF, platform_variants=_PLATFORM
+        reference_genotypes=vcf_file,
+        prs_definition=_PRS_DF,
+        platform_variants=_PLATFORM,
+        # Provenance so the JSON round trip exercises a deployable artifact (P1.7).
+        genome_build="GRCh37",
+        reference_panel_id="1000G_phase3_EUR",
+        training_ancestry="EUR",
     )
     return model
 
@@ -172,8 +178,9 @@ class TestImputationRoundTrip:
         paths = model.export(tmp_path, model_name="rt", formats=[fmt])
         loaded = LinearImputationPRS.load(paths[fmt])
 
-        r0 = model.predict(user_genotype_df, apply_calibration=False)
-        r1 = loaded.predict(user_genotype_df, apply_calibration=False)
+        # The model declares GRCh37; pass it so the build guard stays silent.
+        r0 = model.predict(user_genotype_df, apply_calibration=False, genome_build="GRCh37")
+        r1 = loaded.predict(user_genotype_df, apply_calibration=False, genome_build="GRCh37")
 
         # Floats: allclose. The round trip must not perturb the score.
         np.testing.assert_allclose(

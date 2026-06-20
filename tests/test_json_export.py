@@ -111,6 +111,7 @@ class TestBasicExport:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
             )
 
             assert result_path == output_path
@@ -137,6 +138,7 @@ class TestBasicExport:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
                 calibration_params=sample_calibration_params,
             )
 
@@ -160,6 +162,7 @@ class TestBasicExport:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
                 evaluation_metrics=sample_evaluation_metrics,
             )
 
@@ -184,6 +187,7 @@ class TestVarianceScaling:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
                 include_variance_scaling=False,
             )
 
@@ -207,6 +211,7 @@ class TestVarianceScaling:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
                 include_variance_scaling=True,
             )
 
@@ -233,6 +238,7 @@ class TestJSONValidity:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
             )
 
             # This should not raise an exception
@@ -251,6 +257,7 @@ class TestJSONValidity:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
             )
 
             with open(output_path) as f:
@@ -283,6 +290,7 @@ class TestRoundTrip:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
                 calibration_params=sample_calibration_params,
                 evaluation_metrics=sample_evaluation_metrics,
                 platform_name="23andme_v5",
@@ -323,6 +331,7 @@ class TestEdgeCases:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=[],
+                require_provenance=False,
             )
 
             with open(output_path) as f:
@@ -340,6 +349,7 @@ class TestEdgeCases:
                 output_path=output_path,
                 observed_variants=[],
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
             )
 
             with open(output_path) as f:
@@ -359,6 +369,7 @@ class TestEdgeCases:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
             )
 
             assert result_path.exists()
@@ -378,6 +389,7 @@ class TestMetadata:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
             )
 
             with open(output_path) as f:
@@ -396,6 +408,7 @@ class TestMetadata:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
             )
 
             with open(output_path) as f:
@@ -413,6 +426,7 @@ class TestMetadata:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
             )
 
             with open(output_path) as f:
@@ -433,6 +447,7 @@ class TestPlatformVariantIndex:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=[],
+                require_provenance=False,
             )
 
             with open(output_path) as f:
@@ -463,6 +478,7 @@ class TestTrainingSummary:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
                 training_summary=training_summary,
             )
 
@@ -483,6 +499,7 @@ class TestTrainingSummary:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
             )
 
             with open(output_path) as f:
@@ -504,6 +521,7 @@ class TestStringPath:
                 output_path=output_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
+                require_provenance=False,
             )
 
             assert isinstance(result_path, Path)
@@ -514,6 +532,9 @@ class TestV2Schema:
     """Tests for the v2.0 browser-deployable schema additions."""
 
     def _export(self, tmpdir, observed, imputed, **kwargs):
+        # These tests exercise serialization shape, not deployability; skip the
+        # provenance deploy gate unless a test opts in.
+        kwargs.setdefault("require_provenance", False)
         output_path = Path(tmpdir) / "model.json"
         export_to_json(
             output_path=output_path,
@@ -665,6 +686,8 @@ class TestSchemaValidation:
     """Validate exported v2 artifacts against the committed JSON Schema (P1.5c)."""
 
     def _export(self, tmpdir, observed, imputed, **kwargs):
+        # Schema-shape tests; skip the provenance deploy gate unless opted in.
+        kwargs.setdefault("require_provenance", False)
         output_path = Path(tmpdir) / "model.json"
         export_to_json(
             output_path=output_path,

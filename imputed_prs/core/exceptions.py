@@ -25,6 +25,13 @@ class IncompatibleBuildError(ImputedPRSError):
     pass
 
 
+class IncompatiblePlatformError(ImputedPRSError):
+    """Genotyping platform mismatch (e.g. model trained for 23andme_v5,
+    upload declared as a different array)."""
+
+    pass
+
+
 class MissingVariantsError(ImputedPRSError):
     """Required variants not found in data."""
 

@@ -18,12 +18,14 @@ from imputed_prs.core.exceptions import (
     DataLoadError,
     ImputedPRSError,
     IncompatibleBuildError,
+    IncompatiblePlatformError,
     MissingVariantsError,
     ModelNotFittedError,
     ValidationError,
 )
 from imputed_prs.core.harmonizer import (
     align_effect_alleles,
+    check_predict_compatibility,
     filter_to_local_window,
     partition_variants,
     validate_genome_build,
@@ -58,11 +60,13 @@ __all__ = [
     "DataLoadError",
     "ImputedPRSError",
     "IncompatibleBuildError",
+    "IncompatiblePlatformError",
     "MissingVariantsError",
     "ModelNotFittedError",
     "ValidationError",
     # Harmonization functions
     "align_effect_alleles",
+    "check_predict_compatibility",
     "filter_to_local_window",
     "partition_variants",
     "validate_genome_build",

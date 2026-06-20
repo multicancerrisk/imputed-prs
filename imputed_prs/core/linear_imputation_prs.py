@@ -11,6 +11,7 @@ from imputed_prs.core.harmonizer import (
     _is_ambiguous_snp,
     _normalize_chromosome,
     build_reference_allele_index,
+    check_predict_compatibility,
     match_oriented_dosage,
     partition_variants,
     validate_genome_build,
@@ -767,6 +768,10 @@ class LinearImputationPRS:
         self,
         user_genotypes: Union[str, Path, pd.DataFrame, Dict[str, float]],
         apply_calibration: bool = True,
+        *,
+        genome_build: Optional[str] = None,
+        platform_id: Optional[str] = None,
+        strict: bool = True,
     ) -> PredictionResult:
         """Compute PRS for user genotypes.
 
@@ -777,6 +782,15 @@ class LinearImputationPRS:
                 - Dict mapping variant_id to dosage values
             apply_calibration: Whether to apply calibration scaling.
                 Default: True.
+            genome_build: Genome build of the user genotypes (e.g. "GRCh37").
+                Overrides auto-detection. For file inputs the build is
+                auto-detected when omitted; DataFrame/dict inputs are not.
+            platform_id: Genotyping platform the user genotypes came from. When
+                provided, it is checked against the platform the model was
+                trained for.
+            strict: If True (default), an incompatible genome build or a declared
+                platform mismatch raises. If False, the mismatch is downgraded to
+                a blocking UserWarning and scoring proceeds.
 
         Returns:
             PredictionResult with PRS value, uncertainty estimates, and diagnostics.
@@ -784,11 +798,31 @@ class LinearImputationPRS:
         Raises:
             ModelNotFittedError: If fit() has not been called.
             DataLoadError: If user genotype file cannot be loaded.
+            IncompatibleBuildError: If strict and the user build is known and
+                mismatches the model's build.
+            IncompatiblePlatformError: If strict and platform_id mismatches the
+                model's platform.
+
+        Warns:
+            UserWarning: If the user build cannot be determined while the model
+                declares one, or if strict=False downgrades a build/platform
+                mismatch.
         """
         if not self._is_fitted:
             raise ModelNotFittedError(
                 "Model has not been fitted. Call fit() before predict()."
             )
+
+        # Refuse (or hard-block) before scoring when the upload is incompatible
+        # with the model's training build / platform.
+        check_predict_compatibility(
+            model_build=self._genome_build,
+            model_platform=self._platform_name,
+            user_input=user_genotypes,
+            declared_build=genome_build,
+            declared_platform=platform_id,
+            strict=strict,
+        )
 
         # Get expected variants for filtering
         expected_variants = self._get_expected_variants()

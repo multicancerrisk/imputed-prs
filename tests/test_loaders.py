@@ -120,6 +120,7 @@ class TestJSONLoader:
         with tempfile.TemporaryDirectory() as tmpdir:
             json_path = Path(tmpdir) / "model.json"
             export_to_json(
+                require_provenance=False,
                 output_path=json_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
@@ -161,6 +162,7 @@ class TestJSONLoader:
         with tempfile.TemporaryDirectory() as tmpdir:
             json_path = Path(tmpdir) / "model.json"
             export_to_json(
+                require_provenance=False,
                 output_path=json_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
@@ -183,6 +185,7 @@ class TestJSONLoader:
         with tempfile.TemporaryDirectory() as tmpdir:
             json_path = Path(tmpdir) / "model.json"
             export_to_json(
+                require_provenance=False,
                 output_path=json_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
@@ -202,6 +205,7 @@ class TestJSONLoader:
         with tempfile.TemporaryDirectory() as tmpdir:
             json_path = f"{tmpdir}/model.json"
             export_to_json(
+                require_provenance=False,
                 output_path=json_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
@@ -550,6 +554,7 @@ class TestRoundTrip:
         with tempfile.TemporaryDirectory() as tmpdir:
             json_path = Path(tmpdir) / "model.json"
             export_to_json(
+                require_provenance=False,
                 output_path=json_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
@@ -754,6 +759,7 @@ class TestJSONv2RoundTrip:
         with tempfile.TemporaryDirectory() as tmpdir:
             json_path = Path(tmpdir) / "model.json"
             export_to_json(
+                require_provenance=False,
                 output_path=json_path,
                 observed_variants=sample_observed_variants,
                 imputed_models=sample_imputed_models,
@@ -807,6 +813,7 @@ class TestJSONv2RoundTrip:
         with tempfile.TemporaryDirectory() as tmpdir:
             json_path = Path(tmpdir) / "model.json"
             export_to_json(
+                require_provenance=False,
                 output_path=json_path,
                 observed_variants=observed,
                 imputed_models=imputed,
