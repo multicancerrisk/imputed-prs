@@ -27,8 +27,13 @@ def load_model_json(path: Union[str, Path]) -> Dict[str, Any]:
     Returns:
         Dictionary containing all model components:
         - metadata: Model metadata dict
-        - observed_variants: List of observed variant dicts
-        - imputed_variants: List of imputed variant dicts with coefficients
+        - provenance: Optional provenance dict (v2.0): genome_build, platform_id,
+          reference_panel_id, training_ancestry, ambiguous_policy, centering_scaling
+        - observed_variants: List of observed variant dicts (v2.0 adds accepted_ids
+          and an ambiguous flag)
+        - imputed_variants: List of imputed variant dicts; v2.0 carries a
+          self-describing `predictors` list, v1.0 carried parallel
+          predictor_variant_ids/coefficients arrays
         - platform_variant_index: Dict mapping variant_id to index
         - calibration_params: Optional calibration parameters dict
         - evaluation_metrics: Optional evaluation metrics dict

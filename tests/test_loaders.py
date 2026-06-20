@@ -6,8 +6,10 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import pandas as pd
 import pytest
 
+from imputed_prs.core.linear_imputation_prs import LinearImputationPRS
 from imputed_prs.core.types import (
     CalibrationParams,
     EvaluationMetrics,
@@ -17,6 +19,8 @@ from imputed_prs.core.types import (
 from imputed_prs.io.exporters.hdf5_export import export_to_hdf5
 from imputed_prs.io.exporters.json_export import export_to_json
 from imputed_prs.io.loaders import load_model_hdf5, load_model_json
+from imputed_prs.io.user_genotypes import load_raw_user_genotypes
+from imputed_prs.models.predictor import compute_imputed_prs_oriented
 
 
 @pytest.fixture
@@ -47,6 +51,11 @@ def sample_imputed_models():
             predictor_variant_ids=["rs1", "rs2"],
             coefficients=np.array([0.3, 0.2]),
             is_intercept_only=False,
+            predictor_chromosomes=["1", "1"],
+            predictor_positions=[100, 200],
+            predictor_counted_alleles=["G", "T"],
+            predictor_other_alleles=["A", "C"],
+            predictor_allele_frequencies=np.array([0.4, 0.3]),
         ),
         ImputedVariantModel(
             variant_id="rs5",
@@ -569,8 +578,8 @@ class TestRoundTrip:
             rs4 = next(v for v in data["imputed_variants"] if v["variant_id"] == "rs4")
             assert rs4["allele_frequency"] == 0.3
             assert rs4["imputation_r2"] == 0.8
-            assert rs4["predictor_variant_ids"] == ["rs1", "rs2"]
-            assert rs4["coefficients"] == [0.3, 0.2]
+            assert [p["variant_id"] for p in rs4["predictors"]] == ["rs1", "rs2"]
+            assert [p["coefficient"] for p in rs4["predictors"]] == [0.3, 0.2]
 
             # Verify calibration params
             assert data["calibration_params"]["scaling_factor"] == 1.1
@@ -728,3 +737,167 @@ class TestMetadataLoading:
             assert meta["n_imputed_variants"] == 2
             assert meta["n_intercept_only"] == 1
             assert "created_at" in meta
+
+
+class TestJSONv2RoundTrip:
+    """v2.0 JSON: provenance, predictor-metadata restore, and v1.0 back-compat."""
+
+    def test_json_loader_returns_provenance(
+        self, sample_observed_variants, sample_imputed_models
+    ):
+        """The raw-dict loader surfaces the v2 provenance block."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "model.json"
+            export_to_json(
+                output_path=json_path,
+                observed_variants=sample_observed_variants,
+                imputed_models=sample_imputed_models,
+                platform_name="23andme_v5",
+                genome_build="GRCh37",
+                reference_panel_id="1000G_phase3_EUR",
+                training_ancestry="EUR",
+            )
+
+            data = load_model_json(json_path)
+
+            assert "provenance" in data
+            assert data["provenance"]["platform_id"] == "23andme_v5"
+            assert data["provenance"]["reference_panel_id"] == "1000G_phase3_EUR"
+            assert data["provenance"]["training_ancestry"] == "EUR"
+            assert (
+                data["provenance"]["ambiguous_policy"]
+                == "exclude_unless_platform_strand_known"
+            )
+
+    def test_json_round_trip_via_predict(self):
+        """Export -> load -> oriented score is identical to the in-memory model.
+
+        This is the teeth: ``compute_imputed_prs_oriented`` indexes the predictor
+        allele metadata, so a loader that dropped it would mis-score (or
+        ``IndexError``). The score-equivalence assertion is what proves the
+        restore.
+        """
+        observed = [VariantInfo("rs1", "1", 100, "A", "G", 0.1)]
+        imputed = [
+            ImputedVariantModel(
+                variant_id="rs4", chromosome="1", position=150,
+                effect_allele="A", other_allele="G", beta=0.05,
+                allele_frequency=0.3, imputation_r2=0.8, residual_variance=0.1,
+                intercept=0.6, predictor_variant_ids=["rs1", "rs2"],
+                coefficients=np.array([0.3, 0.2]), is_intercept_only=False,
+                predictor_chromosomes=["1", "1"], predictor_positions=[100, 200],
+                predictor_counted_alleles=["G", "T"],
+                predictor_other_alleles=["A", "C"],
+                predictor_allele_frequencies=np.array([0.4, 0.3]),
+            ),
+            ImputedVariantModel(
+                variant_id="rs5", chromosome="2", position=400,
+                effect_allele="T", other_allele="C", beta=0.02,
+                allele_frequency=0.5, imputation_r2=0.0, residual_variance=0.5,
+                intercept=1.0, predictor_variant_ids=[],
+                coefficients=np.array([]), is_intercept_only=True,
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "model.json"
+            export_to_json(
+                output_path=json_path,
+                observed_variants=observed,
+                imputed_models=imputed,
+            )
+            loaded = LinearImputationPRS.load(json_path)
+
+        loaded_rs4 = next(m for m in loaded._imputed_models if m.variant_id == "rs4")
+        orig_rs4 = imputed[0]
+
+        # Exact reconstruction of ids / alleles / structure.
+        assert loaded_rs4.predictor_variant_ids == orig_rs4.predictor_variant_ids
+        assert loaded_rs4.predictor_chromosomes == orig_rs4.predictor_chromosomes
+        assert loaded_rs4.predictor_positions == orig_rs4.predictor_positions
+        assert (
+            loaded_rs4.predictor_counted_alleles
+            == orig_rs4.predictor_counted_alleles
+        )
+        assert (
+            loaded_rs4.predictor_other_alleles == orig_rs4.predictor_other_alleles
+        )
+        assert loaded_rs4.is_intercept_only == orig_rs4.is_intercept_only
+
+        # Allclose for floats.
+        np.testing.assert_allclose(
+            loaded_rs4.coefficients, orig_rs4.coefficients, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            loaded_rs4.predictor_allele_frequencies,
+            orig_rs4.predictor_allele_frequencies,
+            rtol=0, atol=1e-12,
+        )
+
+        # Score-equivalence on the oriented (raw-genotype) path.
+        raw = load_raw_user_genotypes(
+            pd.DataFrame(
+                {
+                    "rsid": ["rs1", "rs2"],
+                    "chrom": ["1", "1"],
+                    "pos": [100, 200],
+                    "genotype": ["AG", "TT"],
+                }
+            )
+        )
+        orig_score = compute_imputed_prs_oriented(raw, imputed, allow_ambiguous=True)
+        loaded_score = compute_imputed_prs_oriented(
+            raw, loaded._imputed_models, allow_ambiguous=True
+        )
+        np.testing.assert_allclose(
+            orig_score[0], loaded_score[0], rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            orig_score[1], loaded_score[1], rtol=0, atol=1e-12
+        )
+
+    def test_v1_file_still_loads(self):
+        """A legacy v1.0 JSON (parallel arrays, no provenance) still loads."""
+        v1 = {
+            "metadata": {
+                "format_version": "1.0",
+                "prs_id": "PGS000004",
+                "platform_name": "23andme_v5",
+                "genome_build": "GRCh37",
+                "model_name": "legacy",
+            },
+            "observed_variants": [
+                {
+                    "variant_id": "rs1", "chromosome": "1", "position": 100,
+                    "effect_allele": "A", "other_allele": "G", "beta": 0.1,
+                }
+            ],
+            "imputed_variants": [
+                {
+                    "variant_id": "rs4", "chromosome": "1", "position": 150,
+                    "effect_allele": "A", "other_allele": "G", "beta": 0.05,
+                    "allele_frequency": 0.3, "imputation_r2": 0.8,
+                    "intercept": 0.6, "is_intercept_only": False,
+                    "predictor_variant_ids": ["rs1"], "coefficients": [0.3],
+                }
+            ],
+            "platform_variant_index": {"rs1": 0},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "v1_model.json"
+            with open(json_path, "w") as f:
+                json.dump(v1, f)
+
+            loaded = LinearImputationPRS.load(json_path)
+
+        rs4 = loaded._imputed_models[0]
+        assert rs4.predictor_variant_ids == ["rs1"]
+        np.testing.assert_allclose(rs4.coefficients, [0.3], rtol=0, atol=1e-12)
+        # v1.0 carried no predictor allele metadata -> stays empty (documented).
+        assert rs4.predictor_counted_alleles == []
+        assert rs4.predictor_allele_frequencies.size == 0
+        # Identity still restored from `metadata`; provenance defaults to None.
+        assert loaded._genome_build == "GRCh37"
+        assert loaded._platform_name == "23andme_v5"
+        assert loaded._reference_panel_id is None
+        assert loaded._training_ancestry is None

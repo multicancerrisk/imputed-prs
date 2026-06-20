@@ -44,6 +44,11 @@ def sample_imputed_models():
             predictor_variant_ids=["rs1", "rs2"],
             coefficients=np.array([0.3, 0.2]),
             is_intercept_only=False,
+            predictor_chromosomes=["1", "1"],
+            predictor_positions=[100, 200],
+            predictor_counted_alleles=["G", "T"],
+            predictor_other_alleles=["A", "C"],
+            predictor_allele_frequencies=np.array([0.4, 0.3]),
         ),
         ImputedVariantModel(
             variant_id="rs5",
@@ -251,12 +256,14 @@ class TestJSONValidity:
             with open(output_path) as f:
                 data = json.load(f)
 
-            # Find the model with coefficients
+            # Find the model with coefficients (v2: per-predictor objects).
             model_with_coeffs = next(
                 m for m in data["imputed_variants"] if not m["is_intercept_only"]
             )
-            assert isinstance(model_with_coeffs["coefficients"], list)
-            assert model_with_coeffs["coefficients"] == [0.3, 0.2]
+            assert isinstance(model_with_coeffs["predictors"], list)
+            coeffs = [p["coefficient"] for p in model_with_coeffs["predictors"]]
+            assert all(isinstance(c, float) for c in coeffs)
+            assert coeffs == [0.3, 0.2]
 
 
 class TestRoundTrip:
@@ -394,7 +401,7 @@ class TestMetadata:
             with open(output_path) as f:
                 data = json.load(f)
 
-            assert data["metadata"]["format_version"] == "1.0"
+            assert data["metadata"]["format_version"] == "2.0"
 
     def test_created_at_timestamp_present(
         self, sample_observed_variants, sample_imputed_models
@@ -501,3 +508,126 @@ class TestStringPath:
 
             assert isinstance(result_path, Path)
             assert result_path.exists()
+
+
+class TestV2Schema:
+    """Tests for the v2.0 browser-deployable schema additions."""
+
+    def _export(self, tmpdir, observed, imputed, **kwargs):
+        output_path = Path(tmpdir) / "model.json"
+        export_to_json(
+            output_path=output_path,
+            observed_variants=observed,
+            imputed_models=imputed,
+            **kwargs,
+        )
+        with open(output_path) as f:
+            return json.load(f)
+
+    def test_provenance_block(
+        self, sample_observed_variants, sample_imputed_models,
+        sample_calibration_params,
+    ):
+        """Provenance carries identity + policy + centering/scaling."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._export(
+                tmpdir, sample_observed_variants, sample_imputed_models,
+                calibration_params=sample_calibration_params,
+                platform_name="23andme_v5", genome_build="GRCh37",
+                reference_panel_id="1000G_phase3_EUR", training_ancestry="EUR",
+            )
+            prov = data["provenance"]
+            assert prov["genome_build"] == "GRCh37"
+            assert prov["platform_id"] == "23andme_v5"
+            assert prov["reference_panel_id"] == "1000G_phase3_EUR"
+            assert prov["training_ancestry"] == "EUR"
+            assert prov["ambiguous_policy"] == "exclude_unless_platform_strand_known"
+            np.testing.assert_allclose(
+                prov["centering_scaling"]["scaling_factor"], 1.1, rtol=0, atol=1e-12
+            )
+
+    def test_provenance_centering_scaling_null_without_calibration(
+        self, sample_observed_variants, sample_imputed_models
+    ):
+        """centering_scaling is null when no calibration was fitted."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._export(tmpdir, sample_observed_variants, sample_imputed_models)
+            assert data["provenance"]["centering_scaling"] is None
+
+    def test_observed_accepted_ids_and_ambiguous_flag(self, sample_imputed_models):
+        """Observed terms carry accepted_ids and a palindrome flag."""
+        observed = [
+            VariantInfo("rs1", "1", 100, "A", "G", 0.1),   # not palindromic
+            VariantInfo("rs_pal", "3", 500, "A", "T", 0.3),  # A/T palindrome
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._export(tmpdir, observed, sample_imputed_models)
+            by_id = {v["variant_id"]: v for v in data["observed_variants"]}
+            assert by_id["rs1"]["accepted_ids"] == ["rs1", "1:100"]
+            assert by_id["rs1"]["ambiguous"] is False
+            assert by_id["rs_pal"]["accepted_ids"] == ["rs_pal", "3:500"]
+            assert by_id["rs_pal"]["ambiguous"] is True
+
+    def test_predictor_objects_are_self_describing(
+        self, sample_observed_variants, sample_imputed_models
+    ):
+        """Each predictor is an object carrying its own locus + alleles + AF."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._export(tmpdir, sample_observed_variants, sample_imputed_models)
+            rs4 = next(m for m in data["imputed_variants"] if m["variant_id"] == "rs4")
+            preds = rs4["predictors"]
+            assert [p["variant_id"] for p in preds] == ["rs1", "rs2"]
+            assert preds[0]["counted_allele"] == "G"
+            assert preds[0]["other_allele"] == "A"
+            assert preds[1]["counted_allele"] == "T"
+            assert preds[1]["other_allele"] == "C"
+            np.testing.assert_allclose(
+                [p["allele_frequency"] for p in preds], [0.4, 0.3], rtol=0, atol=1e-12
+            )
+            np.testing.assert_allclose(
+                [p["coefficient"] for p in preds], [0.3, 0.2], rtol=0, atol=1e-12
+            )
+
+    def test_intercept_only_has_empty_predictors(
+        self, sample_observed_variants, sample_imputed_models
+    ):
+        """Intercept-only imputed variants emit an empty predictors list."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._export(tmpdir, sample_observed_variants, sample_imputed_models)
+            rs5 = next(m for m in data["imputed_variants"] if m["variant_id"] == "rs5")
+            assert rs5["is_intercept_only"] is True
+            assert rs5["predictors"] == []
+
+    def test_deploy_gate_raises_on_missing_observed_other_allele(
+        self, sample_imputed_models
+    ):
+        """Default export refuses a scored observed term without other_allele."""
+        observed = [VariantInfo("rsX", "1", 100, "A", None, 0.1)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="other_allele"):
+                self._export(tmpdir, observed, sample_imputed_models)
+
+    def test_deploy_gate_raises_on_predictor_without_metadata(self):
+        """A predictor lacking other_allele metadata cannot be deployed."""
+        imputed = [
+            ImputedVariantModel(
+                variant_id="rs4", chromosome="1", position=150,
+                effect_allele="A", other_allele="G", beta=0.05,
+                allele_frequency=0.3, imputation_r2=0.8, residual_variance=0.1,
+                intercept=0.6, predictor_variant_ids=["rs1"],
+                coefficients=np.array([0.3]), is_intercept_only=False,
+            )
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="other_allele"):
+                self._export(tmpdir, [], imputed)
+
+    def test_escape_hatch_allows_missing_other_allele(self, sample_imputed_models):
+        """require_other_allele=False writes a non-deployable research export."""
+        observed = [VariantInfo("rsX", "1", 100, "A", None, 0.1)]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._export(
+                tmpdir, observed, sample_imputed_models, require_other_allele=False
+            )
+            assert data["observed_variants"][0]["other_allele"] is None
+            assert data["observed_variants"][0]["ambiguous"] is False

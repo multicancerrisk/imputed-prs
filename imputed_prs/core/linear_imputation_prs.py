@@ -160,6 +160,14 @@ class LinearImputationPRS:
         self._genome_build: Optional[str] = None
         self._model_name: Optional[str] = None
 
+        # Provenance for the deployable v2 export (consumed by the build/platform
+        # compatibility check). Reference panel / ancestry are set at fit(); the
+        # ambiguity policy default follows the deploy decision (training-side
+        # exclude_ambiguous stays False, so the model still carries palindromes).
+        self._reference_panel_id: Optional[str] = None
+        self._training_ancestry: Optional[str] = None
+        self._ambiguous_policy: str = "exclude_unless_platform_strand_known"
+
     def fit(
         self,
         reference_genotypes: Union[str, Path],
@@ -170,6 +178,8 @@ class LinearImputationPRS:
         genome_build: Optional[str] = None,
         prs_id: Optional[str] = None,
         model_name: Optional[str] = None,
+        reference_panel_id: Optional[str] = None,
+        training_ancestry: Optional[str] = None,
         evaluation_genotypes: Optional[Union[str, Path]] = None,
     ) -> "LinearImputationPRS":
         """Train imputation models on reference genotype data.
@@ -187,6 +197,10 @@ class LinearImputationPRS:
             genome_build: Genome build ("GRCh37" or "GRCh38"). Auto-detected if None.
             prs_id: PRS identifier for metadata.
             model_name: Human-readable model name for metadata.
+            reference_panel_id: Provenance — reference panel used for training
+                (e.g., "1000G_phase3_EUR"). Recorded in the deployable export.
+            training_ancestry: Provenance — ancestry of the training cohort
+                (e.g., "EUR"). Recorded in the deployable export.
             evaluation_genotypes: Optional holdout genotypes for external evaluation.
 
         Returns:
@@ -683,6 +697,8 @@ class LinearImputationPRS:
         self._platform_name = effective_platform_name
         self._genome_build = effective_genome_build
         self._model_name = model_name
+        self._reference_panel_id = reference_panel_id
+        self._training_ancestry = training_ancestry
 
         if self.verbose >= 1:
             print(
@@ -885,7 +901,16 @@ class LinearImputationPRS:
         for fmt in formats:
             if fmt == "json":
                 output_path = output_dir / f"{effective_model_name}.json"
-                export_to_json(output_path=output_path, **common_kwargs)
+                # Provenance params are JSON-only (v2); the shared common_kwargs is
+                # also consumed by the HDF5/Arrow/CSV exporters, which do not accept
+                # them yet (P1.5b).
+                export_to_json(
+                    output_path=output_path,
+                    reference_panel_id=self._reference_panel_id,
+                    training_ancestry=self._training_ancestry,
+                    ambiguous_policy=self._ambiguous_policy,
+                    **common_kwargs,
+                )
                 output_paths["json"] = output_path
 
             elif fmt == "arrow":
@@ -1010,9 +1035,38 @@ class LinearImputationPRS:
                 )
             )
 
-        # Parse imputed models
+        # Parse imputed models. v2 emits a self-describing `predictors` list; v1.0
+        # used parallel `predictor_variant_ids`/`coefficients` arrays with no
+        # predictor allele metadata. Restoring the P1.3 metadata is essential: the
+        # oriented scorer indexes predictor_counted_alleles[i] etc., so a model
+        # reloaded without it would mis-score (or IndexError) on real uploads.
         imputed_models = []
         for m in data.get("imputed_variants", []):
+            preds = m.get("predictors")
+            if preds is not None:
+                pred_ids = [p["variant_id"] for p in preds]
+                coefficients = np.array(
+                    [p["coefficient"] for p in preds], dtype=np.float64
+                )
+                predictor_chromosomes = [p["chromosome"] for p in preds]
+                predictor_positions = [p["position"] for p in preds]
+                predictor_counted_alleles = [p["counted_allele"] for p in preds]
+                predictor_other_alleles = [p["other_allele"] for p in preds]
+                predictor_allele_frequencies = np.array(
+                    [p["allele_frequency"] for p in preds], dtype=np.float64
+                )
+            else:
+                # v1.0 / legacy parallel-array layout (predictor allele metadata
+                # absent -> empty, preserving the historical load behavior).
+                pred_ids = m.get("predictor_variant_ids", [])
+                coefficients = np.array(m.get("coefficients", []), dtype=np.float64)
+                predictor_chromosomes = m.get("predictor_chromosomes", [])
+                predictor_positions = m.get("predictor_positions", [])
+                predictor_counted_alleles = m.get("predictor_counted_alleles", [])
+                predictor_other_alleles = m.get("predictor_other_alleles", [])
+                predictor_allele_frequencies = np.array(
+                    m.get("predictor_allele_frequencies", []), dtype=np.float64
+                )
             imputed_models.append(
                 ImputedVariantModel(
                     variant_id=m["variant_id"],
@@ -1025,9 +1079,14 @@ class LinearImputationPRS:
                     imputation_r2=m["imputation_r2"],
                     residual_variance=m.get("residual_variance", 0.0),
                     intercept=m["intercept"],
-                    predictor_variant_ids=m.get("predictor_variant_ids", []),
-                    coefficients=np.array(m.get("coefficients", [])),
+                    predictor_variant_ids=pred_ids,
+                    coefficients=coefficients,
                     is_intercept_only=m.get("is_intercept_only", False),
+                    predictor_chromosomes=predictor_chromosomes,
+                    predictor_positions=predictor_positions,
+                    predictor_counted_alleles=predictor_counted_alleles,
+                    predictor_other_alleles=predictor_other_alleles,
+                    predictor_allele_frequencies=predictor_allele_frequencies,
                 )
             )
 
@@ -1048,12 +1107,23 @@ class LinearImputationPRS:
         instance._calibration_params = calib_params
         instance._evaluation_metrics = eval_metrics
 
-        # Populate metadata
+        # Populate metadata + provenance (v2). Fall back to `metadata` for the
+        # identity fields that predate the provenance block so v1.0 files still
+        # populate genome build / platform.
         metadata = data.get("metadata", {})
+        provenance = data.get("provenance", {})
         instance._prs_id = metadata.get("prs_id")
-        instance._platform_name = metadata.get("platform_name")
-        instance._genome_build = metadata.get("genome_build")
+        instance._platform_name = (
+            metadata.get("platform_name") or provenance.get("platform_id")
+        )
+        instance._genome_build = (
+            metadata.get("genome_build") or provenance.get("genome_build")
+        )
         instance._model_name = metadata.get("model_name")
+        instance._reference_panel_id = provenance.get("reference_panel_id")
+        instance._training_ancestry = provenance.get("training_ancestry")
+        if provenance.get("ambiguous_policy"):
+            instance._ambiguous_policy = provenance["ambiguous_policy"]
 
         return instance
 
