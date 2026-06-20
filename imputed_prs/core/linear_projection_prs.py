@@ -170,6 +170,7 @@ class LinearProjectionPRS:
         model_name: Optional[str] = None,
         reference_panel_id: Optional[str] = None,
         training_ancestry: Optional[str] = None,
+        allow_alt_as_effect: bool = False,
     ) -> "LinearProjectionPRS":
         """Train projection models on reference genotype data.
 
@@ -187,6 +188,9 @@ class LinearProjectionPRS:
                 (e.g., "1000G_phase3_EUR"). Recorded in the deployable export.
             training_ancestry: Provenance — ancestry of the training cohort
                 (e.g., "EUR"). Recorded in the deployable export.
+            allow_alt_as_effect: If True, permit a PRS definition that supplies an
+                ``alt`` column (but no explicit ``effect_allele``) to be loaded by
+                treating ALT as the effect allele. Defaults to False, which raises.
 
         Returns:
             self (for method chaining).
@@ -215,7 +219,9 @@ class LinearProjectionPRS:
 
         # Step 2: Load PRS definition
         if isinstance(prs_definition, pd.DataFrame):
-            prs_df = load_prs_from_dataframe(prs_definition)
+            prs_df = load_prs_from_dataframe(
+                prs_definition, allow_alt_as_effect=allow_alt_as_effect
+            )
         elif isinstance(prs_definition, str) and prs_definition.upper().startswith("PGS"):
             prs_df, pgs_metadata = download_pgs_catalog_score(
                 prs_definition,
@@ -226,7 +232,9 @@ class LinearProjectionPRS:
             if effective_genome_build is None and pgs_metadata:
                 effective_genome_build = pgs_metadata.genome_build
         else:
-            prs_df = load_prs_from_file(Path(prs_definition))
+            prs_df = load_prs_from_file(
+                Path(prs_definition), allow_alt_as_effect=allow_alt_as_effect
+            )
 
         if self.verbose >= 2:
             print(f"Loaded PRS definition with {len(prs_df)} variants")

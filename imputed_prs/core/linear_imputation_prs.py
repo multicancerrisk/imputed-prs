@@ -208,6 +208,7 @@ class LinearImputationPRS:
         reference_panel_id: Optional[str] = None,
         training_ancestry: Optional[str] = None,
         evaluation_genotypes: Optional[Union[str, Path]] = None,
+        allow_alt_as_effect: bool = False,
     ) -> "LinearImputationPRS":
         """Train imputation models on reference genotype data.
 
@@ -229,6 +230,9 @@ class LinearImputationPRS:
             training_ancestry: Provenance — ancestry of the training cohort
                 (e.g., "EUR"). Recorded in the deployable export.
             evaluation_genotypes: Optional holdout genotypes for external evaluation.
+            allow_alt_as_effect: If True, permit a PRS definition that supplies an
+                ``alt`` column (but no explicit ``effect_allele``) to be loaded by
+                treating ALT as the effect allele. Defaults to False, which raises.
 
         Returns:
             self (for method chaining).
@@ -257,7 +261,9 @@ class LinearImputationPRS:
 
         # Step 2: Load PRS definition
         if isinstance(prs_definition, pd.DataFrame):
-            prs_df = load_prs_from_dataframe(prs_definition)
+            prs_df = load_prs_from_dataframe(
+                prs_definition, allow_alt_as_effect=allow_alt_as_effect
+            )
         elif isinstance(prs_definition, str) and prs_definition.upper().startswith("PGS"):
             # PGS Catalog ID
             prs_df, pgs_metadata = download_pgs_catalog_score(
@@ -270,7 +276,9 @@ class LinearImputationPRS:
                 effective_genome_build = pgs_metadata.genome_build
         else:
             # File path
-            prs_df = load_prs_from_file(Path(prs_definition))
+            prs_df = load_prs_from_file(
+                Path(prs_definition), allow_alt_as_effect=allow_alt_as_effect
+            )
 
         if self.verbose >= 2:
             print(f"Loaded PRS definition with {len(prs_df)} variants")

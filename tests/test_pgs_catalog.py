@@ -446,10 +446,10 @@ class TestDownloadScore:
         # Create test scoring file content
         scoring_content = (
             "# PGS000004\n"
-            "rsID\thm_rsID\tchr_name\thm_chr\tchr_position\thm_pos\teffect_allele\teffect_weight\thm_code\n"
-            "rs123\trs123\t1\t1\t100\t100\tA\t0.1\t0\n"
-            "rs456\trs456\t2\t2\t200\t200\tG\t0.2\t0\n"
-            "rs789\trs789\t3\t3\t300\t300\tT\t0.3\t-1\n"
+            "rsID\thm_rsID\tchr_name\thm_chr\tchr_position\thm_pos\teffect_allele\tother_allele\teffect_weight\thm_code\n"
+            "rs123\trs123\t1\t1\t100\t100\tA\tG\t0.1\t0\n"
+            "rs456\trs456\t2\t2\t200\t200\tG\tA\t0.2\t0\n"
+            "rs789\trs789\t3\t3\t300\t300\tT\tC\t0.3\t-1\n"
         )
 
         # Mock file download response
@@ -496,11 +496,11 @@ class TestDownloadScore:
             )
             _save_metadata_to_cache(metadata, cache_dir)
 
-            # Create cached scoring file
+            # Create cached scoring file (harmonized files carry chr/pos + other_allele)
             scoring_content = (
-                "rsID\teffect_allele\teffect_weight\n"
-                "rs123\tA\t0.1\n"
-                "rs456\tG\t0.2\n"
+                "rsID\tchr_name\tchr_position\teffect_allele\tother_allele\teffect_weight\n"
+                "rs123\t1\t100\tA\tG\t0.1\n"
+                "rs456\t2\t200\tG\tA\t0.2\n"
             )
             cache_path = cache_dir / "PGS000004_hmPOS_GRCh37.txt.gz"
             with gzip.open(cache_path, "wt") as f:
