@@ -22,6 +22,7 @@ from imputed_prs.core.harmonizer import (
 )
 from imputed_prs.core.types import (
     CalibrationParams,
+    ImputedVariantModel,
     PredictionResult,
     ProjectionRegionModel,
     ProjectionTrainingResult,
@@ -43,6 +44,7 @@ from imputed_prs.io.user_genotypes import (
 from imputed_prs.io.exporters.projection_json_export import export_projection_to_json
 from imputed_prs.models.projection_predictor import ProjectionPredictor
 from imputed_prs.models.projection_trainer import ProjectionRegionTrainer
+from imputed_prs.models.trainer import ImputationModelTrainer
 
 
 class LinearProjectionPRS:
@@ -540,11 +542,85 @@ class LinearProjectionPRS:
                     print(f"Warning: Could not compute calibration parameters: {e}")
                 calibration_params = None
 
-        # Step 11: Build observed VariantInfo objects (excluding QC-dropped SNPs)
-        observed_variants_list: List[VariantInfo] = []
+        # Step 11: Build observed VariantInfo objects (excluding QC-dropped SNPs),
+        # each carrying an optional per-variant fallback imputation model (P2.4) so
+        # an observed variant the user's upload cannot resolve/call is recovered
+        # rather than silently dropped — parity with the imputation product (P1.8).
+        #
+        # Pass 1: collect the kept observed rows and, for each whose effect-allele
+        # dosage is extractable from the reference, an effect-oriented target column
+        # to train its fallback from (local-window platform predictors, the target
+        # locus auto-excluded by filter_to_local_window).
+        kept_observed_rows: List[pd.Series] = []
+        fb_target_pos: List[int] = []  # indices into kept_observed_rows with a target
+        fb_columns: List[np.ndarray] = []
+        fallback_no_target_ids: Set[str] = set()
         for _, row in prs_df[prs_df["variant_id"].isin(observed_variant_ids)].iterrows():
             if row["variant_id"] in ambiguous_excluded_ids:
                 continue
+            pos_in_kept = len(kept_observed_rows)
+            kept_observed_rows.append(row)
+            if Z.shape[1] == 0:
+                continue
+            match = match_oriented_dosage(
+                row["chromosome"], int(row["position"]),
+                row["effect_allele"], row.get("other_allele"),
+                genotype_data.variant_info, genotype_data.dosage_matrix,
+                reference_index,
+            )
+            if match is None:
+                # Platform-measured but no reference target (locus absent): still
+                # scored directly when the upload resolves it, but there is no panel
+                # to train a fallback from.
+                fallback_no_target_ids.add(row["variant_id"])
+                continue
+            fb_target_pos.append(pos_in_kept)
+            fb_columns.append(match[1])
+
+        # Train the fallbacks with the same trainer/config as the region models.
+        # Projection does no tuning, so use self.l1_ratio / self.alpha (the region
+        # trainer above does the same). The trainer keys results by variant_id, which
+        # is not unique at duplicate-rsID multiallelic loci, so train against a unique
+        # synthetic key and reset each model's identity to its real variant afterwards.
+        fallback_by_pos: Dict[int, ImputedVariantModel] = {}
+        if fb_columns:
+            if self.verbose >= 1:
+                print(
+                    f"Training {len(fb_columns)} observed-variant fallback models..."
+                )
+            fb_prs_rows = []
+            for k, pos_in_kept in enumerate(fb_target_pos):
+                fb_row = kept_observed_rows[pos_in_kept].copy()
+                fb_row["variant_id"] = str(k)
+                fb_prs_rows.append(fb_row)
+            fb_prs_df = pd.DataFrame(fb_prs_rows).reset_index(drop=True)
+            X_observed = np.column_stack(fb_columns).astype(np.float32)
+            fb_trainer = ImputationModelTrainer(
+                window_size=self.window_size,
+                l1_ratio=self.l1_ratio,
+                alpha=self.alpha,
+                cv_folds=self.cv_folds,
+                n_jobs=self.n_jobs,
+                random_state=self.random_state,
+                max_predictors=self.max_predictors,
+                verbose=0,
+            )
+            fb_result = fb_trainer.fit_all_variants(
+                Z=Z,
+                X=X_observed,
+                prs_variants=fb_prs_df,
+                platform_variant_info=platform_variant_info,
+            )
+            for k, pos_in_kept in enumerate(fb_target_pos):
+                model = fb_result.models.get(str(k))
+                if model is None:
+                    continue
+                model.variant_id = kept_observed_rows[pos_in_kept]["variant_id"]
+                fallback_by_pos[pos_in_kept] = model
+
+        # Pass 2: build the VariantInfos, attaching each fallback by position.
+        observed_variants_list: List[VariantInfo] = []
+        for pos_in_kept, row in enumerate(kept_observed_rows):
             other_allele = row.get("other_allele")
             if pd.isna(other_allele):
                 other_allele = None
@@ -557,12 +633,14 @@ class LinearProjectionPRS:
                     effect_allele=row["effect_allele"],
                     other_allele=other_allele,
                     beta=float(row["beta"]),
+                    fallback=fallback_by_pos.get(pos_in_kept),
                 )
             )
 
         # Step 11b: Record a disposition for every input PRS variant so coverage
         # is reported honestly (no silent loss).
         observed_kept_ids = {v.variant_id for v in observed_variants_list}
+        observed_fallback_ids = {m.variant_id for m in fallback_by_pos.values()}
         covered_ids: Set[str] = set()
         for region in training_result.region_models.values():
             covered_ids.update(region.prs_variant_ids)
@@ -572,6 +650,8 @@ class LinearProjectionPRS:
             covered_ids=covered_ids,
             ambiguous_excluded_ids=ambiguous_excluded_ids,
             missing_drop_reason=missing_drop_reason,
+            observed_fallback_ids=observed_fallback_ids,
+            fallback_no_target_ids=fallback_no_target_ids,
         )
 
         # Step 12: Populate instance state
@@ -608,6 +688,8 @@ class LinearProjectionPRS:
         covered_ids: Set[str],
         ambiguous_excluded_ids: Set[str],
         missing_drop_reason: Dict[str, str],
+        observed_fallback_ids: Optional[Set[str]] = None,
+        fallback_no_target_ids: Optional[Set[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Build one disposition record per input PRS variant.
 
@@ -615,7 +697,14 @@ class LinearProjectionPRS:
         {observed, projected, dropped}; ``reason`` is None for placed variants,
         or one of {ambiguous_excluded, reference_contig_missing, allele_mismatch,
         not_in_reference, training_failed} for dropped ones.
+
+        For observed variants, ``has_fallback`` records whether a per-variant
+        fallback model was trained (P2.4) and ``fallback_reason`` explains its
+        absence ({no_reference_target, no_fallback_model}); both are False/None
+        for non-observed rows.
         """
+        observed_fallback_ids = observed_fallback_ids or set()
+        fallback_no_target_ids = fallback_no_target_ids or set()
         dispositions: List[Dict[str, Any]] = []
         for _, row in prs_df.iterrows():
             var_id = row["variant_id"]
@@ -634,6 +723,17 @@ class LinearProjectionPRS:
                 status = "dropped"
                 reason = missing_drop_reason.get(var_id, "training_failed")
 
+            has_fallback = False
+            fallback_reason: Optional[str] = None
+            if status == "observed":
+                has_fallback = var_id in observed_fallback_ids
+                if not has_fallback:
+                    fallback_reason = (
+                        "no_reference_target"
+                        if var_id in fallback_no_target_ids
+                        else "no_fallback_model"
+                    )
+
             dispositions.append({
                 "variant_id": var_id,
                 "chromosome": str(row["chromosome"]),
@@ -643,6 +743,8 @@ class LinearProjectionPRS:
                 "beta": float(row["beta"]),
                 "status": status,
                 "reason": reason,
+                "has_fallback": has_fallback,
+                "fallback_reason": fallback_reason,
             })
         return dispositions
 
@@ -791,6 +893,11 @@ class LinearProjectionPRS:
             )
 
         n_observed = len(self._observed_variants or [])
+        # Observed variants recoverable via a per-variant fallback model (P2.4).
+        # Computed from state so it is correct for both fitted and loaded models.
+        n_observed_with_fallback = sum(
+            1 for v in (self._observed_variants or []) if v.fallback is not None
+        )
         n_missing = sum(
             len(m.prs_variant_ids) for m in (self._region_models or [])
         )
@@ -821,6 +928,7 @@ class LinearProjectionPRS:
 
         return {
             "n_observed_variants": n_observed,
+            "n_observed_with_fallback": n_observed_with_fallback,
             "n_missing_variants": n_missing,
             "n_definition_variants": n_definition,
             "n_dropped": n_dropped,

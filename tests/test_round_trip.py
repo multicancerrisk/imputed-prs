@@ -303,6 +303,52 @@ class TestProjectionRoundTrip:
         assert r1.n_variants_used == r0.n_variants_used
         assert r1.unresolved_observed_ids == r0.unresolved_observed_ids
 
+    def test_fitted_model_trains_observed_fallbacks(self, fitted_projection_model):
+        # Guards the fallback round trip below: every in-reference observed
+        # variant (rs1-rs3) must carry a per-variant fallback model (P2.4).
+        observed = fitted_projection_model.observed_variants
+        assert observed, "expected observed variants"
+        assert all(v.fallback is not None for v in observed)
+        assert fitted_projection_model.summary["n_observed_with_fallback"] == len(
+            observed
+        )
+
+    def test_round_trip_recovers_observed_fallback(
+        self, fitted_projection_model, tmp_path
+    ):
+        """An upload that no-calls an observed variant recovers it via fallback,
+        and that recovery survives the JSON export->load (P2.4)."""
+        model = fitted_projection_model
+        # rs2 is a no-call; rs1/rs3 are called so rs2's fallback can use them.
+        upload = pd.DataFrame(
+            {
+                "rsid": ["rs1", "rs2", "rs3"],
+                "chromosome": ["1", "1", "1"],
+                "position": [100000, 100500, 101000],
+                "genotype": ["AG", "--", "AA"],
+            }
+        )
+        loaded = LinearProjectionPRS.load(
+            model.export(tmp_path, model_name="fb", formats=["json"])["json"]
+        )
+
+        r0 = model.predict(upload, apply_calibration=False, genome_build="GRCh37")
+        r1 = loaded.predict(upload, apply_calibration=False, genome_build="GRCh37")
+
+        # rs2 recovered via fallback (not dropped), both in-memory and loaded.
+        assert r0.n_observed_scored_via_fallback == 1
+        assert r1.n_observed_scored_via_fallback == 1
+        assert r0.unresolved_observed_ids == ()
+        assert r1.unresolved_observed_ids == ()
+        # The fallback recovery survives the round trip to float tolerance, so the
+        # serialized projection fallback block is exact.
+        np.testing.assert_allclose(
+            [r1.prs, r1.prs_observed_component, r1.se],
+            [r0.prs, r0.prs_observed_component, r0.se],
+            rtol=0,
+            atol=1e-12,
+        )
+
     def test_calibration_survives_round_trip(
         self, fitted_projection_model, user_genotype_df, tmp_path
     ):
