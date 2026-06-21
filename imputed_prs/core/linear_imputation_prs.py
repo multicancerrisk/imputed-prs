@@ -950,9 +950,14 @@ class LinearImputationPRS:
 
         Args:
             user_genotypes: User genotype data as:
-                - File path (DTC format auto-detected)
-                - DataFrame with variant_id and genotype columns
-                - Dict mapping variant_id to dosage values
+                - File path (DTC format auto-detected) — scored allele-aware
+                  (genotypes are oriented against each variant's effect/other
+                  alleles). Recommended for correct scoring.
+                - DataFrame with variant_id and genotype columns — also scored
+                  allele-aware. Recommended for correct scoring.
+                - Dict mapping variant_id to numeric dosage — a legacy,
+                  allele-blind fallback that bypasses allele orientation (it
+                  trusts the dosages as-is). Prefer a file/DataFrame input.
             apply_calibration: Whether to apply calibration scaling.
                 Default: True.
             genome_build: Genome build of the user genotypes (e.g. "GRCh37").
@@ -1001,11 +1006,13 @@ class LinearImputationPRS:
         expected_variants = self._get_expected_variants()
 
         # Handle dict input directly, otherwise use the loaders. For real uploads
-        # (file / DataFrame) also load a multi-key raw collection so the observed
-        # component is scored allele-aware. The imputed component still reads the
-        # legacy dosage dict (unchanged until P1.4), so the input is deliberately
-        # parsed twice here; the double parse goes away when P1.4 routes predictor
-        # inputs through the same collection.
+        # (file / DataFrame) we load a multi-key raw collection so that BOTH the
+        # observed and imputed components are scored allele-aware (the predictor
+        # passes raw_genotypes to its oriented scorers). The legacy dosage dict
+        # (user_dosages) is still loaded alongside it to drive the allele-blind
+        # back-compat path and the missing-variant accounting; that is why the
+        # input is parsed twice here. A numeric dict input takes only the legacy
+        # allele-blind path (raw_genotypes stays None).
         raw_genotypes = None
         if isinstance(user_genotypes, dict):
             user_dosages = user_genotypes

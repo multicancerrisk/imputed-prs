@@ -22,6 +22,7 @@ from imputed_prs import LinearProjectionPRS
 from imputed_prs.core.exceptions import ModelNotFittedError
 from imputed_prs.core.types import (
     CalibrationParams,
+    ImputedVariantModel,
     ProjectionRegionModel,
     VariantInfo,
 )
@@ -554,3 +555,158 @@ class TestProjectionExportMethod:
         model = LinearProjectionPRS(verbose=0)
         with pytest.raises(ModelNotFittedError):
             model.export(tmp_path)
+
+
+# =============================================================================
+# JSON Schema validation
+# =============================================================================
+
+# Committed machine-readable schema for the v2.0 deployable projection artifact.
+SCHEMA_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "schemas"
+    / "projection_model_v2.schema.json"
+)
+
+
+@pytest.fixture
+def jsonschema_mod():
+    """The jsonschema module; schema tests skip if the dev dep is absent."""
+    return pytest.importorskip("jsonschema")
+
+
+@pytest.fixture
+def projection_v2_validator(jsonschema_mod):
+    """A validator built from the committed v2 projection schema.
+
+    Building it also asserts the committed schema is itself a valid Draft
+    2020-12 schema (``check_schema``), so a malformed schema fails loudly.
+    """
+    with open(SCHEMA_PATH) as f:
+        schema = json.load(f)
+    validator_cls = jsonschema_mod.validators.validator_for(schema)
+    validator_cls.check_schema(schema)
+    return validator_cls(schema)
+
+
+class TestSchemaValidation:
+    """Validate exported v2 projection artifacts against the committed schema."""
+
+    def test_committed_schema_is_valid(self, projection_v2_validator):
+        """The committed schema parses and passes Draft 2020-12 check_schema."""
+        # Reaching here means the fixture built the validator without raising.
+        assert projection_v2_validator is not None
+
+    def test_full_export_validates(self, projection_v2_validator):
+        """A fully-populated deployable export conforms to the schema."""
+        data = _export(
+            _make_observed_variants(),
+            [
+                _make_region_model(region_id="r1"),
+                _make_region_model(region_id="r2", is_intercept_only=True),
+            ],
+            calibration_params=_make_calibration_params(),
+            training_summary={"mean_r2": 0.75, "n_high_quality": 100},
+            platform_name="23andme_v5",
+            prs_id="PGS000004",
+            genome_build="GRCh37",
+            model_name="Test PRS Model",
+            reference_panel_id="1000G_phase3_EUR",
+            training_ancestry="EUR",
+            include_variance_scaling=True,
+            require_provenance=True,
+        )
+        projection_v2_validator.validate(data)  # raises on invalid
+
+    def test_minimal_export_validates(self, projection_v2_validator):
+        """A minimal export still conforms.
+
+        No calibration/training_summary, so the optional top-level blocks are
+        absent and ``centering_scaling`` is null.
+        """
+        data = _export(_make_observed_variants(), [_make_region_model()])
+        assert "calibration_params" not in data
+        assert "training_summary" not in data
+        assert data["provenance"]["centering_scaling"] is None
+        projection_v2_validator.validate(data)
+
+    def test_empty_region_models_validates(self, projection_v2_validator):
+        """An export with no projected regions still conforms."""
+        data = _export(_make_observed_variants(), [])
+        assert data["region_models"] == []
+        projection_v2_validator.validate(data)
+
+    def test_observed_fallback_validates(self, projection_v2_validator):
+        """An observed variant carrying a populated fallback model conforms (P2.4)."""
+        fallback = ImputedVariantModel(
+            variant_id="rs4",
+            chromosome="1",
+            position=150,
+            effect_allele="A",
+            other_allele="G",
+            beta=0.05,
+            allele_frequency=0.3,
+            imputation_r2=0.8,
+            residual_variance=0.1,
+            intercept=0.6,
+            predictor_variant_ids=["rs1", "rs2"],
+            coefficients=np.array([0.3, 0.2]),
+            is_intercept_only=False,
+            predictor_chromosomes=["1", "1"],
+            predictor_positions=[100, 200],
+            predictor_counted_alleles=["G", "T"],
+            predictor_other_alleles=["A", "C"],
+            predictor_allele_frequencies=np.array([0.4, 0.3]),
+        )
+        observed = [
+            VariantInfo("rs100", "1", 500_000, "A", "G", 0.5, fallback=fallback),
+            VariantInfo("rs101", "1", 600_000, "C", "T", -0.3),  # fallback=None
+        ]
+        data = _export(observed, [_make_region_model()])
+        assert data["observed_variants"][0]["fallback"] is not None
+        assert data["observed_variants"][1]["fallback"] is None
+        projection_v2_validator.validate(data)
+
+    def test_prs_variant_null_other_allele_validates(self, projection_v2_validator):
+        """A region PRS variant with a null other_allele conforms (it is allowed
+        to be null since PRS variants are projected, not counted)."""
+        region = _make_region_model(prs_other_alleles=[None])
+        data = _export(_make_observed_variants(), [region])
+        assert data["region_models"][0]["prs_variants"][0]["other_allele"] is None
+        projection_v2_validator.validate(data)
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            pytest.param(
+                lambda d: d["metadata"].__setitem__("unexpected", 1),
+                id="extra-field",
+            ),
+            pytest.param(
+                lambda d: d["region_models"][0]["predictors"][0].pop(
+                    "counted_allele"
+                ),
+                id="missing-predictor-counted-allele",
+            ),
+            pytest.param(
+                lambda d: d["region_models"][0].pop("target_variance"),
+                id="missing-region-target-variance",
+            ),
+            pytest.param(
+                lambda d: d["observed_variants"][0].__setitem__("position", "100"),
+                id="position-wrong-type",
+            ),
+            pytest.param(
+                lambda d: d["metadata"].__setitem__("format_version", "1.0"),
+                id="wrong-format-version",
+            ),
+        ],
+    )
+    def test_invalid_artifacts_are_rejected(
+        self, jsonschema_mod, projection_v2_validator, mutate
+    ):
+        """The schema actually constrains: malformed artifacts fail validation."""
+        data = _export(_make_observed_variants(), [_make_region_model()])
+        mutate(data)
+        with pytest.raises(jsonschema_mod.ValidationError):
+            projection_v2_validator.validate(data)

@@ -876,7 +876,13 @@ class LinearProjectionPRS:
         """Compute PRS for user genotypes using projection models.
 
         Args:
-            user_genotypes: User genotype data as file path, DataFrame, or dict.
+            user_genotypes: User genotype data as a file path (DTC format
+                auto-detected) or DataFrame — both scored allele-aware
+                (genotypes are oriented against each variant's effect/other
+                alleles); recommended for correct scoring. A dict mapping
+                variant_id to numeric dosage is a legacy, allele-blind fallback
+                that bypasses allele orientation (it trusts the dosages as-is);
+                prefer a file/DataFrame input.
             apply_calibration: Whether to apply calibration scaling. Default: True.
             genome_build: Genome build of the user genotypes (e.g. "GRCh37").
                 Overrides auto-detection. For file inputs the build is
@@ -921,10 +927,13 @@ class LinearProjectionPRS:
 
         expected_variants = self._get_expected_variants()
 
-        # See LinearImputationPRS.predict: real uploads also load a multi-key raw
-        # collection for allele-aware observed scoring; the projected component
-        # still reads the legacy dosage dict (unchanged until P1.4), hence the
-        # deliberate double parse.
+        # See LinearImputationPRS.predict: for real uploads we load a multi-key
+        # raw collection so BOTH the observed and projected components are scored
+        # allele-aware (the predictor passes raw_genotypes to its oriented
+        # scorers). The legacy dosage dict (user_dosages) is loaded alongside it
+        # for the allele-blind back-compat path and missing-variant accounting,
+        # hence the double parse. A numeric dict input takes only the legacy
+        # allele-blind path (raw_genotypes stays None).
         raw_genotypes = None
         if isinstance(user_genotypes, dict):
             user_dosages = user_genotypes

@@ -1,0 +1,150 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://imputed-prs/schemas/projection_model_v2.schema.json",
+  "title": "imputed-prs projection model (JSON export v2.0)",
+  "description": "Browser-deployable projection PRS artifact emitted by imputed_prs.io.exporters.projection_json_export.export_projection_to_json with require_other_allele=True. Strict/closed contract for the v2.0 format. The projection analog of imputation_model_v2.schema.json: per-variant blocks are grouped into region_models (instead of a flat imputed_variants list) and there is no evaluation_metrics block.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["metadata", "provenance", "observed_variants", "region_models", "platform_variant_index"],
+  "properties": {
+    "metadata": { "$ref": "#/$defs/metadata" },
+    "provenance": { "$ref": "#/$defs/provenance" },
+    "observed_variants": { "type": "array", "items": { "$ref": "#/$defs/observedVariant" } },
+    "region_models": { "type": "array", "items": { "$ref": "#/$defs/regionModel" } },
+    "platform_variant_index": { "type": "object", "additionalProperties": { "type": "integer" } },
+    "calibration_params": { "$ref": "#/$defs/calibrationParams" },
+    "training_summary": { "type": "object" }
+  },
+  "$defs": {
+    "metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["format_version", "created_at", "model_name", "prs_id", "platform_name", "genome_build", "n_observed_variants", "n_region_models", "n_intercept_only_regions", "include_variance_scaling"],
+      "properties": {
+        "format_version": { "const": "2.0" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "model_name": { "type": ["string", "null"] },
+        "prs_id": { "type": ["string", "null"] },
+        "platform_name": { "type": ["string", "null"] },
+        "genome_build": { "type": ["string", "null"] },
+        "n_observed_variants": { "type": "integer", "minimum": 0 },
+        "n_region_models": { "type": "integer", "minimum": 0 },
+        "n_intercept_only_regions": { "type": "integer", "minimum": 0 },
+        "include_variance_scaling": { "type": "boolean" }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["genome_build", "platform_id", "reference_panel_id", "training_ancestry", "ambiguous_policy", "centering_scaling"],
+      "properties": {
+        "genome_build": { "type": ["string", "null"] },
+        "platform_id": { "type": ["string", "null"] },
+        "reference_panel_id": { "type": ["string", "null"] },
+        "training_ancestry": { "type": ["string", "null"] },
+        "ambiguous_policy": { "type": "string", "minLength": 1 },
+        "centering_scaling": { "anyOf": [ { "$ref": "#/$defs/calibrationParams" }, { "type": "null" } ] }
+      }
+    },
+    "observedVariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["variant_id", "chromosome", "position", "effect_allele", "other_allele", "beta", "accepted_ids", "ambiguous"],
+      "properties": {
+        "variant_id": { "type": "string", "minLength": 1 },
+        "chromosome": { "type": "string", "minLength": 1 },
+        "position": { "type": "integer" },
+        "effect_allele": { "type": "string", "minLength": 1 },
+        "other_allele": { "type": ["string", "null"] },
+        "beta": { "type": "number" },
+        "accepted_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "ambiguous": { "type": "boolean" },
+        "fallback": { "anyOf": [ { "$ref": "#/$defs/imputedVariant" }, { "type": "null" } ] }
+      }
+    },
+    "regionModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["region_id", "chromosome", "start", "end", "intercept", "cv_mse", "cv_r2", "is_intercept_only", "mean_prs_contribution", "target_variance", "predictors", "prs_variants"],
+      "properties": {
+        "region_id": { "type": "string", "minLength": 1 },
+        "chromosome": { "type": "string", "minLength": 1 },
+        "start": { "type": "integer" },
+        "end": { "type": "integer" },
+        "intercept": { "type": "number" },
+        "cv_mse": { "type": "number" },
+        "cv_r2": { "type": "number" },
+        "is_intercept_only": { "type": "boolean" },
+        "mean_prs_contribution": { "type": "number" },
+        "target_variance": { "type": "number" },
+        "predictors": { "type": "array", "items": { "$ref": "#/$defs/predictor" } },
+        "prs_variants": { "type": "array", "items": { "$ref": "#/$defs/prsVariant" } }
+      }
+    },
+    "prsVariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["variant_id", "chromosome", "position", "effect_allele", "other_allele", "beta"],
+      "properties": {
+        "variant_id": { "type": "string", "minLength": 1 },
+        "chromosome": { "type": "string", "minLength": 1 },
+        "position": { "type": "integer" },
+        "effect_allele": { "type": "string", "minLength": 1 },
+        "other_allele": { "type": ["string", "null"] },
+        "beta": { "type": "number" }
+      }
+    },
+    "imputedVariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["variant_id", "chromosome", "position", "effect_allele", "other_allele", "beta", "allele_frequency", "imputation_r2", "intercept", "is_intercept_only", "predictors"],
+      "properties": {
+        "variant_id": { "type": "string", "minLength": 1 },
+        "chromosome": { "type": "string", "minLength": 1 },
+        "position": { "type": "integer" },
+        "effect_allele": { "type": "string", "minLength": 1 },
+        "other_allele": { "type": ["string", "null"] },
+        "beta": { "type": "number" },
+        "allele_frequency": { "type": "number" },
+        "imputation_r2": { "type": "number" },
+        "intercept": { "type": "number" },
+        "is_intercept_only": { "type": "boolean" },
+        "predictors": { "type": "array", "items": { "$ref": "#/$defs/predictor" } },
+        "residual_variance": { "type": "number" }
+      }
+    },
+    "predictor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["variant_id", "chromosome", "position", "counted_allele", "other_allele", "allele_frequency", "coefficient"],
+      "properties": {
+        "variant_id": { "type": "string", "minLength": 1 },
+        "chromosome": { "type": "string", "minLength": 1 },
+        "position": { "type": "integer" },
+        "counted_allele": { "type": "string", "minLength": 1 },
+        "other_allele": { "type": "string", "minLength": 1 },
+        "allele_frequency": { "type": "number" },
+        "coefficient": { "type": "number" }
+      }
+    },
+    "calibrationParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scaling_factor", "scaling_factor_se", "calibration_intercept", "calibration_r2", "sd_cv_predicted", "sd_true", "sd_scaled", "attenuation_factor", "n_calibration"],
+      "properties": {
+        "scaling_factor": { "type": "number" },
+        "scaling_factor_se": { "type": "number" },
+        "calibration_intercept": { "type": "number" },
+        "calibration_r2": { "type": "number" },
+        "sd_cv_predicted": { "type": "number" },
+        "sd_true": { "type": "number" },
+        "sd_scaled": { "type": "number" },
+        "attenuation_factor": { "type": "number" },
+        "n_calibration": { "type": "integer" },
+        "raw_empirical_residual_sd": { "type": ["number", "null"] },
+        "calibrated_empirical_residual_sd": { "type": ["number", "null"] },
+        "diagonal_model_se_lower_bound": { "type": ["number", "null"] }
+      }
+    }
+  }
+}

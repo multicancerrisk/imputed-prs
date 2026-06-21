@@ -131,29 +131,39 @@ LinearProjectionPRS(alpha=0.01, l1_ratio=0.5)
 
 ### Hyperparameter Tuning
 
-The two methods differ in their tuning support:
+Both methods support hyperparameter tuning via a `tuning_scope` parameter. All tuning
+modes evaluate candidate `(\alpha, \rho)` pairs on the **same local-window (imputation)
+or region (projection) matrices that training uses** — built with the identical
+windowing/region call the trainer makes — so the tuner never optimizes a model that
+differs from the one ultimately fit. To keep cost bounded, the search runs over a
+**stratified subsample** of fitting units (variants or regions) rather than the full
+set; the strata are chosen so the subsample spans the structural regimes that drive
+the best hyperparameters.
 
-All tuning modes evaluate candidate hyperparameters on the **same local-window
-(imputation) or region (projection) matrices used in training**, so the tuner never
-optimizes a model that is not the one ultimately fit.
-
-**Linear Imputation** supports the `tuning_scope` parameter with three strategies:
+**Linear Imputation** supports three strategies:
 
 | Strategy | Behavior |
 |----------|----------|
-| `"global"` | Tune once on a bounded, stratified sample of missing variants (by chromosome / MAF / \|beta\|), each scored on its own local window; apply the winning `alpha`/`l1_ratio` to all variants. Sample size is capped by `max_tuning_variants`. |
+| `"global"` | Tune once on a bounded, stratified sample of missing variants, each scored on its own local window; apply the single winning `alpha`/`l1_ratio` to all variants. The sample is stratified by **chromosome × MAF bin × \|beta\| bin** (MAF and \|beta\| bucketed by data quantiles) and capped at `max_tuning_variants`. |
 | `"per_variant"` | Grid-search each variant's own local window and give each variant its own `alpha`/`l1_ratio` (slower, more precise). |
-| `"none"` | Use the provided `alpha` and `l1_ratio` directly |
+| `"none"` | Use the provided `alpha` and `l1_ratio` directly. |
 
-See `imputed_prs/models/tuning.py` for the tuning implementation and `imputed_prs/models/elastic_net.py:fit_single_variant_model()` for per-variant fitting.
+See `imputed_prs/models/tuning.py:global_hyperparameter_search()` (and
+`optuna_hyperparameter_search()` for the TPE variant) plus
+`imputed_prs/models/elastic_net.py:fit_single_variant_model()` for per-variant fitting.
 
-**Linear Projection** supports `tuning_scope` with `"global"` and `"none"`. `"global"`
-searches a bounded, stratified sample of regions (capped by `max_tuning_regions`) on
-the same region matrices training uses — target $S_R = X_R \beta_R$, predictors the
-region's platform variants — and applies the winning `alpha`/`l1_ratio` to all region
-models. There is no `"per_variant"` mode for projection.
+**Linear Projection** supports `"global"` and `"none"` (there is no `"per_variant"`
+mode for projection). `"global"` searches a bounded, stratified sample of regions
+(capped by `max_tuning_regions`) on the same region matrices training uses — target
+$S_R = X_R \beta_R$, predictors the region's platform variants — and applies the
+winning `alpha`/`l1_ratio` to all region models. Because the unit of fitting is a
+region (not a single variant), the projection sample is stratified by the region's
+**predictor-count bucket × PRS-variant-count bucket** (a region's MAF/$\beta$ are
+not single scalars), rather than by the imputation chr/MAF/$|\beta|$ key.
 
-See `imputed_prs/models/projection.py:fit_single_region_model()` for the region fitting implementation and `imputed_prs/models/tuning.py:projection_hyperparameter_search()` for the region tuner.
+See `imputed_prs/models/projection.py:fit_single_region_model()` for the region
+fitting implementation and `imputed_prs/models/tuning.py:projection_hyperparameter_search()`
+for the region tuner.
 
 ---
 
@@ -185,7 +195,35 @@ $$
 
 The slope $b$ (typically $> 1$) is the scaling factor that inflates predictions back to the correct variance. The intercept $a$ corrects for any mean shift.
 
+The same out-of-fold fit also yields the library's **empirical, score-level
+approximation error** — the standard deviations of the per-sample residuals
+$S_{true} - S_{cv}$ (raw) and $S_{true} - (a + b\,S_{cv})$ (calibrated). Because these
+are residuals of the *whole-score* difference, they capture the full
+$\beta^\top \Sigma \beta$ covariance — LD off-diagonals included — that a per-variant
+sum-of-variances structurally omits. They are the quantities the prediction interval
+actually reports; see each method's *Uncertainty Quantification* section.
+
 See `imputed_prs/evaluation/calibration.py:estimate_cv_calibration()` for implementation.
+
+#### Missing-Data Handling in the Calibration Matrix
+
+The score matrix used to assemble $S_{cv}$ and $S_{true}$ is effect-allele-oriented
+reference dosages, one column per placed PRS variant. Samples missing a reference
+dosage for a column are filled by **per-column mean imputation**
+(`mean_impute_columns`), not by `NaN \to 0`. Under Hardy-Weinberg equilibrium a
+column's mean equals the population-expected dosage $2 q_j$, so filling with the column
+mean substitutes the unbiased expectation rather than $0$ (which would assert
+homozygous *non-effect* and pull both $S_{true}$ and the observed part of $S_{cv}$
+toward zero).
+
+> **Honest caveat about what this fixes.** Mean-filling de-biases the **location** of
+> each column (its mean is preserved exactly) and lowers reconstruction SSE relative to
+> zero-filling. It does **not** make the estimated calibration *scaling* parameters
+> ($a$, $b$) uniformly closer to their complete-case values: imputed cells sit exactly
+> at the column mean, which **shrinks** the column's variance and distorts its
+> covariance with other columns. What is robust here is column-mean (location)
+> preservation and a smaller reconstruction error — not an unbiased recovery of the
+> regression slope under missingness. See `imputed_prs/evaluation/calibration.py:mean_impute_columns()`.
 
 ### How $S_{cv}$ Differs Between Methods
 
@@ -211,21 +249,28 @@ See `imputed_prs/core/linear_projection_prs.py` (Step 10) for the projection cal
 
 ### Applying Calibration at Prediction Time
 
-At inference, the raw PRS and its uncertainty are rescaled using the learned calibration parameters:
+At inference, the raw PRS point estimate is rescaled using the learned calibration parameters:
 
 $$
 S_{scaled} = a + b \cdot S_{raw}
 $$
 
 $$
-SE_{scaled} = |b| \cdot SE
-$$
-
-$$
 CI_{scaled} = S_{scaled} \pm 1.96 \cdot SE_{scaled}
 $$
 
-The absolute value $|b|$ ensures the standard error remains non-negative regardless of the sign of the slope.
+The interval half-width $SE_{scaled}$ is **not** simply $|b| \cdot SE$. Since the
+empirical residual calibration (see each method's *Uncertainty Quantification*
+section), the reported $SE_{scaled}$ is the empirical post-calibration residual SD,
+floored by the slope-scaled diagonal lower bound:
+
+$$
+SE_{scaled} = \max\!\left(\,\widehat{\sigma}^{\,cal}_{err},\; |b| \cdot SE_{diag}\,\right)
+$$
+
+The legacy form $|b| \cdot SE$ is recovered exactly on artifacts that predate this
+empirical calibration (no stored residual SD), where $SE = SE_{diag}$. The absolute
+value $|b|$ keeps the half-width non-negative regardless of the sign of the slope.
 
 ### Calibration Parameters
 
@@ -236,6 +281,12 @@ The absolute value $|b|$ ensures the standard error remains non-negative regardl
 | $a$ | `calibration_intercept` | Intercept from calibration regression |
 | $R^2$ | `calibration_r2` | $R^2$ of the calibration fit |
 | $SD(S_{cv}) / SD(S_{true})$ | `attenuation_factor` | Measures how much variance is lost |
+| $\widehat{\sigma}^{\,raw}_{err}$ | `raw_empirical_residual_sd` | $SD(S_{true} - S_{cv})$ — empirical raw-scale approximation error |
+| $\widehat{\sigma}^{\,cal}_{err}$ | `calibrated_empirical_residual_sd` | $SD(S_{true} - (a + b\,S_{cv}))$ — empirical calibrated approximation error |
+| $SE_{diag}$ (full-data) | `diagonal_model_se_lower_bound` | Fit-time, no-missingness diagonal SE; an optimistic LD-blind reference lower bound |
+
+The last three fields are `None` on artifacts predating the empirical residual
+calibration, in which case prediction falls back to the diagonal SE.
 
 See `imputed_prs/core/types.py:CalibrationParams` for the full data type definition.
 

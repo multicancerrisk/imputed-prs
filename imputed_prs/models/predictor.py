@@ -241,8 +241,8 @@ def compute_observed_prs_oriented(
     duplicate user entries conflict.
 
     This is the canonical scoring path for real uploads; the legacy
-    :func:`compute_observed_prs` (dosage-dict, allele-blind) is retained only for
-    the evaluator / back-compat path until P1.6.
+    :func:`compute_observed_prs` (dosage-dict, allele-blind) is retained only as
+    the back-compat fallback for numeric-dict inputs (no raw genotype strings).
 
     Args:
         raw_genotypes: User genotypes as a multi-key resolvable collection.
@@ -418,8 +418,8 @@ def compute_imputed_prs_oriented(
     the point estimate.
 
     This is the canonical imputed-scoring path for real uploads; the legacy
-    :func:`compute_imputed_prs` (dosage-dict, allele-blind) is retained only for
-    the evaluator / back-compat path until P1.6.
+    :func:`compute_imputed_prs` (dosage-dict, allele-blind) is retained only as
+    the back-compat fallback for numeric-dict inputs (no raw genotype strings).
 
     Args:
         raw_genotypes: User genotypes as a multi-key resolvable collection.
@@ -521,10 +521,11 @@ class PRSPredictor:
                 not supplied).
             apply_calibration: Whether to apply calibration scaling
                 (requires calibration_params to be set).
-            raw_genotypes: When provided, the observed component is scored
-                allele-aware from these raw genotype strings (the path for real
-                uploads). When omitted, the legacy allele-blind dosage-dict scorer
-                is used (evaluators / back-compat until P1.6).
+            raw_genotypes: When provided, the observed (and imputed) components
+                are scored allele-aware from these raw genotype strings (the path
+                for real uploads). When omitted, the legacy allele-blind
+                dosage-dict path is used instead — this happens only when no raw
+                genotypes are supplied (e.g. a numeric-dict input).
 
         Returns:
             PredictionResult with PRS value, confidence intervals,

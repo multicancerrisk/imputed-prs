@@ -59,8 +59,13 @@ from imputed_prs.evaluation import ProjectionEvaluator
 from imputed_prs.core.types import (
     PredictionResult,
     PlatformInfo,
+    VariantInfo,
+    VariantIdentity,
+    ImputedVariantModel,
     EvaluationMetrics,
     CalibrationParams,
+    TrainingResult,
+    TrainingFailure,
     ProjectionRegionModel,
     ProjectionTrainingResult,
 )
@@ -97,12 +102,14 @@ The library provides two approaches for computing PRS when the genotyping platfo
 |---------|----------------------|----------------------|
 | **Unit of prediction** | Per-variant dosage | Per-region PRS contribution |
 | **`tuning_scope` parameter** | Yes (`global`/`per_variant`/`none`) | Yes (`global`/`none`) |
+| **Hyperparameter tuning** | Yes (`global` / `per_variant`) | Yes (`global` only) |
 | **`evaluation_genotypes` in `fit()`** | Yes | No |
 | **Dosage clipping** | Yes (truncated normal variance) | No (target is PRS, not dosage) |
-| **Missing predictor handling** | Fallback to intercept-only | Mean-substitution ($2 \cdot AF$) |
-| **Uncertainty source** | $\sum \beta_j^2 \sigma^2_{adj,j}$ | $\sum_R \text{cv\_mse}_R$ |
-| **Export/Load** | Yes | Not yet implemented |
-| **Per-variant diagnostics** | Yes (`imputation_r2` per variant) | No (`cv_r2` per region) |
+| **Missing predictor handling** | Per-predictor mean-substitution ($2 \cdot AF$) with missingness-aware variance inflation | Per-predictor mean-substitution ($2 \cdot AF$) with missingness-aware variance inflation |
+| **Per-variant fallback model** | Yes (`VariantInfo.fallback`; direct-else-fallback for observed variants) | Yes (`VariantInfo.fallback`; same shape) |
+| **Reported uncertainty (SE)** | `max(empirical_residual_sd, diagonal_lower_bound)`; diagonal is $\sqrt{\sum \beta_j^2 \sigma^2_{adj,j}}$ | `max(empirical_residual_sd, diagonal_lower_bound)`; diagonal is $\sqrt{\sum_R \text{cv\_mse}_R}$ |
+| **Export/Load** | Yes (`json`, `hdf5`, `arrow`, `parquet`, `csv`) | Yes (`json` only) |
+| **Per-variant diagnostics** | Yes (`imputation_r2` per variant) | Yes (`cv_r2`/`cv_mse` per region) |
 | **Key model property** | `imputed_models` | `region_models` |
 
 ---
@@ -124,6 +131,8 @@ LinearImputationPRS(
     random_state: Optional[int] = None,
     max_predictors: Optional[int] = None,
     max_tuning_variants: Optional[int] = 50,
+    exclude_ambiguous: bool = False,
+    ambiguous_maf_threshold: float = 0.4,
     verbose: int = 1,
 )
 ```
@@ -140,7 +149,9 @@ LinearImputationPRS(
 | `n_jobs` | `int` | `1` | Number of parallel jobs for training. Use `-1` for all CPUs. |
 | `random_state` | `int` | `None` | Random seed for reproducibility. |
 | `max_predictors` | `int` | `None` | Maximum number of predictor variants per model. If `None`, uses all variants in window. |
-| `max_tuning_variants` | `int` | `50` | Cap on missing variants sampled for `tuning_scope="global"`. `None` tunes on all missing variants. |
+| `max_tuning_variants` | `int` | `50` | Cap on missing variants sampled for `tuning_scope="global"`. `None` tunes on all missing variants. Must be positive when set. |
+| `exclude_ambiguous` | `bool` | `False` | If `True`, drop strand-ambiguous (palindromic A/T and C/G) SNPs whose reference minor-allele frequency exceeds `ambiguous_maf_threshold`, since their strand cannot be resolved reliably. |
+| `ambiguous_maf_threshold` | `float` | `0.4` | MAF above which ambiguous SNPs are excluded when `exclude_ambiguous` is `True`. |
 | `verbose` | `int` | `1` | Verbosity level. 0=silent, 1=progress bar, 2=debug output. |
 
 **Example:**
@@ -172,7 +183,10 @@ def fit(
     genome_build: Optional[str] = None,
     prs_id: Optional[str] = None,
     model_name: Optional[str] = None,
+    reference_panel_id: Optional[str] = None,
+    training_ancestry: Optional[str] = None,
     evaluation_genotypes: Optional[Union[str, Path]] = None,
+    allow_alt_as_effect: bool = False,
 ) -> "LinearImputationPRS"
 ```
 
@@ -188,7 +202,12 @@ def fit(
 | `genome_build` | `str` | Genome build (`"GRCh37"` or `"GRCh38"`). Auto-detected if `None`. |
 | `prs_id` | `str` | PRS identifier for metadata. |
 | `model_name` | `str` | Human-readable model name for metadata. |
+| `reference_panel_id` | `str` | Provenance — reference panel used for training (e.g., `"1000G_phase3_EUR"`). Recorded in the deployable export. |
+| `training_ancestry` | `str` | Provenance — ancestry of the training cohort (e.g., `"EUR"`). Recorded in the deployable export. |
 | `evaluation_genotypes` | `str` or `Path` | Optional holdout genotypes for external evaluation. |
+| `allow_alt_as_effect` | `bool` | If `True`, permit a PRS definition that supplies an `alt` column (but no explicit `effect_allele`) to be loaded by treating ALT as the effect allele. Defaults to `False`, which raises. |
+
+**Note:** Strand-ambiguity QC (`exclude_ambiguous`, `ambiguous_maf_threshold`) and tuning caps (`max_tuning_variants`) are set on the **constructor**, not on `fit()`.
 
 **Returns:** `self` (for method chaining)
 
@@ -219,29 +238,48 @@ def predict(
     self,
     user_genotypes: Union[str, Path, pd.DataFrame, Dict[str, float]],
     apply_calibration: bool = True,
+    *,
+    genome_build: Optional[str] = None,
+    platform_id: Optional[str] = None,
+    strict: bool = True,
 ) -> PredictionResult
 ```
 
 **Parameters:**
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `user_genotypes` | `str`, `Path`, `DataFrame`, or `dict` | User genotype data as file path (DTC format auto-detected), DataFrame with `variant_id` and `genotype` columns, or dict mapping variant_id to dosage values. |
-| `apply_calibration` | `bool` | Whether to apply calibration scaling. Default: `True`. |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `user_genotypes` | `str`, `Path`, `DataFrame`, or `Dict[str, float]` | | User genotype data. See input-type note below. |
+| `apply_calibration` | `bool` | `True` | Whether to apply calibration scaling. |
+| `genome_build` | `str` | `None` | Genome build of the user genotypes (e.g. `"GRCh37"`). Overrides auto-detection. For file inputs the build is auto-detected when omitted; DataFrame/dict inputs are not. |
+| `platform_id` | `str` | `None` | Genotyping platform the user genotypes came from. When provided, it is checked against the platform the model was trained for. |
+| `strict` | `bool` | `True` | If `True`, an incompatible genome build or a declared platform mismatch raises. If `False`, the mismatch is downgraded to a blocking `UserWarning` and scoring proceeds. |
+
+**Input types (allele-awareness):**
+- **File path** (DTC format auto-detected) or **DataFrame** with `variant_id` and `genotype` columns — scored **allele-aware** (the observed component counts copies of each variant's *effect* allele, predictors count their stored ALT allele). This is the recommended path.
+- **`Dict[str, float]`** mapping `variant_id` to dosage — accepted but **LEGACY / allele-blind**: dosages are taken at face value with no allele orientation, so a homozygous call can be miscounted when the effect allele is not the counted allele. On this path the allele-aware diagnostics (`n_observed_scored_direct`, `n_observed_scored_via_fallback`, `weighted_beta_via_fallback`, `unresolved_observed_ids`) are `None`, and per-variant fallbacks are not consulted. Prefer a file or DataFrame whenever the raw genotype strings/alleles are available.
 
 **Returns:** `PredictionResult` with PRS value, uncertainty estimates, and diagnostics.
 
 **Raises:**
 - `ModelNotFittedError`: If `fit()` has not been called.
 - `DataLoadError`: If user genotype file cannot be loaded.
+- `IncompatibleBuildError`: If `strict` and the user build is known and mismatches the model's build.
+- `IncompatiblePlatformError`: If `strict` and `platform_id` mismatches the model's platform.
+
+**Warns:**
+- `UserWarning`: If the user build cannot be determined while the model declares one, or if `strict=False` downgrades a build/platform mismatch.
 
 **Example:**
 
 ```python
-# From file
+# From file (allele-aware, recommended)
 result = model.predict("user_23andme.txt")
 
-# From dict
+# Declaring build/platform, non-strict
+result = model.predict("user.txt", genome_build="GRCh37", platform_id="23andme_v5", strict=False)
+
+# From dict (LEGACY allele-blind path)
 dosages = {"rs123": 1.0, "rs456": 2.0, "rs789": 0.0}
 result = model.predict(dosages)
 
@@ -326,7 +364,8 @@ result = model.predict("user_genotypes.txt")
 | Property | Type | Description |
 |----------|------|-------------|
 | `is_fitted` | `bool` | Whether the model has been fitted. |
-| `variant_table` | `pd.DataFrame` | Per-variant summary with status and quality metrics. |
+| `variant_table` | `pd.DataFrame` | Per-variant summary. Columns: `variant_id`, `chromosome`, `position`, `effect_allele`, `other_allele`, `beta`, `status`, `reason`, `imputation_r2`, `allele_frequency`, `n_predictors`. |
+| `variant_dispositions` | `pd.DataFrame` | Per-variant disposition table (status/reason for every input PRS variant). Empty for models loaded from disk (dispositions are not serialized). |
 | `summary` | `Dict[str, Any]` | Model summary with counts and quality statistics. |
 | `evaluation_metrics` | `EvaluationMetrics` or `None` | Evaluation metrics from training (if available). |
 | `calibration_params` | `CalibrationParams` or `None` | Calibration parameters from CV training. |
@@ -366,6 +405,8 @@ LinearProjectionPRS(
     random_state: Optional[int] = None,
     max_predictors: Optional[int] = None,
     max_tuning_regions: Optional[int] = 50,
+    exclude_ambiguous: bool = False,
+    ambiguous_maf_threshold: float = 0.4,
     verbose: int = 1,
 )
 ```
@@ -382,7 +423,9 @@ LinearProjectionPRS(
 | `n_jobs` | `int` | `1` | Number of parallel jobs for training. Use `-1` for all CPUs. |
 | `random_state` | `int` | `None` | Random seed for reproducibility. |
 | `max_predictors` | `int` | `None` | Maximum number of predictor variants per region. If `None`, uses all variants in region. |
-| `max_tuning_regions` | `int` | `50` | Cap on regions sampled for `tuning_scope="global"`. `None` tunes on all regions. |
+| `max_tuning_regions` | `int` | `50` | Cap on regions sampled for `tuning_scope="global"`. `None` tunes on all regions. Must be positive when set. |
+| `exclude_ambiguous` | `bool` | `False` | If `True`, drop strand-ambiguous (palindromic A/T and C/G) SNPs whose reference minor-allele frequency exceeds `ambiguous_maf_threshold`. |
+| `ambiguous_maf_threshold` | `float` | `0.4` | MAF above which ambiguous SNPs are excluded when `exclude_ambiguous` is `True`. |
 | `verbose` | `int` | `1` | Verbosity level. 0=silent, 1=progress bar, 2=debug output. |
 
 **Example:**
@@ -414,6 +457,9 @@ def fit(
     genome_build: Optional[str] = None,
     prs_id: Optional[str] = None,
     model_name: Optional[str] = None,
+    reference_panel_id: Optional[str] = None,
+    training_ancestry: Optional[str] = None,
+    allow_alt_as_effect: bool = False,
 ) -> "LinearProjectionPRS"
 ```
 
@@ -429,8 +475,11 @@ def fit(
 | `genome_build` | `str` | Genome build (`"GRCh37"` or `"GRCh38"`). Auto-detected if `None`. |
 | `prs_id` | `str` | PRS identifier for metadata. |
 | `model_name` | `str` | Human-readable model name for metadata. |
+| `reference_panel_id` | `str` | Provenance — reference panel used for training (e.g., `"1000G_phase3_EUR"`). Recorded in the deployable export. |
+| `training_ancestry` | `str` | Provenance — ancestry of the training cohort (e.g., `"EUR"`). Recorded in the deployable export. |
+| `allow_alt_as_effect` | `bool` | If `True`, permit a PRS definition that supplies an `alt` column (but no explicit `effect_allele`) to be loaded by treating ALT as the effect allele. Defaults to `False`, which raises. |
 
-**Note:** Unlike `LinearImputationPRS.fit()`, there is no `evaluation_genotypes` parameter. Use `ProjectionEvaluator` for external evaluation.
+**Note:** Unlike `LinearImputationPRS.fit()`, there is no `evaluation_genotypes` parameter. Use `ProjectionEvaluator` for external evaluation. Strand-ambiguity QC (`exclude_ambiguous`, `ambiguous_maf_threshold`) and the tuning cap (`max_tuning_regions`) are set on the **constructor**, not on `fit()`.
 
 **Returns:** `self` (for method chaining)
 
@@ -461,33 +510,110 @@ def predict(
     self,
     user_genotypes: Union[str, Path, pd.DataFrame, Dict[str, float]],
     apply_calibration: bool = True,
+    *,
+    genome_build: Optional[str] = None,
+    platform_id: Optional[str] = None,
+    strict: bool = True,
 ) -> PredictionResult
 ```
 
 **Parameters:**
 
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `user_genotypes` | `str`, `Path`, `DataFrame`, or `dict` | User genotype data as file path (DTC format auto-detected), DataFrame with `variant_id` and `genotype` columns, or dict mapping variant_id to dosage values. |
-| `apply_calibration` | `bool` | Whether to apply calibration scaling. Default: `True`. |
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `user_genotypes` | `str`, `Path`, `DataFrame`, or `Dict[str, float]` | | User genotype data. See input-type note below. |
+| `apply_calibration` | `bool` | `True` | Whether to apply calibration scaling. |
+| `genome_build` | `str` | `None` | Genome build of the user genotypes (e.g. `"GRCh37"`). Overrides auto-detection. For file inputs the build is auto-detected when omitted; DataFrame/dict inputs are not. |
+| `platform_id` | `str` | `None` | Genotyping platform the user genotypes came from. Checked against the platform the model was trained for. |
+| `strict` | `bool` | `True` | If `True`, an incompatible genome build or a declared platform mismatch raises. If `False`, the mismatch is downgraded to a blocking `UserWarning` and scoring proceeds. |
+
+**Input types (allele-awareness):** identical to `LinearImputationPRS.predict()` — a **file path** or **DataFrame** is scored **allele-aware** (recommended), while a numeric **`Dict[str, float]`** is **LEGACY / allele-blind** (dosages taken at face value; allele-aware diagnostics are `None`). Prefer file/DataFrame.
 
 **Returns:** `PredictionResult` with PRS value, uncertainty estimates, and diagnostics. The `prs_imputed_component` field contains the sum of regional projection predictions. The `n_truncated` field is always 0 (no dosage clipping in projection).
 
 **Raises:**
 - `ModelNotFittedError`: If `fit()` has not been called.
 - `DataLoadError`: If user genotype file cannot be loaded.
+- `IncompatibleBuildError`: If `strict` and the user build is known and mismatches the model's build.
+- `IncompatiblePlatformError`: If `strict` and `platform_id` mismatches the model's platform.
+
+**Warns:**
+- `UserWarning`: If the user build cannot be determined while the model declares one, or if `strict=False` downgrades a build/platform mismatch.
 
 **Example:**
 
 ```python
-# From file
+# From file (allele-aware, recommended)
 result = model.predict("user_23andme.txt")
 
-# From dict
+# From dict (LEGACY allele-blind path)
 dosages = {"rs123": 1.0, "rs456": 2.0, "rs789": 0.0}
 result = model.predict(dosages)
 
 print(f"PRS: {result.prs:.3f} (95% CI: {result.ci_lower:.3f}-{result.ci_upper:.3f})")
+```
+
+---
+
+### export()
+
+Export the trained projection model. **JSON only** (the browser-deployable artifact; the HDF5/Arrow/Parquet/CSV formats remain imputation-only).
+
+```python
+def export(
+    self,
+    output_dir: Union[str, Path],
+    model_name: Optional[str] = None,
+    formats: Optional[List[str]] = None,
+    include_variance_scaling: bool = True,
+) -> Dict[str, Path]
+```
+
+**Parameters:**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `output_dir` | `str` or `Path` | | Directory for output files. |
+| `model_name` | `str` | `None` | Base name for output files. Uses internal name (or `"projection_prs_model"`) if `None`. |
+| `formats` | `List[str]` | `["json"]` | Export formats. Only `"json"` is supported; any other format raises `ValueError`. |
+| `include_variance_scaling` | `bool` | `True` | Accepted for parity with the imputation exporter; projection has no per-region residual-variance field. |
+
+**Returns:** Dict mapping format name to output file path (e.g. `{"json": Path("models/my_model.json")}`).
+
+**Raises:**
+- `ModelNotFittedError`: If `fit()` has not been called.
+- `ValueError`: If an unsupported format is requested.
+
+---
+
+### load() (classmethod)
+
+Load a trained projection model from a JSON artifact.
+
+```python
+@classmethod
+def load(cls, path: Union[str, Path]) -> "LinearProjectionPRS"
+```
+
+**Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `path` | `str` or `Path` | Path to a saved projection model (a `.json` file). |
+
+**Returns:** Loaded `LinearProjectionPRS` instance ready for prediction.
+
+**Raises:**
+- `DataLoadError`: If the file is missing or its format is unsupported (only `.json` is accepted).
+
+**Note:** Training-time diagnostics (the training result and `variant_dispositions`) are not serialized and stay empty on a loaded model.
+
+**Example:**
+
+```python
+paths = model.export("./models", model_name="my_projection_model")  # {'json': Path('models/my_projection_model.json')}
+reloaded = LinearProjectionPRS.load(paths["json"])
+result = reloaded.predict("user_genotypes.txt")
 ```
 
 ---
@@ -501,9 +627,8 @@ print(f"PRS: {result.prs:.3f} (95% CI: {result.ci_lower:.3f}-{result.ci_upper:.3
 | `region_models` | `List[ProjectionRegionModel]` | List of trained projection region models. |
 | `calibration_params` | `CalibrationParams` or `None` | Calibration parameters from CV training. |
 | `summary` | `Dict[str, Any]` | Model summary with region counts and quality statistics. |
-| `variant_table` | `pd.DataFrame` | Per-region summary table with columns: `region_id`, `chromosome`, `start`, `end`, `n_prs_variants`, `n_predictors`, `cv_r2`, `cv_mse`, `is_intercept_only`. |
-
-**Note:** `export()` and `load()` are not yet implemented for the projection method.
+| `variant_table` | `pd.DataFrame` | Per-region summary table with columns: `region_id`, `chromosome`, `start`, `end`, `n_prs_variants`, `n_predictors`, `cv_r2`, `cv_mse`, `is_intercept_only`, `prs_variant_ids`. |
+| `variant_dispositions` | `pd.DataFrame` | Per-variant disposition table (status/reason for every input PRS variant). Empty for loaded models. |
 
 **Example:**
 
@@ -711,7 +836,7 @@ metrics = evaluator.evaluate("held_out_data.vcf.gz")
 print(f"R²: {metrics.r2:.3f}, Correlation: {metrics.correlation:.3f}")
 ```
 
-**Note:** Unlike `ImputationEvaluator`, `ProjectionEvaluator` does not yet provide `cross_validate()` or `sensitivity_analysis()` methods.
+**Note:** Unlike `ImputationEvaluator`, `ProjectionEvaluator` provides only `evaluate()` (and the lower-level `compute_score_arrays(evaluation_genotypes) -> Tuple[np.ndarray, np.ndarray]`, returning the raw `(s_estimated, s_true)` PRS arrays). It does **not** provide `cross_validate()` or `sensitivity_analysis()`.
 
 ---
 
@@ -1106,6 +1231,32 @@ def export_variant_table(
 
 ---
 
+### export_projection_to_json()
+
+Export a trained **projection** model to portable JSON (schema v2.0) — the browser-deployable artifact. This is the projection analog of `export_to_json`; the per-variant blocks are grouped into `region_models` (instead of a flat `imputed_variants` list) and there is no `evaluation_metrics` parameter. Usually invoked via `LinearProjectionPRS.export()`. Importable from `imputed_prs.io.exporters`.
+
+```python
+def export_projection_to_json(
+    output_path: Union[str, Path],
+    observed_variants: List[VariantInfo],
+    region_models: List[ProjectionRegionModel],
+    calibration_params: Optional[CalibrationParams] = None,
+    platform_name: Optional[str] = None,
+    prs_id: Optional[str] = None,
+    genome_build: Optional[str] = None,
+    model_name: Optional[str] = None,
+    include_variance_scaling: bool = True,
+    training_summary: Optional[Dict[str, Any]] = None,
+    reference_panel_id: Optional[str] = None,
+    training_ancestry: Optional[str] = None,
+    ambiguous_policy: str = DEFAULT_AMBIGUOUS_POLICY,
+    require_other_allele: bool = True,
+    require_provenance: bool = True,
+) -> Path
+```
+
+---
+
 ## Data Types Reference
 
 ### PredictionResult
@@ -1116,7 +1267,7 @@ Output from PRS prediction. Used by both `LinearImputationPRS` and `LinearProjec
 @dataclass
 class PredictionResult:
     prs: float                      # Raw PRS value
-    se: float                       # Standard error
+    se: float                       # Standard error (see "Uncertainty" note)
     ci_lower: float                 # Lower 95% CI bound
     ci_upper: float                 # Upper 95% CI bound
     prs_observed_component: float   # Contribution from observed variants
@@ -1126,13 +1277,24 @@ class PredictionResult:
     n_variants_intercept_only: int  # Count using intercept-only models
     n_user_variants_missing: int    # User variants not available
     n_truncated: int                # Dosages clipped (always 0 for projection)
-    prs_scaled: Optional[float]     # Scaled PRS (if calibrated)
-    se_scaled: Optional[float]      # Scaled SE (if calibrated)
-    ci_lower_scaled: Optional[float]
-    ci_upper_scaled: Optional[float]
+    prs_scaled: Optional[float] = None     # Scaled PRS (if calibrated)
+    se_scaled: Optional[float] = None      # Scaled SE (if calibrated)
+    ci_lower_scaled: Optional[float] = None
+    ci_upper_scaled: Optional[float] = None
+    # Allele-aware diagnostics (None on the legacy allele-blind dict path)
+    n_observed_scored_direct: Optional[int] = None       # Observed scored from a direct effect-allele dosage
+    n_observed_scored_via_fallback: Optional[int] = None # Observed recovered via per-variant fallback model
+    weighted_beta_via_fallback: Optional[float] = None   # Sum of |beta| recovered through the fallback path (QC)
+    unresolved_observed_ids: Optional[Tuple[str, ...]] = None  # Observed scored by neither path (never silently dropped)
+    # Per-prediction diagonal SE lower bound (always populated on the predict path)
+    se_diagonal_lower_bound: Optional[float] = None      # sqrt(Σ beta² · effective_residual_variance) for THIS user
 ```
 
 **Note on shared fields:** The `prs_imputed_component` field represents the missing-variant contribution for both methods: for imputation, it is the sum of imputed dosages times effect sizes ($\sum \hat{x}_j \beta_j$); for projection, it is the sum of regional projection predictions ($\sum_R \hat{S}_R$). Similarly, `n_variants_imputed` counts the missing PRS variants covered by either per-variant imputation models or region models. The `n_truncated` field is always 0 for projection (no dosage clipping).
+
+**Note on allele-aware diagnostics:** `n_observed_scored_direct`, `n_observed_scored_via_fallback`, `weighted_beta_via_fallback`, and `unresolved_observed_ids` are populated only when `predict()` is given a file/DataFrame (the allele-aware path). They are `None` on the legacy `Dict[str, float]` (allele-blind) path. Observed variants that resolve directly are scored from an exact effect-allele count; those that cannot be resolved/oriented are recovered via their per-variant `fallback` model when one was trained (direct-else-fallback), and only those scorable by neither path appear in `unresolved_observed_ids` (never silently dropped).
+
+**Note on uncertainty (`se` / `se_scaled`):** Since the residual-calibration remediation, the reported `se` is **not** just the diagonal sum. It is `se = max(raw_empirical_residual_sd, se_diagonal_lower_bound)`, where `raw_empirical_residual_sd` is the LD-aware, panel-wide approximation error (from `CalibrationParams`) and `se_diagonal_lower_bound` is the per-prediction diagonal — $\sqrt{\sum \beta_j^2 \sigma^2_{adj,j}}$ for imputation, $\sqrt{\sum_R \text{cv\_mse}_R}$ for projection — inflated by missingness-aware variance for this specific upload. The diagonal is now only a **lower bound** that becomes the binding floor under heavy user missingness. When calibrated, `se_scaled = max(calibrated_empirical_residual_sd, |scaling_factor| · se_diagonal_lower_bound)`. For uncalibrated or pre-remediation (`raw_empirical_residual_sd is None`) artifacts, `se` falls back to the diagonal SE alone.
 
 ---
 
@@ -1170,6 +1332,27 @@ class VariantInfo:
     effect_allele: str    # Allele associated with the effect
     other_allele: Optional[str]
     beta: float           # Effect size
+    fallback: Optional["ImputedVariantModel"] = None  # Per-variant fallback model
+```
+
+The `fallback` field holds an optional imputation-style model that predicts this variant's *effect-allele* dosage from local-window platform predictors (excluding its own locus). When an observed variant cannot be resolved/called directly from the user's upload, it is recovered through this fallback instead of being silently dropped (direct-else-fallback). It is `None` when no fallback was trained (e.g. locus absent from the reference, or no platform predictors in window).
+
+---
+
+### VariantIdentity
+
+Stable, multi-key identity for a single scored variant, used to resolve a user's raw genotype against the several identifiers a DTC file may use and to carry the role-specific counted/other alleles for oriented scoring. Frozen dataclass.
+
+```python
+@dataclass(frozen=True)
+class VariantIdentity:
+    feature_id: str                  # Canonical, collision-free key ("chr:pos:ref:alt")
+    variant_id: str                  # Primary identifier (rsID or source-provided id)
+    accepted_ids: Tuple[str, ...]    # All ids that should match this variant in a user file
+    chromosome: str
+    position: int
+    counted_allele: str              # Allele whose copies are counted for this role
+    other_allele: str                # The complementary allele of the biallelic pair
 ```
 
 ---
@@ -1190,11 +1373,19 @@ class ImputedVariantModel:
     allele_frequency: float       # Population AF
     imputation_r2: float          # CV R² of imputation
     residual_variance: float      # Residual variance
-    intercept: float              # Model intercept
+    intercept: float              # Model intercept (2*AF for intercept-only)
     predictor_variant_ids: List[str]  # IDs of predictor variants
     coefficients: np.ndarray      # Regression coefficients
     is_intercept_only: bool       # True if no predictors
+    # Predictor allele-metadata arrays (index-aligned with predictor_variant_ids / coefficients)
+    predictor_chromosomes: List[str]            # Chromosome of each predictor
+    predictor_positions: List[int]              # Genomic position of each predictor
+    predictor_counted_alleles: List[str]        # Allele each predictor coefficient counts (= ALT of backing reference row)
+    predictor_other_alleles: List[str]          # Non-counted allele of each predictor (= REF of backing reference row)
+    predictor_allele_frequencies: np.ndarray    # Counted-allele AF per predictor (for 2*AF mean-substitution)
 ```
+
+The predictor allele-metadata arrays let inference orient each predictor dosage allele-aware and mean-substitute missing predictors (mean dosage = `2 * AF`). Together, chromosome/position plus counted/other allele identify the exact reference row, which disambiguates multiallelic loci.
 
 ---
 
@@ -1214,7 +1405,13 @@ class CalibrationParams:
     sd_scaled: float              # SD of scaled predictions
     attenuation_factor: float     # Ratio sd_cv/sd_true
     n_calibration: int            # Sample size for calibration
+    # Empirical residual-calibration fields (None on pre-remediation artifacts)
+    raw_empirical_residual_sd: Optional[float] = None        # std(s_true - s_cv); honest SD for the raw interval (captures LD off-diagonals)
+    calibrated_empirical_residual_sd: Optional[float] = None # std(s_true - (intercept + slope*s_cv)); SD for the scaled interval
+    diagonal_model_se_lower_bound: Optional[float] = None    # Full-data (no-missingness) diagonal SE measured at fit time; reference/QC lower bound
 ```
+
+`raw_empirical_residual_sd` / `calibrated_empirical_residual_sd` are the panel-wide, LD-aware approximation-error SDs consumed by `predict()` to report `se` / `se_scaled` (see the `PredictionResult` uncertainty note). `diagonal_model_se_lower_bound` is the **fit-time, full-data** diagonal SE scalar — imputation $\sqrt{\sum \beta^2 \cdot \text{residual\_var}}$, projection $\sqrt{\sum \text{cv\_mse}}$ — and is distinct from `PredictionResult.se_diagonal_lower_bound` (which is the per-prediction, user-specific diagonal SE that `predict()` recomputes).
 
 ---
 
@@ -1249,6 +1446,25 @@ class TrainingResult:
     n_variants_failed: int
     n_intercept_only: int
     training_summary: Dict[str, Any]  # Includes mean_r2, median_r2, etc.
+    failures: Dict[str, TrainingFailure] = field(default_factory=dict)  # variant_id -> structured failure reason
+```
+
+---
+
+### TrainingFailure
+
+Structured reason a per-variant (imputation) or per-region (projection) training fit failed. Captured only when an ElasticNet fit raises a genuine exception inside the trainer; degenerate-but-handled cases (zero-variance target, too few samples, no predictors) are downgraded to intercept-only models and are *not* failures. Frozen dataclass. These surface through the orchestrators' `variant_dispositions` / `summary` so a failed variant reports *why* it failed, not merely that it did.
+
+```python
+@dataclass(frozen=True)
+class TrainingFailure:
+    unit_id: str                       # variant_id (imputation) or region_id (projection) that failed
+    error_type: str                    # Exception class name
+    error_message: str                 # Exception message
+    n_valid_samples: Optional[int] = None    # Non-missing target samples at the failed fit, if known
+    target_variance: Optional[float] = None  # Variance of the non-missing target, if known
+    n_predictors: Optional[int] = None       # Number of windowed predictors at the failed fit, if known
+    member_ids: Tuple[str, ...] = ()         # PRS variant IDs covered by a failed projection region (empty for imputation)
 ```
 
 ---
@@ -1319,7 +1535,7 @@ Stores the trained projection model for a single genomic region.
 ```python
 @dataclass
 class ProjectionRegionModel:
-    region_id: str                        # e.g., "chr1:1000000-3000000"
+    region_id: str                        # format "chr{chrom}:{start}-{end}"
     chromosome: str
     start: int                            # Region start position
     end: int                              # Region end position
@@ -1332,8 +1548,20 @@ class ProjectionRegionModel:
     cv_r2: float                          # Cross-validated R-squared
     is_intercept_only: bool               # True if no predictors or all zero
     mean_prs_contribution: float          # Mean of S_R across training samples
-    predictor_allele_frequencies: np.ndarray  # AFs for mean-substitution at inference
+    predictor_allele_frequencies: np.ndarray  # Counted-allele AFs for 2*AF mean-substitution
+    # Predictor allele metadata (index-aligned with predictor_variant_ids / coefficients)
+    predictor_chromosomes: List[str] = field(default_factory=list)
+    predictor_positions: List[int] = field(default_factory=list)
+    predictor_counted_alleles: List[str] = field(default_factory=list)   # = ALT of backing reference row
+    predictor_other_alleles: List[str] = field(default_factory=list)     # = REF of backing reference row
+    # PRS-variant allele metadata (index-aligned with prs_variant_ids / betas)
+    prs_positions: List[int] = field(default_factory=list)               # Position of each PRS variant
+    prs_effect_alleles: List[str] = field(default_factory=list)          # Effect allele beta is oriented to
+    prs_other_alleles: List[Optional[str]] = field(default_factory=list) # Non-effect allele (may be None)
+    target_variance: float = 0.0          # Var(S_R) across reference samples; intercept-only error variance for P3.3 inflation
 ```
+
+The predictor allele metadata orients each predictor dosage allele-aware at inference. The PRS-variant allele metadata (`prs_positions`, `prs_effect_alleles`, `prs_other_alleles`) lets a standalone scorer orient the *true* PRS via `match_oriented_dosage` instead of assuming effect==ALT. `target_variance` is the error variance of predicting with the regional mean; as predictors are mean-substituted at inference the region's effective variance interpolates from `cv_mse` toward `target_variance` (missingness-aware uncertainty inflation).
 
 ---
 
@@ -1350,6 +1578,7 @@ class ProjectionTrainingResult:
     n_regions_failed: int
     n_intercept_only: int
     training_summary: Dict[str, Any]       # mean_r2, median_r2, n_high_quality, etc.
+    failures: Dict[str, TrainingFailure] = field(default_factory=dict)  # region_id -> failure (carries member_ids)
 ```
 
 ---
