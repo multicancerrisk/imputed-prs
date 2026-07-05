@@ -1,6 +1,7 @@
 """Main LinearProjectionPRS class for training and prediction."""
 
 import dataclasses
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Union
 
@@ -880,9 +881,23 @@ class LinearProjectionPRS:
         statistics, never materializing the dosage matrix and never building the
         per-region ``cv_predictions`` dict (``s_true``/``s_cv`` reduced in-stream).
 
-        Documented deviations (mirroring the imputation streaming backend): the
-        reference genome build is not auto-detected from the panel; ``exclude_ambiguous``
-        and non-``none`` ``tuning_scope`` are follow-ups (guarded below).
+        Sanctioned deviations from the dense oracle (all documented; parity is exact
+        on a dense, no-missing panel like 1000G):
+
+        - Region targets are assembled as the length-``n`` vector
+          ``S_R = Σ β_j x_eff_j`` accumulated in-stream — no ``X_region`` matrix and no
+          per-region PRS-variant Gram ``X_RᵀX_R``; the projection SE uses ``var(S_R)``
+          and ``Σ_R cv_mse_R``.
+        - Mean-imputation, not listwise deletion (NaN dosages mean-imputed at
+          accumulation).
+        - Calibration via two O(n) accumulators: ``s_true``/``s_cv`` reduced in-stream,
+          so ``ProjectionTrainingResult.cv_predictions`` is ``None``.
+        - float64 accumulation matmuls (float32/GPU tradeoff deferred to Phase 3).
+        - Genome build is not auto-detected from the panel (the PRS/platform build is
+          used).
+        - Not yet supported on streaming: ``exclude_ambiguous`` (raises
+          ``NotImplementedError``) and hyperparameter tuning (``tuning_scope != "none"``
+          warns and uses the configured ``l1_ratio``/``alpha``). Use ``backend="dense"``.
         """
         from imputed_prs.compute.projection_stream import (
             StreamingProjectionFitter,
@@ -906,11 +921,17 @@ class LinearProjectionPRS:
             )
         effective_l1_ratio = self.l1_ratio
         effective_alpha = self.alpha
-        if self.tuning_scope != "none" and self.verbose >= 1:
-            print(
+        if self.tuning_scope != "none":
+            # Streaming projection tuning is a follow-up. Warn unconditionally so a
+            # default streaming fit never *silently* drops tuning, then use the
+            # configured (l1_ratio, alpha). tuning_scope='none' silences this.
+            warnings.warn(
                 f"backend='streaming': tuning_scope={self.tuning_scope!r} is not yet "
-                f"supported on the streaming projection path; using configured "
-                f"l1_ratio={effective_l1_ratio}, alpha={effective_alpha}."
+                f"supported on the streaming projection path; using the configured "
+                f"l1_ratio={effective_l1_ratio}, alpha={effective_alpha} "
+                f"(no hyperparameter tuning performed).",
+                UserWarning,
+                stacklevel=2,
             )
         if self.verbose >= 1:
             print(f"Streaming backend: {len(source.sample_ids)} reference samples")
@@ -960,7 +981,7 @@ class LinearProjectionPRS:
             )
         training_result = ProjectionTrainingResult(
             region_models=result.region_models,
-            cv_predictions={},  # the calibration blocker never materializes
+            cv_predictions=None,  # the calibration blocker never materializes
             n_regions_trained=result.n_regions_trained,
             n_regions_failed=result.n_regions_failed,
             n_intercept_only=result.n_intercept_only,

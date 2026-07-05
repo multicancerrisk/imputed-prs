@@ -445,8 +445,9 @@ class TrainingResult:
 
     Attributes:
         models: Dictionary mapping variant_id to trained ImputedVariantModel.
-        cv_predictions: Dictionary mapping variant_id to out-of-fold CV predictions.
-            Shape of each array: (n_samples,).
+        cv_predictions: Dictionary mapping variant_id to out-of-fold CV predictions
+            (shape (n_samples,) each), or ``None`` when the streaming backend
+            accumulated calibration in-stream (no per-variant predictions retained).
         n_variants_trained: Number of variants successfully trained.
         n_variants_failed: Number of variants where training failed.
         n_intercept_only: Number of variants using intercept-only models.
@@ -465,7 +466,7 @@ class TrainingResult:
     """
 
     models: Dict[str, "ImputedVariantModel"]
-    cv_predictions: Dict[str, np.ndarray]
+    cv_predictions: Optional[Dict[str, np.ndarray]]
     n_variants_trained: int
     n_variants_failed: int
     n_intercept_only: int
@@ -597,7 +598,8 @@ class ProjectionTrainingResult:
     Attributes:
         region_models: Dict mapping region_id to ProjectionRegionModel.
         cv_predictions: Dict mapping region_id to out-of-fold CV predictions
-            of S_R for each sample. Shape of each: (n_samples,).
+            of S_R for each sample (shape (n_samples,) each), or ``None`` when the
+            streaming backend accumulated calibration in-stream.
         n_regions_trained: Number of regions successfully trained.
         n_regions_failed: Number of regions where training failed.
         n_intercept_only: Number of regions using intercept-only models.
@@ -612,7 +614,7 @@ class ProjectionTrainingResult:
     """
 
     region_models: Dict[str, "ProjectionRegionModel"]
-    cv_predictions: Dict[str, np.ndarray]
+    cv_predictions: Optional[Dict[str, np.ndarray]]
     n_regions_trained: int
     n_regions_failed: int
     n_intercept_only: int

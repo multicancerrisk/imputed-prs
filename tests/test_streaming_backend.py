@@ -255,3 +255,15 @@ class TestStreamingGuardrails:
         with pytest.raises(NotImplementedError, match="exclude_ambiguous"):
             model.fit(reference_genotypes=path, prs_definition=prs_df,
                       platform_variants=platform, genome_build="GRCh38")
+
+    def test_tuning_scope_warns_loudly(self, panel):
+        """Streaming with tuning enabled warns unconditionally (never silently drops
+        tuning), independent of verbose level."""
+        path, prs_df, platform = panel
+        model = LinearImputationPRS(
+            window_size=WINDOW, tuning_scope="global", alpha=0.01, l1_ratio=0.5,
+            cv_folds=5, random_state=SEED, backend="streaming", verbose=0,
+        )
+        with pytest.warns(UserWarning, match="tuning_scope"):
+            model.fit(reference_genotypes=path, prs_definition=prs_df,
+                      platform_variants=platform, genome_build="GRCh38")

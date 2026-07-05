@@ -1,6 +1,7 @@
 """Main LinearImputationPRS class for training and prediction."""
 
 import dataclasses
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Union
 
@@ -970,10 +971,22 @@ class LinearImputationPRS:
         statistics, never materializing the dosage matrix and never building the
         per-variant ``cv_predictions`` dict (``s_true``/``s_cv`` are reduced in-stream).
 
-        Deviations from the dense oracle, all documented: reference genome build is
-        not auto-detected from the panel (the streaming source carries none — the
-        PRS/platform build is used); ``exclude_ambiguous`` and non-``none``
-        ``tuning_scope`` are not yet supported (see below).
+        Sanctioned deviations from the dense oracle (all documented; parity is exact
+        on a dense, no-missing panel like 1000G):
+
+        - Mean-imputation, not listwise deletion: NaN dosages are mean-imputed at
+          accumulation (a shared Gram cannot drop per-variant-varying rows), so under
+          panel missingness ``n_valid`` and the intercept-only triggers can differ.
+        - Calibration via two O(n) accumulators: ``s_true``/``s_cv`` are reduced
+          in-stream, so ``TrainingResult.cv_predictions`` is ``None`` (no per-variant
+          dict — the calibration blocker never materializes).
+        - float64 accumulation matmuls (more accurate than a float32 path; the
+          float32/GPU tradeoff is deferred to Phase 3).
+        - Genome build is not auto-detected from the panel (the streaming source
+          carries none — the PRS/platform build is used).
+        - Not yet supported on streaming: ``exclude_ambiguous`` (raises
+          ``NotImplementedError``) and hyperparameter tuning (``tuning_scope != "none"``
+          warns and uses the configured ``l1_ratio``/``alpha``). Use ``backend="dense"``.
         """
         from imputed_prs.compute.sufficient_stats import (
             StreamingImputationFitter,
@@ -994,14 +1007,18 @@ class LinearImputationPRS:
 
         effective_l1_ratio = self.l1_ratio
         effective_alpha = self.alpha
-        if self.tuning_scope != "none" and self.verbose >= 1:
+        if self.tuning_scope != "none":
             # Bounded streaming hyperparameter tuning (windowed dense pre-pass) is a
-            # follow-up; use the configured (l1_ratio, alpha) rather than implying a
-            # tuned fit. tuning_scope='none' silences this; backend='dense' tunes.
-            print(
+            # follow-up. Warn unconditionally so a default streaming fit never
+            # *silently* drops tuning, then use the configured (l1_ratio, alpha).
+            # tuning_scope='none' silences this; backend='dense' tunes.
+            warnings.warn(
                 f"backend='streaming': tuning_scope={self.tuning_scope!r} is not yet "
-                f"supported on the streaming path; using configured "
-                f"l1_ratio={effective_l1_ratio}, alpha={effective_alpha}."
+                f"supported on the streaming path; using the configured "
+                f"l1_ratio={effective_l1_ratio}, alpha={effective_alpha} "
+                f"(no hyperparameter tuning performed).",
+                UserWarning,
+                stacklevel=2,
             )
 
         if self.verbose >= 1:
@@ -1041,8 +1058,8 @@ class LinearImputationPRS:
             result.s_true, result.s_cv, result.models
         )
 
-        # TrainingResult with an EMPTY cv_predictions dict — the calibration blocker
-        # never materializes; s_true/s_cv were accumulated during the pass.
+        # TrainingResult with cv_predictions=None — the calibration blocker never
+        # materializes; s_true/s_cv were accumulated during the streaming pass.
         training_failures: Dict[str, TrainingFailure] = {}
         for vid, msg in result.failures.items():
             etype, _, emsg = msg.partition(": ")
@@ -1051,7 +1068,7 @@ class LinearImputationPRS:
             )
         training_result = TrainingResult(
             models=result.models,
-            cv_predictions={},
+            cv_predictions=None,
             n_variants_trained=result.n_trained,
             n_variants_failed=result.n_failed,
             n_intercept_only=result.n_intercept_only,
