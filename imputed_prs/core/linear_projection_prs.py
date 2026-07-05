@@ -898,6 +898,18 @@ class LinearProjectionPRS:
         - Not yet supported on streaming: ``exclude_ambiguous`` (raises
           ``NotImplementedError``) and hyperparameter tuning (``tuning_scope != "none"``
           warns and uses the configured ``l1_ratio``/``alpha``). Use ``backend="dense"``.
+
+        Scaling note (dense scores): the region-scoped chip band buffer holds a per-fold
+        Gram ``Ghold=(K, cap, cap)`` where ``cap`` is the number of chip columns buffered
+        for the widest open region. On a *uniformly dense* score like PGS000027, ±W windows
+        merge into ~one region per chromosome (thousands of predictors), so ``cap`` grows to
+        many thousands and this Gram dominates RAM (measured ~12 GB on chr22, independent of
+        n_samples) — and the mega-region fit is itself low-R². Such scores are better served
+        by ``LinearImputationPRS`` (per-variant windows stay small: measured 3.7 GB, mean
+        R²≈0.77 on the same chr22 data); projection targets scores whose PRS variants cluster
+        into a modest number of separated regions. Bounding ``max_predictors`` caps the *fit*
+        predictors but not the buffered ``cap``; a band-limited per-fold Gram is a Phase-3
+        optimization (see benchmarks/results/streaming/).
         """
         from imputed_prs.compute.projection_stream import (
             StreamingProjectionFitter,

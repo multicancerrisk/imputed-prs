@@ -1,0 +1,53 @@
+{
+  "reference": "chr22 PGS000027 (34,388 positions)",
+  "n_prs_variants": 27854,
+  "points": [
+    {
+      "n_samples": 500,
+      "peak_rss_bytes": 11842338816,
+      "peak_rss_gb": 11.842338816,
+      "wall_seconds": 127.32630295888521,
+      "authoritative": true
+    },
+    {
+      "n_samples": 1000,
+      "peak_rss_bytes": 11653169152,
+      "peak_rss_gb": 11.653169152,
+      "wall_seconds": 121.61773862503469,
+      "authoritative": true
+    },
+    {
+      "n_samples": 2000,
+      "peak_rss_bytes": 11939102720,
+      "peak_rss_gb": 11.93910272,
+      "wall_seconds": 107.76331104221754,
+      "authoritative": true
+    },
+    {
+      "n_samples": 3202,
+      "peak_rss_bytes": 12135120896,
+      "peak_rss_gb": 12.135120896,
+      "wall_seconds": 107.67148229200393,
+      "authoritative": true
+    }
+  ],
+  "empirical_fit": {
+    "model": "peak_rss = a + b*n_samples",
+    "a_bytes": 11654800366.74541,
+    "b_bytes_per_sample": 141827.8300534701,
+    "r2": 0.7114342853955755,
+    "predicted_500k_bytes": 82568715393.48045,
+    "predicted_500k_gb": 82.56871539348046,
+    "caveat": "measured n<=3202: band buffer is tiny vs fixed overhead, so the slope is noisy; the analytical model below is the principled 500K estimate."
+  },
+  "analytical_500k": {
+    "n_samples": 500000,
+    "n_variants": 34388,
+    "band_proxy": 4096,
+    "streaming_total_bytes": 16408000000,
+    "streaming_total_gb": 16.408,
+    "dense_total_bytes": 412656000000,
+    "dense_total_tb": 0.412656,
+    "dense_over_streaming_ratio": 25.149683081423696
+  }
+}
