@@ -9,7 +9,7 @@ from typing import List
 
 import pandas as pd
 
-from imputed_prs.core.harmonizer import _normalize_chromosome
+from imputed_prs.core.harmonizer import normalize_chromosome_array
 
 
 @dataclass
@@ -87,14 +87,21 @@ def merge_variant_windows(
             max_region_span_bp=0,
         )
 
-    # Compute per-variant windows with normalized chromosomes
+    # Compute per-variant windows with normalized chromosomes. Vectorized: the
+    # per-row iterrows built a Series per variant (~60x slower at PRS scale). The
+    # sweep-merge below is unchanged, so ordering/tie-breaking is preserved.
+    chroms = normalize_chromosome_array(prs_variants["chromosome"]).tolist()
+    positions = prs_variants["position"].to_numpy().tolist()
+    variant_ids = prs_variants["variant_id"].to_numpy().tolist()
+    # iterrows yields the index *label*; callers reset_index so it equals the
+    # positional index used to slice X. Preserve that exactly.
+    idxs = prs_variants.index.to_numpy().tolist()
     windows = []
-    for idx, row in prs_variants.iterrows():
-        chrom = _normalize_chromosome(str(row["chromosome"]))
-        pos = int(row["position"])
+    for chrom, pos, variant_id, idx in zip(chroms, positions, variant_ids, idxs):
+        pos = int(pos)
         start = max(0, pos - window_size)
         end = pos + window_size
-        windows.append((chrom, start, end, row["variant_id"], idx))
+        windows.append((chrom, start, end, variant_id, idx))
 
     # Group by chromosome
     chrom_groups: dict = {}

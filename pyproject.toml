@@ -38,6 +38,11 @@ plotting = [
 bench = [
     "pyliftover>=0.4",
 ]
+scale = [
+    # PLINK 2 PGEN streaming reader (io/genotype_source.py::PgenGenotypeSource).
+    # Lazily imported; the CPU/VCF path works without it.
+    "pgenlib>=0.94",
+]
 
 [tool.pytest.ini_options]
 markers = [

@@ -7,6 +7,7 @@ This module provides functions to harmonize variants across different data sourc
 - Filter variants to local genomic windows
 """
 
+import re
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -116,15 +117,22 @@ def _normalize_build(build: Optional[str]) -> Optional[str]:
     return build
 
 
+# Float-stringified numeric chromosome, e.g. "22.0" produced when a mixed-dtype
+# source column is inferred as float. Guarded to purely-numeric names so that
+# versioned scaffold accessions (e.g. "GL000220.0") are never touched.
+_CHROM_FLOAT_RE = re.compile(r"^(\d+)\.0$")
+
+
 def _normalize_chromosome(chrom: str) -> str:
     """Normalize chromosome name.
 
-    Strips 'chr' prefix and normalizes sex/mitochondrial chromosomes.
+    Strips 'chr' prefix, repairs float-stringified numeric chromosomes, and
+    normalizes sex/mitochondrial chromosomes.
 
     Parameters
     ----------
     chrom : str
-        Chromosome string (e.g., "chr1", "CHR22", "chrX").
+        Chromosome string (e.g., "chr1", "CHR22", "chrX", "22.0").
 
     Returns
     -------
@@ -135,10 +143,74 @@ def _normalize_chromosome(chrom: str) -> str:
     # Strip chr prefix
     if chrom.startswith("CHR"):
         chrom = chrom[3:]
+    # Repair float artifacts like "22.0" -> "22" (see _CHROM_FLOAT_RE). This
+    # arises when a harmonized PGS Catalog file's chromosome column is inferred
+    # as float; without repair, "22.0" fails to match a "chr22" reference and
+    # those variants are silently dropped.
+    match = _CHROM_FLOAT_RE.match(chrom)
+    if match:
+        chrom = match.group(1)
     # Normalize common aliases
     if chrom == "MT":
         chrom = "M"
     return chrom
+
+
+def normalize_chromosome_array(chromosomes) -> np.ndarray:
+    """Vectorized chromosome normalization, element-wise identical to
+    :func:`_normalize_chromosome`.
+
+    Normalizes only the *unique* input values through the scalar function (a
+    handful of distinct chromosomes even for millions of rows) and maps them
+    back. Equivalent to ``pd.Series(chromosomes).apply(lambda x:
+    _normalize_chromosome(str(x)))`` but at a fraction of the cost, which is why
+    it can replace the per-call ``.apply``/``.iterrows`` normalization in the
+    windowing and reference-indexing hotspots.
+
+    Parameters
+    ----------
+    chromosomes : pandas.Series or array-like
+        Raw chromosome values.
+
+    Returns
+    -------
+    numpy.ndarray
+        Object array of normalized chromosome strings, aligned to the input.
+    """
+    # ``.map(str)`` applies Python ``str`` element-wise, reproducing the scalar
+    # path's ``str(x)`` exactly (NaN -> "nan", None -> "None") and turning every
+    # value into a real string so the subsequent dict-map has no NaN-key
+    # mismatch. Only the handful of *distinct* strings pay the regex cost.
+    as_str = pd.Series(chromosomes).map(str)
+    mapping = {value: _normalize_chromosome(value) for value in as_str.unique()}
+    return as_str.map(mapping).to_numpy()
+
+
+def hoist_columns(df: pd.DataFrame, *names: str) -> List[list]:
+    """Return per-column Python lists for fast index-based row iteration.
+
+    A drop-in replacement for ``df.iterrows()`` in per-variant harmonization
+    loops: ``iterrows`` builds a Series per row (~60x slower at PRS scale and it
+    can upcast dtypes), whereas indexing pre-extracted lists does neither. An
+    absent optional column yields ``[None] * len(df)`` to mirror ``row.get``.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Frame to hoist.
+    *names : str
+        Column names, in the order the returned lists should be unpacked.
+
+    Returns
+    -------
+    List[list]
+        One Python list per requested name, each aligned to ``df`` row order.
+    """
+    n = len(df)
+    return [
+        df[name].tolist() if name in df.columns else [None] * n
+        for name in names
+    ]
 
 
 def _build_variant_lookup(
@@ -830,12 +902,19 @@ def build_reference_allele_index(variant_info: pd.DataFrame) -> Dict[str, List[i
     Dict[str, List[int]]
         Mapping from "chrom:pos" to a list of *positional* row indices.
     """
-    index: Dict[str, List[int]] = {}
-    for pos_idx, (_, row) in enumerate(variant_info.iterrows()):
-        chrom = _normalize_chromosome(str(row["chromosome"]))
-        pos = int(row["position"])
-        index.setdefault(f"{chrom}:{pos}", []).append(pos_idx)
-    return index
+    n = len(variant_info)
+    if n == 0:
+        return {}
+    chroms = normalize_chromosome_array(variant_info["chromosome"]).tolist()
+    positions = variant_info["position"].to_numpy().tolist()
+    # int(p) matches the scalar path and avoids float-tainted keys ("22:1.0").
+    keys = [f"{chrom}:{int(pos)}" for chrom, pos in zip(chroms, positions)]
+    # groupby(sort=False).indices yields, per key in first-appearance order, the
+    # ascending positional row indices at that locus -- identical to the
+    # enumerate/setdefault loop this replaces. .tolist() is required: consumers
+    # do ``if not candidates`` / iterate the list, which breaks on an ndarray.
+    grouped = pd.Series(np.arange(n)).groupby(keys, sort=False).indices
+    return {key: rows.tolist() for key, rows in grouped.items()}
 
 
 def match_oriented_dosage(
@@ -903,3 +982,86 @@ def match_oriented_dosage(
                 return idx, 2.0 - dosage, True
 
     return None
+
+
+class ReferenceAlleleResolver:
+    """Effect-allele-oriented dosage resolver over a fixed reference panel.
+
+    Built once from a reference ``variant_info``; :meth:`resolve` reproduces
+    :func:`match_oriented_dosage` exactly but resolves candidate rows through
+    pre-extracted numpy arrays instead of a per-candidate
+    ``variant_info.iloc[idx]``. The ``.iloc`` Series construction is the dominant
+    per-variant cost when a whole PRS is harmonized (``match_oriented_dosage`` is
+    called once per PRS variant across several passes), so this array access is
+    the hotspot fix. ``match_oriented_dosage`` is retained unchanged as the
+    differential oracle.
+
+    Parameters
+    ----------
+    variant_info : pd.DataFrame
+        Reference variant metadata with columns chromosome, position,
+        ref_allele, alt_allele.
+    """
+
+    def __init__(self, variant_info: pd.DataFrame):
+        self.locus_to_rows: Dict[str, List[int]] = build_reference_allele_index(
+            variant_info
+        )
+        # Pre-uppercase with element-wise ``str(x).upper()`` (NOT
+        # ``Series.str.upper``, which maps None/NaN to NaN rather than
+        # "NONE"/"NAN") so the comparisons in resolve() are byte-identical to the
+        # scalar oracle, including for ALT-less records whose alt_allele is None.
+        self._ref = np.array(
+            [str(a).upper() for a in variant_info["ref_allele"].to_numpy()],
+            dtype=object,
+        )
+        self._alt = np.array(
+            [str(a).upper() for a in variant_info["alt_allele"].to_numpy()],
+            dtype=object,
+        )
+
+    def resolve(
+        self,
+        chromosome: str,
+        position: int,
+        effect_allele: str,
+        other_allele: Optional[str],
+        dosage_matrix: np.ndarray,
+    ) -> Optional[Tuple[int, np.ndarray, bool]]:
+        """Resolve a PRS variant to effect-oriented dosage.
+
+        Equivalent to ``match_oriented_dosage(chromosome, position,
+        effect_allele, other_allele, variant_info, dosage_matrix,
+        self.locus_to_rows)`` for the ``variant_info`` this resolver was built
+        from. Returns ``(reference_row_index, oriented_dosage, was_flipped)`` or
+        None when no allele-compatible reference row exists at the locus.
+        """
+        chrom = _normalize_chromosome(str(chromosome))
+        candidates = self.locus_to_rows.get(f"{chrom}:{int(position)}")
+        if not candidates:
+            return None
+
+        effect = str(effect_allele).upper()
+        if other_allele is None or (
+            isinstance(other_allele, float) and pd.isna(other_allele)
+        ):
+            other = ""
+        else:
+            other = str(other_allele).upper()
+
+        # Pass 1 matches alleles directly; pass 2 retries the complementary strand.
+        for use_complement in (False, True):
+            eff = _complement(effect) if use_complement else effect
+            oth = _complement(other) if (use_complement and other) else other
+            for idx in candidates:
+                ref = self._ref[idx]
+                alt = self._alt[idx]
+                dosage = dosage_matrix[:, idx]
+                # Effect allele is the ALT -> dosage already counts it.
+                if eff == alt and (oth == ref or oth == ""):
+                    return idx, dosage.copy(), False
+                # Effect allele is the REF -> flip so dosage counts the effect.
+                if eff == ref and (oth == alt or oth == ""):
+                    return idx, 2.0 - dosage, True
+
+        return None

@@ -376,7 +376,14 @@ def _read_scoring_file(path: Path) -> pd.DataFrame:
         If file cannot be read.
     """
     try:
-        return pd.read_csv(path, sep="\t", comment="#", compression="gzip")
+        # low_memory=False forces whole-file dtype inference. With the default
+        # (chunked) inference, a large file's chromosome column (e.g. hm_chr on
+        # PGS000027's ~2.1M rows) can be typed float in some chunks, yielding
+        # float-stringified values like "22.0" that then fail to match a
+        # "chr22" reference. Inferring once keeps the column consistent.
+        return pd.read_csv(
+            path, sep="\t", comment="#", compression="gzip", low_memory=False
+        )
     except Exception as e:
         raise DataLoadError(f"Failed to read scoring file {path}: {e}") from e
 

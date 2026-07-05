@@ -15,9 +15,10 @@ from imputed_prs.core.exceptions import (
 from imputed_prs.core.harmonizer import (
     _is_ambiguous_snp,
     _normalize_chromosome,
-    build_reference_allele_index,
+    ReferenceAlleleResolver,
     check_predict_compatibility,
-    match_oriented_dosage,
+    hoist_columns,
+    normalize_chromosome_array,
     partition_variants,
     validate_genome_build,
 )
@@ -270,11 +271,15 @@ class LinearProjectionPRS:
 
         # Step 5: Load reference genotypes
         prs_chrpos = set()
-        for _, row in prs_df.iterrows():
-            chrom = str(row["chromosome"]).upper()
-            if chrom.startswith("CHR"):
-                chrom = chrom[3:]
-            prs_chrpos.add(f"{chrom}:{int(row['position'])}")
+        _chroms, _pos = hoist_columns(prs_df, "chromosome", "position")
+        for _c, _p in zip(_chroms, _pos):
+            # Inline normalization preserved verbatim (upper + strip "chr" only,
+            # intentionally NOT the full _normalize_chromosome): this only widens
+            # the load filter, and changing it would change which variants load.
+            _c = str(_c).upper()
+            if _c.startswith("CHR"):
+                _c = _c[3:]
+            prs_chrpos.add(f"{_c}:{int(_p)}")
         all_needed_variants = set(prs_df["variant_id"]) | platform_variant_set | prs_chrpos
         genotype_data = load_genotypes(
             path=reference_genotypes, variant_ids=all_needed_variants
@@ -299,7 +304,8 @@ class LinearProjectionPRS:
             effective_genome_build = build_result.prs_build
 
         # Step 7: Build allele-aware reference indices (see LinearImputationPRS).
-        reference_index = build_reference_allele_index(genotype_data.variant_info)
+        resolver = ReferenceAlleleResolver(genotype_data.variant_info)
+        reference_index = resolver.locus_to_rows
         reference_contigs = {
             _normalize_chromosome(str(c))
             for c in genotype_data.variant_info["chromosome"].unique()
@@ -308,26 +314,37 @@ class LinearProjectionPRS:
         # Step 8: Build training matrices.
         # Mapping for platform predictor lookups (first occurrence wins).
         geno_var_to_idx: Dict[str, int] = {}
-        for idx, row in genotype_data.variant_info.iterrows():
-            geno_var_to_idx.setdefault(row["variant_id"], idx)
-            chrom = _normalize_chromosome(str(row["chromosome"]))
-            pos = str(int(row["position"]))
-            geno_var_to_idx.setdefault(f"{chrom}:{pos}", idx)
+        _gv_ids, _gv_pos = hoist_columns(
+            genotype_data.variant_info, "variant_id", "position"
+        )
+        _gv_chroms = normalize_chromosome_array(
+            genotype_data.variant_info["chromosome"]
+        ).tolist()
+        for idx in range(len(_gv_ids)):
+            # idx is positional (variant_info has a RangeIndex); setdefault keeps
+            # first-occurrence-wins for determinism, exactly as the iterrows loop.
+            geno_var_to_idx.setdefault(_gv_ids[idx], idx)
+            geno_var_to_idx.setdefault(
+                f"{_gv_chroms[idx]}:{int(_gv_pos[idx])}", idx
+            )
 
         # Optional QC — exclude strand-ambiguous SNPs with high reference MAF.
         ambiguous_excluded_ids: Set[str] = set()
         if self.exclude_ambiguous:
-            for _, row in prs_df.iterrows():
-                effect = str(row["effect_allele"]).upper()
-                other = row.get("other_allele")
+            _vids, _chroms, _pos, _effs, _oths = hoist_columns(
+                prs_df, "variant_id", "chromosome", "position",
+                "effect_allele", "other_allele",
+            )
+            for i in range(len(prs_df)):
+                effect = str(_effs[i]).upper()
+                other = _oths[i]
                 if pd.isna(other):
                     continue
                 if not _is_ambiguous_snp(effect, str(other).upper()):
                     continue
-                match = match_oriented_dosage(
-                    row["chromosome"], int(row["position"]), effect, other,
-                    genotype_data.variant_info, genotype_data.dosage_matrix,
-                    reference_index,
+                match = resolver.resolve(
+                    _chroms[i], int(_pos[i]), effect, other,
+                    genotype_data.dosage_matrix,
                 )
                 if match is None:
                     continue
@@ -337,7 +354,7 @@ class LinearProjectionPRS:
                     continue
                 af = float(np.mean(dosage[valid]) / 2.0)
                 if min(af, 1.0 - af) > self.ambiguous_maf_threshold:
-                    ambiguous_excluded_ids.add(row["variant_id"])
+                    ambiguous_excluded_ids.add(_vids[i])
 
         # Allele-aware observed inclusion (see LinearImputationPRS): require an
         # observed variant's (effect, other) alleles to be compatible with the
@@ -348,23 +365,25 @@ class LinearProjectionPRS:
         observed_variant_ids = set(observed_variant_ids)
         missing_variant_ids = set(missing_variant_ids)
         observed_allele_reclassified: Set[str] = set()
-        for _, row in prs_df[
-            prs_df["variant_id"].isin(observed_variant_ids)
-        ].iterrows():
-            var_id = row["variant_id"]
+        _obs_df = prs_df[prs_df["variant_id"].isin(observed_variant_ids)]
+        _vids, _chroms, _pos, _effs, _oths = hoist_columns(
+            _obs_df, "variant_id", "chromosome", "position",
+            "effect_allele", "other_allele",
+        )
+        for i in range(len(_obs_df)):
+            var_id = _vids[i]
             if var_id in ambiguous_excluded_ids:
                 continue
             locus = (
-                f"{_normalize_chromosome(str(row['chromosome']))}:"
-                f"{int(row['position'])}"
+                f"{_normalize_chromosome(str(_chroms[i]))}:"
+                f"{int(_pos[i])}"
             )
             if locus not in reference_index:
                 continue  # platform-measured but absent from reference: keep observed
-            match = match_oriented_dosage(
-                row["chromosome"], int(row["position"]),
-                row["effect_allele"], row.get("other_allele"),
-                genotype_data.variant_info, genotype_data.dosage_matrix,
-                reference_index,
+            match = resolver.resolve(
+                _chroms[i], int(_pos[i]),
+                _effs[i], _oths[i],
+                genotype_data.dosage_matrix,
             )
             if match is None:
                 observed_allele_reclassified.add(var_id)
@@ -423,11 +442,10 @@ class LinearProjectionPRS:
             if var_id in ambiguous_excluded_ids:
                 missing_drop_reason[var_id] = "ambiguous_excluded"
                 continue
-            match = match_oriented_dosage(
+            match = resolver.resolve(
                 row["chromosome"], int(row["position"]),
                 row["effect_allele"], row.get("other_allele"),
-                genotype_data.variant_info, genotype_data.dosage_matrix,
-                reference_index,
+                genotype_data.dosage_matrix,
             )
             if match is None:
                 chrom_n = _normalize_chromosome(str(row["chromosome"]))
@@ -549,25 +567,28 @@ class LinearProjectionPRS:
                 placed_columns: List[np.ndarray] = []
                 placed_var_ids: List[str] = []
                 placed_betas: List[float] = []
-                for _, prs_row in prs_df.iterrows():
-                    var_id = prs_row["variant_id"]
+                _vids, _chroms, _pos, _effs, _oths, _betas = hoist_columns(
+                    prs_df, "variant_id", "chromosome", "position",
+                    "effect_allele", "other_allele", "beta",
+                )
+                for i in range(len(prs_df)):
+                    var_id = _vids[i]
                     is_observed = (
                         var_id in observed_variant_ids
                         and var_id not in ambiguous_excluded_ids
                     )
                     if not (is_observed or var_id in covered_ids):
                         continue
-                    match = match_oriented_dosage(
-                        prs_row["chromosome"], int(prs_row["position"]),
-                        prs_row["effect_allele"], prs_row.get("other_allele"),
-                        genotype_data.variant_info, genotype_data.dosage_matrix,
-                        reference_index,
+                    match = resolver.resolve(
+                        _chroms[i], int(_pos[i]),
+                        _effs[i], _oths[i],
+                        genotype_data.dosage_matrix,
                     )
                     if match is None:
                         continue
                     placed_columns.append(match[1])
                     placed_var_ids.append(var_id)
-                    placed_betas.append(float(prs_row["beta"]))
+                    placed_betas.append(float(_betas[i]))
 
                 if placed_columns:
                     # Per-column (per-variant) mean imputation of missing reference
@@ -651,11 +672,10 @@ class LinearProjectionPRS:
             kept_observed_rows.append(row)
             if Z.shape[1] == 0:
                 continue
-            match = match_oriented_dosage(
+            match = resolver.resolve(
                 row["chromosome"], int(row["position"]),
                 row["effect_allele"], row.get("other_allele"),
-                genotype_data.variant_info, genotype_data.dosage_matrix,
-                reference_index,
+                genotype_data.dosage_matrix,
             )
             if match is None:
                 # Platform-measured but no reference target (locus absent): still

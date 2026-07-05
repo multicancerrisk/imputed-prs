@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from imputed_prs.core.exceptions import DataLoadError, ValidationError
+from imputed_prs.core.harmonizer import _normalize_chromosome
 from imputed_prs.core.types import GenotypeData
 
 logger = logging.getLogger(__name__)
@@ -145,25 +146,10 @@ def _detect_genotype_format(path: Path) -> str:
     return "unknown"
 
 
-def _normalize_chromosome(chrom: str) -> str:
-    """Normalize chromosome name.
-
-    Strips 'chr' prefix and normalizes sex/mitochondrial chromosomes.
-
-    Args:
-        chrom: Chromosome string (e.g., "chr1", "CHR22", "chrX").
-
-    Returns:
-        Normalized chromosome (e.g., "1", "22", "X").
-    """
-    chrom = str(chrom).upper()
-    # Strip chr prefix
-    if chrom.startswith("CHR"):
-        chrom = chrom[3:]
-    # Normalize common aliases
-    if chrom == "MT":
-        chrom = "M"
-    return chrom
+# ``_normalize_chromosome`` is imported from core.harmonizer (single source of
+# truth); it is re-exported here so existing ``io.genotype_loader`` callers and
+# tests keep working. Keeping two copies risked silent drift between the
+# reference and PRS chromosome-normalization paths.
 
 
 def _build_variant_lookup(
@@ -280,46 +266,20 @@ def _load_vcf_with_cyvcf2(
     n_genotypes_total = 0
 
     for variant in vcf:
-        chrom = _normalize_chromosome(variant.CHROM)
-        pos = variant.POS
-        var_id = variant.ID if variant.ID else f"{chrom}:{pos}"
-
-        # Apply variant filter
+        # Apply variant filter (chrom/pos/id recomputed inside the shared
+        # splitter too; the recompute here is cheap and keeps that splitter
+        # self-contained and reusable by the streaming source).
         if filter_variants:
-            if not _variant_matches(var_id, chrom, pos, rsid_set, chrpos_set):
+            chrom = _normalize_chromosome(variant.CHROM)
+            var_id = variant.ID if variant.ID else f"{chrom}:{variant.POS}"
+            if not _variant_matches(var_id, chrom, variant.POS, rsid_set, chrpos_set):
                 continue
 
-        # Extract dosage(s). Multi-allelic records are split into one entry per
-        # ALT allele, each with its own allele-specific dosage, so that downstream
-        # chr:pos:ref:alt matching is exact and dosages are never conflated across
-        # distinct alternate alleles.
-        alts = list(variant.ALT)
-        if len(alts) <= 1:
-            dosage = _extract_dosage(variant, dosage_field, len(sample_ids))
-            if dosage is None:
-                logger.warning(f"Could not extract dosage for variant {var_id}, skipping")
-                continue
-            per_alt = [(alts[0] if alts else None, dosage)]
-        else:
-            alt_dosages = _allele_specific_dosages(variant, len(alts), len(sample_ids))
-            if alt_dosages is None:
-                logger.warning(
-                    f"Could not extract allele-specific dosages for multi-allelic "
-                    f"variant {var_id}, skipping"
-                )
-                continue
-            per_alt = list(zip(alts, alt_dosages))
-
-        for alt_allele, dosage in per_alt:
+        for record, dosage in variant_to_records(
+            variant, dosage_field, len(sample_ids)
+        ):
             dosages.append(dosage)
-            variant_records.append({
-                "variant_id": var_id,
-                "chromosome": chrom,
-                "position": pos,
-                "ref_allele": variant.REF,
-                "alt_allele": alt_allele,
-            })
-
+            variant_records.append(record)
             # Track missing rate
             n_missing_total += np.sum(np.isnan(dosage))
             n_genotypes_total += len(dosage)
@@ -359,6 +319,56 @@ def _load_vcf_with_cyvcf2(
         sample_ids=sample_ids,
         source_file=str(path),
     )
+
+
+def variant_to_records(
+    variant, dosage_field: str, n_samples: int
+) -> List[Tuple[Dict, np.ndarray]]:
+    """Split one cyvcf2 variant into ``(record, dosage)`` pairs, one per ALT.
+
+    Multi-allelic records are split so downstream chr:pos:ref:alt matching is
+    exact and dosages are never conflated across distinct ALT alleles. Each
+    ``record`` is a dict with keys ``variant_id, chromosome, position,
+    ref_allele, alt_allele`` and ``dosage`` is an effect-agnostic ALT-count array
+    (NaN for missing). Returns ``[]`` when dosages cannot be extracted (skip).
+
+    Shared by the eager loader and the streaming ``GenotypeSource`` so their
+    per-variant records and dosages are bit-identical.
+    """
+    chrom = _normalize_chromosome(variant.CHROM)
+    pos = variant.POS
+    var_id = variant.ID if variant.ID else f"{chrom}:{pos}"
+
+    alts = list(variant.ALT)
+    if len(alts) <= 1:
+        dosage = _extract_dosage(variant, dosage_field, n_samples)
+        if dosage is None:
+            logger.warning(f"Could not extract dosage for variant {var_id}, skipping")
+            return []
+        per_alt = [(alts[0] if alts else None, dosage)]
+    else:
+        alt_dosages = _allele_specific_dosages(variant, len(alts), n_samples)
+        if alt_dosages is None:
+            logger.warning(
+                f"Could not extract allele-specific dosages for multi-allelic "
+                f"variant {var_id}, skipping"
+            )
+            return []
+        per_alt = list(zip(alts, alt_dosages))
+
+    return [
+        (
+            {
+                "variant_id": var_id,
+                "chromosome": chrom,
+                "position": pos,
+                "ref_allele": variant.REF,
+                "alt_allele": alt_allele,
+            },
+            dosage,
+        )
+        for alt_allele, dosage in per_alt
+    ]
 
 
 def _allele_specific_dosages(
