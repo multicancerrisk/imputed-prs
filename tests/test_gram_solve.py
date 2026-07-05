@@ -1,0 +1,182 @@
+"""Stage 0: sample-free Gram solver parity vs the legacy per-variant fit.
+
+Asserts ``compute.gram_solve.fit_from_local_gram`` reproduces
+``models.elastic_net.fit_single_variant_model`` (coefficients, intercept, cv_mse,
+cv_r2, and per-sample out-of-fold predictions) from sufficient statistics alone,
+across shapes/hyperparameters, plus the three intercept-only fallbacks and the
+sklearn-private-API guardrail. Runs in seconds.
+"""
+
+import numpy as np
+import pytest
+from sklearn.model_selection import KFold
+
+from imputed_prs.compute.gram_solve import (
+    LocalGramBlock,
+    _select_solver,
+    fit_from_local_gram,
+)
+from imputed_prs.models.elastic_net import fit_single_variant_model
+
+
+def build_block(X: np.ndarray, y: np.ndarray, cv_folds: int, seed: int) -> LocalGramBlock:
+    """Assemble a LocalGramBlock from raw (X, y), folded exactly like the legacy fit.
+
+    The legacy fit runs ``KFold(shuffle=True, random_state=seed).split(X_valid)``;
+    with no NaNs X_valid == X, so the same call reproduces its held-out partition.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    n, p = X.shape
+
+    block = LocalGramBlock(
+        n=n,
+        G=X.T @ X,
+        c=X.T @ y,
+        zsum=X.sum(axis=0),
+        zsqsum=(X * X).sum(axis=0),
+        ysum=float(y.sum()),
+        ysqsum=float(y @ y),
+    )
+    kfold = KFold(n_splits=cv_folds, shuffle=True, random_state=seed)
+    for _train_idx, val_idx in kfold.split(X):
+        Xv, yv = X[val_idx], y[val_idx]
+        block.fold_G.append(Xv.T @ Xv)
+        block.fold_c.append(Xv.T @ yv)
+        block.fold_zsum.append(Xv.sum(axis=0))
+        block.fold_zsqsum.append((Xv * Xv).sum(axis=0))
+        block.fold_ysum.append(float(yv.sum()))
+        block.fold_ysqsum.append(float(yv @ yv))
+        block.fold_n.append(len(val_idx))
+    return block
+
+
+def oof_from_fold_models(result, X, cv_folds, seed):
+    """Reconstruct per-sample OOF predictions from the returned raw fold models."""
+    n = X.shape[0]
+    oof = np.full(n, np.nan)
+    if result.is_intercept_only:
+        oof[:] = result.intercept
+        return oof
+    kfold = KFold(n_splits=cv_folds, shuffle=True, random_state=seed)
+    for k, (_train_idx, val_idx) in enumerate(kfold.split(X)):
+        fm = result.fold_models[k]
+        oof[val_idx] = X[val_idx] @ fm.coef + fm.intercept
+    return oof
+
+
+def make_dosage_data(n, p, seed):
+    """Synthetic 0-2 dosage-like data with a real linear signal (no NaN)."""
+    rng = np.random.RandomState(seed)
+    freqs = rng.uniform(0.1, 0.9, size=p)
+    X = rng.binomial(2, freqs, size=(n, p)).astype(np.float64)
+    true_w = rng.randn(p) * 0.3
+    y = X @ true_w + rng.randn(n) * 0.5
+    # Keep y in a plausible dosage range so std/variance edge guards behave alike.
+    y = np.clip(y - y.min(), 0.0, 2.0)
+    return X, y
+
+
+@pytest.mark.parametrize("n,p", [(200, 8), (500, 20), (137, 3), (300, 1)])
+@pytest.mark.parametrize("alpha,l1_ratio", [(0.01, 0.5), (0.1, 0.9), (0.001, 0.1)])
+def test_gram_matches_legacy(n, p, alpha, l1_ratio):
+    seed = 42
+    cv_folds = 5
+    X, y = make_dosage_data(n, p, seed=n + p)
+
+    legacy = fit_single_variant_model(
+        y, X, l1_ratio=l1_ratio, alpha=alpha, cv_folds=cv_folds, random_state=seed
+    )
+    block = build_block(X, y, cv_folds, seed)
+    gram = fit_from_local_gram(block, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv_folds)
+
+    assert gram.is_intercept_only == legacy.is_intercept_only
+    np.testing.assert_allclose(
+        gram.coefficients, legacy.coefficients, atol=1e-8, rtol=1e-6
+    )
+    np.testing.assert_allclose(gram.intercept, legacy.intercept, atol=1e-8, rtol=1e-6)
+    np.testing.assert_allclose(gram.cv_mse, legacy.cv_mse, atol=1e-7, rtol=1e-6)
+    np.testing.assert_allclose(gram.cv_r2, legacy.cv_r2, atol=1e-7, rtol=1e-6)
+
+    # Per-sample out-of-fold predictions (consumed by streaming calibration).
+    oof = oof_from_fold_models(gram, X, cv_folds, seed)
+    np.testing.assert_allclose(oof, legacy.cv_predictions, atol=1e-7, rtol=1e-6)
+
+
+def test_scale_highreg_kink_parity():
+    """At 1000G scale, strong-L1 fits match on the exported model but wobble on OOF.
+
+    With heavy L1 (alpha=0.1, l1=0.9) a marginal predictor can sit exactly on the
+    L1 zero-kink; the tol=1e-4 solver then includes/excludes it differently between
+    the legacy per-fold fit and the Gram (full - held-out) fold fit — two equally
+    valid optima. The **final** model (what is exported) still matches to ~1e-12;
+    the per-fold OOF predictions can differ by ~1e-3, which is uncorrelated across
+    variants and washes out in the aggregate calibration score (statistical parity).
+    """
+    n, p, alpha, l1 = 2504, 50, 0.1, 0.9
+    seed, cv_folds = 42, 5
+    X, y = make_dosage_data(n, p, seed=n + p)
+
+    legacy = fit_single_variant_model(
+        y, X, l1_ratio=l1, alpha=alpha, cv_folds=cv_folds, random_state=seed
+    )
+    block = build_block(X, y, cv_folds, seed)
+    gram = fit_from_local_gram(block, alpha=alpha, l1_ratio=l1, cv_folds=cv_folds)
+
+    # Exported model reproduces legacy tightly.
+    np.testing.assert_allclose(gram.coefficients, legacy.coefficients, atol=1e-9)
+    np.testing.assert_allclose(gram.intercept, legacy.intercept, atol=1e-9)
+    # CV metrics + OOF are within a small statistical band (kink sensitivity).
+    assert abs(gram.cv_r2 - legacy.cv_r2) < 5e-3
+    oof = oof_from_fold_models(gram, X, cv_folds, seed)
+    assert np.max(np.abs(oof - legacy.cv_predictions)) < 5e-3
+
+
+def test_fallback_no_predictors():
+    X, y = make_dosage_data(100, 1, seed=1)
+    X0 = np.empty((100, 0))
+    legacy = fit_single_variant_model(y, X0, cv_folds=5, random_state=0)
+    block = LocalGramBlock(
+        n=100,
+        G=np.empty((0, 0)),
+        c=np.empty(0),
+        zsum=np.empty(0),
+        zsqsum=np.empty(0),
+        ysum=float(y.sum()),
+        ysqsum=float(y @ y),
+    )
+    gram = fit_from_local_gram(block, alpha=0.01, l1_ratio=0.5, cv_folds=5)
+    assert gram.is_intercept_only and legacy.is_intercept_only
+    np.testing.assert_allclose(gram.intercept, legacy.intercept, atol=1e-12)
+    np.testing.assert_allclose(gram.cv_mse, legacy.cv_mse, atol=1e-12)
+    assert gram.cv_r2 == 0.0
+
+
+def test_fallback_too_few_valid():
+    X, y = make_dosage_data(4, 3, seed=2)  # n_valid=4 < cv_folds=5
+    legacy = fit_single_variant_model(y, X, cv_folds=5, random_state=0)
+    block = build_block(X, y, cv_folds=4, seed=0)  # folds irrelevant; fallback fires
+    block.fold_G.clear()  # simulate: caller need not populate folds when n < cv_folds
+    block.fold_n.clear()
+    gram = fit_from_local_gram(block, alpha=0.01, l1_ratio=0.5, cv_folds=5)
+    assert gram.is_intercept_only and legacy.is_intercept_only
+    np.testing.assert_allclose(gram.intercept, legacy.intercept, atol=1e-12)
+
+
+def test_fallback_zero_variance_target():
+    rng = np.random.RandomState(3)
+    X = rng.binomial(2, 0.5, size=(200, 5)).astype(np.float64)
+    y = np.full(200, 1.0)  # constant target
+    legacy = fit_single_variant_model(y, X, cv_folds=5, random_state=0)
+    block = build_block(X, y, cv_folds=5, seed=0)
+    gram = fit_from_local_gram(block, alpha=0.01, l1_ratio=0.5, cv_folds=5)
+    assert gram.is_intercept_only and legacy.is_intercept_only
+    np.testing.assert_allclose(gram.intercept, legacy.intercept, atol=1e-12)
+
+
+def test_private_solver_guardrail():
+    """The sklearn private Gram CD must be present and agree with ElasticNet here."""
+    assert _select_solver() is True, (
+        "sklearn private enet_coordinate_descent_gram failed the self-test; "
+        "the pinned sklearn may have broken the private API."
+    )

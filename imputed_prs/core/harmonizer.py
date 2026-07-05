@@ -1065,3 +1065,45 @@ class ReferenceAlleleResolver:
                     return idx, 2.0 - dosage, True
 
         return None
+
+    def would_resolve(
+        self,
+        chromosome: str,
+        position: int,
+        effect_allele: str,
+        other_allele: Optional[str],
+    ) -> Optional[Tuple[int, bool]]:
+        """Metadata-only :meth:`resolve`: the reference row + flip, no dosage needed.
+
+        Returns ``(reference_row_index, was_flipped)`` for the same reference row
+        :meth:`resolve` would select (``was_flipped`` True ⇒ effect allele is the
+        reference REF, so the effect-oriented dosage is ``2 − ALT``), or None when no
+        allele-compatible row exists. This lets the streaming path classify PRS
+        variants and precompute per-variant flip flags without materializing the
+        dosage matrix.
+        """
+        chrom = _normalize_chromosome(str(chromosome))
+        candidates = self.locus_to_rows.get(f"{chrom}:{int(position)}")
+        if not candidates:
+            return None
+
+        effect = str(effect_allele).upper()
+        if other_allele is None or (
+            isinstance(other_allele, float) and pd.isna(other_allele)
+        ):
+            other = ""
+        else:
+            other = str(other_allele).upper()
+
+        for use_complement in (False, True):
+            eff = _complement(effect) if use_complement else effect
+            oth = _complement(other) if (use_complement and other) else other
+            for idx in candidates:
+                ref = self._ref[idx]
+                alt = self._alt[idx]
+                if eff == alt and (oth == ref or oth == ""):
+                    return idx, False
+                if eff == ref and (oth == alt or oth == ""):
+                    return idx, True
+
+        return None

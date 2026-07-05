@@ -16,9 +16,10 @@ sufficient-statistics pass consumes it (streaming ZᵀZ/ZᵀX accumulation).
 """
 
 import abc
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Optional, Set
+from typing import Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -126,10 +127,22 @@ class VcfGenotypeSource(GenotypeSource):
         vcf.close()
         if not self._sample_ids:
             raise ValidationError("VCF file contains no samples")
+        # Region pushdown needs a tabix/CSI index; without one we fall back to a
+        # whole-file scan filtered to the region's contig (correct, just slower —
+        # fine for per-chromosome or small panels; index large multi-contig VCFs).
+        self._has_index = (
+            Path(self.path + ".tbi").exists() or Path(self.path + ".csi").exists()
+        )
+        self._warned_no_index = False
 
     @property
     def sample_ids(self) -> List[str]:
         return self._sample_ids
+
+    @property
+    def contigs(self) -> List[str]:
+        """Raw contig names in the file (region queries must use these spellings)."""
+        return sorted(self._seqnames)
 
     def _check_region(self, region: str) -> None:
         # cyvcf2 returns an *empty* iterator (no error) if the contig name does
@@ -150,16 +163,39 @@ class VcfGenotypeSource(GenotypeSource):
 
         from cyvcf2 import VCF
 
+        # Region pushdown when indexed; otherwise scan the whole file and keep only
+        # records on the region's contig (+ span) Python-side.
+        scan_region = region
+        contig_filter = span_filter = None
         if region is not None:
             self._check_region(region)
+            if not self._has_index:
+                scan_region = None
+                contig_filter, span_filter = _parse_region(region)
+                if not self._warned_no_index:
+                    warnings.warn(
+                        f"VCF {self.path!r} has no tabix/CSI index; streaming falls "
+                        f"back to a full-file scan per region (slower). Index it "
+                        f"(bgzip + tabix) for large multi-contig panels.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    self._warned_no_index = True
 
         vcf = VCF(self.path, samples=self._samples)
         n = len(self._sample_ids)
         records: List[dict] = []
         columns: List[np.ndarray] = []
         try:
-            iterator = vcf(region) if region is not None else vcf
+            iterator = vcf(scan_region) if scan_region is not None else vcf
             for variant in iterator:
+                if contig_filter is not None:
+                    if variant.CHROM != contig_filter:
+                        continue
+                    if span_filter is not None and not (
+                        span_filter[0] <= variant.POS <= span_filter[1]
+                    ):
+                        continue
                 if self._filter:
                     chrom = _normalize_chromosome(variant.CHROM)
                     var_id = variant.ID if variant.ID else f"{chrom}:{variant.POS}"
@@ -179,6 +215,21 @@ class VcfGenotypeSource(GenotypeSource):
                 yield _make_block(records, columns)
         finally:
             vcf.close()
+
+
+def _parse_region(region: str) -> Tuple[str, Optional[Tuple[int, int]]]:
+    """Split ``contig[:start-end]`` into ``(contig, (lo, hi) | None)``.
+
+    Used for the no-index fallback scan (the raw contig name is matched against
+    ``variant.CHROM``). A bare contig yields ``None`` span (whole contig).
+    """
+    contig, _, span = region.partition(":")
+    if not span:
+        return contig, None
+    start, _, end = span.partition("-")
+    lo = int(start) if start else 0
+    hi = int(end) if end else (1 << 62)
+    return contig, (lo, hi)
 
 
 def _make_block(records: List[dict], columns: List[np.ndarray]) -> VariantBlock:
@@ -358,3 +409,28 @@ class PgenGenotypeSource(GenotypeSource):
                 yield VariantBlock(variant_info=info, dosages=dosages)
         finally:
             reader.close()
+
+
+def make_genotype_source(
+    path, samples: Optional[List[str]] = None, variant_ids: Optional[Set[str]] = None
+) -> GenotypeSource:
+    """Construct the right streaming source for ``path`` from its extension.
+
+    ``.pgen`` (or a path with a companion ``.pgen``) → :class:`PgenGenotypeSource`
+    (the production 500K-sample backend); ``.vcf/.vcf.gz/.bcf`` →
+    :class:`VcfGenotypeSource` (the 1000G verification backend). Mirrors the
+    format detection of :func:`io.genotype_loader.load_genotypes` so the streaming
+    ``backend`` accepts the same reference paths as the dense one.
+    """
+    p = str(path)
+    low = p.lower()
+    if low.endswith(".pgen") or Path(p + ".pgen").exists():
+        pgen_path = p if low.endswith(".pgen") else p + ".pgen"
+        return PgenGenotypeSource(pgen_path, samples=samples, variant_ids=variant_ids)
+    if low.endswith((".vcf", ".vcf.gz", ".vcf.bgz", ".bcf")):
+        return VcfGenotypeSource(p, samples=samples, variant_ids=variant_ids)
+    raise DataLoadError(
+        f"Cannot build a streaming GenotypeSource for {p!r}: expected a "
+        f".vcf/.vcf.gz/.bcf or .pgen path. Use backend='dense' for other formats "
+        f"(e.g. PLINK1 .bed)."
+    )

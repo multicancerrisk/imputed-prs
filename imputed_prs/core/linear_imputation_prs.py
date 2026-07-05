@@ -34,6 +34,7 @@ from imputed_prs.evaluation.calibration import (
     mean_impute_columns,
 )
 from imputed_prs.io.genotype_loader import load_genotypes
+from imputed_prs.io.genotype_source import make_genotype_source
 from imputed_prs.io.pgs_catalog import download_pgs_catalog_score
 from imputed_prs.io.platform_loader import (
     load_platform_from_manifest,
@@ -61,6 +62,12 @@ from imputed_prs.io.user_genotypes import (
 from imputed_prs.models.predictor import PRSPredictor
 from imputed_prs.models.trainer import ImputationModelTrainer
 from imputed_prs.models.tuning import global_hyperparameter_search
+
+# backend="auto" streams when the estimated dense dosage matrix
+# (n_samples x |needed variants| x 4 bytes) exceeds this. Chosen so test-sized
+# inputs (<< 1 GB) stay on the dense oracle — keeping the golden gate exact — while
+# real reference panels (1000G/UK Biobank scale) select the streaming path.
+_AUTO_STREAMING_BYTES_THRESHOLD = 8 * 1024**3  # 8 GiB
 
 
 class LinearImputationPRS:
@@ -106,6 +113,7 @@ class LinearImputationPRS:
         max_tuning_variants: Optional[int] = 50,
         exclude_ambiguous: bool = False,
         ambiguous_maf_threshold: float = 0.4,
+        backend: Literal["auto", "dense", "streaming"] = "auto",
         verbose: int = 1,
     ):
         """Initialize LinearImputationPRS model.
@@ -143,6 +151,18 @@ class LinearImputationPRS:
                 reliably. Default: False.
             ambiguous_maf_threshold: MAF above which ambiguous SNPs are excluded
                 when ``exclude_ambiguous`` is True. Default: 0.4.
+            backend: Training backend for reference genotypes.
+                - "dense": load the whole dosage matrix in RAM and train per-variant
+                  (the original path; the correctness oracle). Feasible only when the
+                  matrix fits in memory (≈ n_samples × n_variants × 4 bytes).
+                - "streaming": stream the panel once via a chunked ``GenotypeSource``
+                  and train from banded sufficient statistics, never materializing the
+                  full matrix (Phase 2). Scales to 2M variants × 500K samples in GB of
+                  RAM. Requires ``tuning_scope`` in {"none", "global"} and
+                  ``exclude_ambiguous=False`` (AF-based streaming QC is a follow-up).
+                - "auto": pick "streaming" when the estimated dense matrix is large
+                  (so test-sized inputs stay on the dense oracle, keeping the golden
+                  gate exact), else "dense". Default: "auto".
             verbose: Verbosity level. 0=silent, 1=progress bar, 2=debug output.
                 Default: 1.
         """
@@ -151,6 +171,10 @@ class LinearImputationPRS:
             raise ValidationError(
                 f"tuning_scope must be 'global', 'per_variant', or 'none', "
                 f"got {tuning_scope!r}"
+            )
+        if backend not in ("auto", "dense", "streaming"):
+            raise ValidationError(
+                f"backend must be 'auto', 'dense', or 'streaming', got {backend!r}"
             )
         if max_tuning_variants is not None and max_tuning_variants <= 0:
             raise ValidationError(
@@ -168,6 +192,7 @@ class LinearImputationPRS:
         self.max_tuning_variants = max_tuning_variants
         self.exclude_ambiguous = exclude_ambiguous
         self.ambiguous_maf_threshold = ambiguous_maf_threshold
+        self.backend = backend
         self.verbose = verbose
 
         # Fitted state (populated by fit())
@@ -328,6 +353,40 @@ class LinearImputationPRS:
                 _c = _c[3:]
             prs_chrpos.add(f"{_c}:{int(_p)}")
         all_needed_variants = set(prs_df["variant_id"]) | platform_variant_set | prs_chrpos
+
+        # Backend selection (Phase 2 streaming seam). The dense in-RAM path below is
+        # the untouched correctness oracle; the streaming path trains from banded
+        # sufficient statistics without ever materializing the dosage matrix. "auto"
+        # streams only when the estimated dense matrix is large, so test-sized inputs
+        # stay on the oracle (golden gate exact).
+        if self.backend != "dense":
+            # "auto" must not regress formats the dense oracle supports: if the
+            # streaming source cannot read this path (e.g. PLINK1 .bed), fall back
+            # to dense. Explicit backend="streaming" surfaces the error instead.
+            try:
+                source = make_genotype_source(
+                    reference_genotypes, variant_ids=all_needed_variants
+                )
+            except DataLoadError:
+                if self.backend == "streaming":
+                    raise
+                source = None
+            if source is not None and (
+                self.backend == "streaming"
+                or self._auto_should_stream(source, all_needed_variants)
+            ):
+                return self._fit_streaming(
+                    source=source,
+                    prs_df=prs_df,
+                    platform_variant_set=platform_variant_set,
+                    effective_prs_id=effective_prs_id,
+                    effective_platform_name=effective_platform_name,
+                    effective_genome_build=effective_genome_build,
+                    model_name=model_name,
+                    reference_panel_id=reference_panel_id,
+                    training_ancestry=training_ancestry,
+                )
+
         genotype_data = load_genotypes(
             path=reference_genotypes, variant_ids=all_needed_variants
         )
@@ -865,6 +924,200 @@ class LinearImputationPRS:
             )
 
         # Step 14: Return self for method chaining
+        return self
+
+    # ------------------------------------------------------------------
+    # Streaming backend (Phase 2): train from banded sufficient statistics
+    # without ever materializing the reference dosage matrix.
+    # ------------------------------------------------------------------
+    def _auto_should_stream(self, source, all_needed_variants: Set[str]) -> bool:
+        """backend='auto': stream when the estimated dense matrix is large.
+
+        Estimated dense bytes = ``n_samples × |needed variants| × 4``. Test-sized
+        inputs fall well below the threshold and stay on the dense oracle (keeping
+        the golden gate exact); real reference panels select streaming.
+        """
+        try:
+            n_samples = len(source.sample_ids)
+        except Exception:  # noqa: BLE001 - can't size it → safe default (dense oracle)
+            return False
+        est_bytes = n_samples * max(len(all_needed_variants), 1) * 4
+        stream = est_bytes > _AUTO_STREAMING_BYTES_THRESHOLD
+        if stream and self.verbose >= 1:
+            print(
+                f"backend='auto': estimated dense matrix ~{est_bytes / 1e9:.1f} GB "
+                f"(> {_AUTO_STREAMING_BYTES_THRESHOLD / 1e9:.0f} GB) → streaming."
+            )
+        return stream
+
+    def _fit_streaming(
+        self,
+        source,
+        prs_df: pd.DataFrame,
+        platform_variant_set: Set[str],
+        effective_prs_id: Optional[str],
+        effective_platform_name: Optional[str],
+        effective_genome_build: Optional[str],
+        model_name: Optional[str],
+        reference_panel_id: Optional[str],
+        training_ancestry: Optional[str],
+    ) -> "LinearImputationPRS":
+        """Train via a single streaming pass over the panel (Phase 2 backend).
+
+        Produces the same fitted state the dense tail (Steps 11–13) would — imputed
+        models, calibration params, observed ``VariantInfo`` list (with per-variant
+        fallbacks), dispositions, platform index — but from banded sufficient
+        statistics, never materializing the dosage matrix and never building the
+        per-variant ``cv_predictions`` dict (``s_true``/``s_cv`` are reduced in-stream).
+
+        Deviations from the dense oracle, all documented: reference genome build is
+        not auto-detected from the panel (the streaming source carries none — the
+        PRS/platform build is used); ``exclude_ambiguous`` and non-``none``
+        ``tuning_scope`` are not yet supported (see below).
+        """
+        from imputed_prs.compute.sufficient_stats import (
+            StreamingImputationFitter,
+            _chrom_sort_key,
+            build_stream_plan,
+            collect_reference_variant_info,
+        )
+        from imputed_prs.evaluation.streaming_calibration import (
+            finalize_imputation_calibration,
+        )
+        from imputed_prs.models.trainer import _compute_training_summary
+
+        if self.exclude_ambiguous:
+            raise NotImplementedError(
+                "backend='streaming' does not yet support exclude_ambiguous=True "
+                "(AF-based streaming QC is a follow-up). Use backend='dense'."
+            )
+
+        effective_l1_ratio = self.l1_ratio
+        effective_alpha = self.alpha
+        if self.tuning_scope != "none" and self.verbose >= 1:
+            # Bounded streaming hyperparameter tuning (windowed dense pre-pass) is a
+            # follow-up; use the configured (l1_ratio, alpha) rather than implying a
+            # tuned fit. tuning_scope='none' silences this; backend='dense' tunes.
+            print(
+                f"backend='streaming': tuning_scope={self.tuning_scope!r} is not yet "
+                f"supported on the streaming path; using configured "
+                f"l1_ratio={effective_l1_ratio}, alpha={effective_alpha}."
+            )
+
+        if self.verbose >= 1:
+            print(f"Streaming backend: {len(source.sample_ids)} reference samples")
+
+        # Metadata scan → harmonized stream plan (targets, observed, chip, fallbacks).
+        chroms = sorted(
+            {_normalize_chromosome(str(c)) for c in prs_df["chromosome"].unique()},
+            key=_chrom_sort_key,
+        )
+        ref_info = collect_reference_variant_info(source, chroms)
+        plan, missing_drop_reason = build_stream_plan(
+            ref_info,
+            prs_df,
+            platform_variant_set,
+            sample_ids=source.sample_ids,
+            window_size=self.window_size,
+            max_predictors=self.max_predictors,
+            alpha=effective_alpha,
+            l1_ratio=effective_l1_ratio,
+            cv_folds=self.cv_folds,
+            random_state=self.random_state,
+        )
+
+        if self.verbose >= 1:
+            print(
+                f"Stream plan: {len(plan.targets)} missing targets, "
+                f"{len(plan.observed)} observed calibration terms, "
+                f"{len(plan.chip_ids)} chip predictors"
+            )
+
+        # Single streaming pass: imputed models + observed fallbacks + calibration.
+        fitter = StreamingImputationFitter(plan)
+        result = fitter.run(source)
+
+        calibration_params = finalize_imputation_calibration(
+            result.s_true, result.s_cv, result.models
+        )
+
+        # TrainingResult with an EMPTY cv_predictions dict — the calibration blocker
+        # never materializes; s_true/s_cv were accumulated during the pass.
+        training_failures: Dict[str, TrainingFailure] = {}
+        for vid, msg in result.failures.items():
+            etype, _, emsg = msg.partition(": ")
+            training_failures[vid] = TrainingFailure(
+                unit_id=vid, error_type=etype or "Error", error_message=emsg or msg
+            )
+        training_result = TrainingResult(
+            models=result.models,
+            cv_predictions={},
+            n_variants_trained=result.n_trained,
+            n_variants_failed=result.n_failed,
+            n_intercept_only=result.n_intercept_only,
+            training_summary=_compute_training_summary(result.models),
+            failures=training_failures,
+        )
+
+        # Observed VariantInfo list, each carrying its per-variant fallback (P1.8),
+        # in PRS order (mirrors dense Step 12).
+        observed_variants_list: List[VariantInfo] = []
+        for _, row in prs_df[
+            prs_df["variant_id"].isin(plan.observed_prs_ids)
+        ].iterrows():
+            other_allele = row.get("other_allele")
+            if pd.isna(other_allele):
+                other_allele = None
+            observed_variants_list.append(
+                VariantInfo(
+                    variant_id=row["variant_id"],
+                    chromosome=str(row["chromosome"]),
+                    position=int(row["position"]),
+                    effect_allele=row["effect_allele"],
+                    other_allele=other_allele,
+                    beta=float(row["beta"]),
+                    fallback=result.fallback_models.get(row["variant_id"]),
+                )
+            )
+
+        # Per-variant dispositions (one record per input PRS variant; no silent loss).
+        intercept_only_ids = {
+            vid for vid, m in result.models.items() if m.is_intercept_only
+        }
+        self._variant_dispositions = self._build_variant_dispositions(
+            prs_df=prs_df,
+            observed_kept_ids=set(plan.observed_prs_ids),
+            trained_models=result.models,
+            intercept_only_ids=intercept_only_ids,
+            ambiguous_excluded_ids=set(),
+            missing_drop_reason=missing_drop_reason,
+            observed_fallback_ids=set(result.fallback_models.keys()),
+            fallback_no_target_ids=set(plan.fallback_no_target_ids),
+            training_failures=training_failures,
+        )
+
+        # Populate instance state (mirrors dense Step 13).
+        self._is_fitted = True
+        self._observed_variants = observed_variants_list
+        self._imputed_models = list(result.models.values())
+        self._calibration_params = calibration_params
+        self._training_result = training_result
+        self._platform_variant_index = {
+            vid: i
+            for i, vid in enumerate(plan.platform_variant_info["variant_id"].tolist())
+        }
+        self._prs_id = effective_prs_id
+        self._platform_name = effective_platform_name
+        self._genome_build = effective_genome_build
+        self._model_name = model_name
+        self._reference_panel_id = reference_panel_id
+        self._training_ancestry = training_ancestry
+
+        if self.verbose >= 1:
+            print(
+                f"Model fitted (streaming): {len(self._observed_variants)} observed, "
+                f"{len(self._imputed_models)} imputed variants"
+            )
         return self
 
     def _build_variant_dispositions(

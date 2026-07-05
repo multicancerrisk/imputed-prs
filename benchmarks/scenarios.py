@@ -119,6 +119,8 @@ def _make_model(method: str, config: Dict[str, Any]):
         tuning_scope=config.get("tuning_scope", "none"),
         verbose=config.get("verbose", 1),
     )
+    if config.get("backend") is not None:  # Phase-2 dense/streaming/auto selector
+        common["backend"] = config["backend"]  # both methods now honor it (M2 + M3)
     if method == "projection":
         common["max_tuning_regions"] = config.get("max_tuning_regions", 50)
         return LinearProjectionPRS(**common)
@@ -147,12 +149,11 @@ def _fit_kwargs(params: Dict[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
-def _op_fit(spec, registry: PhaseRegistry) -> Dict[str, Any]:
+def _fit_and_extract(model, method: str, spec, registry: PhaseRegistry) -> Dict[str, Any]:
+    """Time ``model.fit`` (+ optional predict probe / export) and return the oracle."""
     from benchmarks.oracle import extract_oracle
 
-    method = spec.params.get("method", "imputation")
-    model = _make_model(method, spec.config)
-    _RETAINED.append(model)  # keep the fitted model (and its cv_predictions) live for attribution
+    _RETAINED.append(model)  # keep the fitted model live for attribution
     with phase("fit", registry, trace=spec.tracemalloc):
         model.fit(**_fit_kwargs(spec.params))
     probe = None
@@ -169,6 +170,26 @@ def _op_fit(spec, registry: PhaseRegistry) -> Dict[str, Any]:
                 payload["export_ok"] = False
                 payload["export_error"] = str(exc)
     return payload
+
+
+def _op_fit(spec, registry: PhaseRegistry) -> Dict[str, Any]:
+    method = spec.params.get("method", "imputation")
+    model = _make_model(method, spec.config)
+    return _fit_and_extract(model, method, spec, registry)
+
+
+def _op_streaming_fit(spec, registry: PhaseRegistry) -> Dict[str, Any]:
+    """Phase-2 streaming imputation fit, timed like ``fit``.
+
+    Forces ``backend="streaming"`` so the op always exercises the sufficient-statistics
+    path (never materializing the dosage matrix) regardless of scenario config, letting
+    ``harness.measure(..., timeout_s=...)`` enforce the per-chromosome wall-clock ceiling
+    and record peak RSS for the 500K extrapolation. Honors ``method`` (imputation or
+    projection) so both streaming backends can be benchmarked.
+    """
+    method = spec.params.get("method", "imputation")
+    model = _make_model(method, {**spec.config, "backend": "streaming"})
+    return _fit_and_extract(model, method, spec, registry)
 
 
 def _predict_probe(model, probe_spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -213,6 +234,7 @@ SCENARIOS: Dict[str, Callable[[Any, PhaseRegistry], Dict[str, Any]]] = {
     "_selftest_numpy_attrib": _op_selftest_numpy_attrib,
     "load_genotypes": _op_load_genotypes,
     "fit": _op_fit,
+    "streaming_fit": _op_streaming_fit,
     "predict": _op_predict,
 }
 
@@ -251,4 +273,18 @@ def predict_bytes(
         cv = int(n_missing) * int(n_samples) * 8
         dense = concurrent_copies * dense_one
         return {"dense_copies": dense, "cv_predictions": cv, "total_est": dense + cv}
+    if operation == "streaming_fit":
+        # Window-bounded: the resident state is the ±2W chip band (Z + Gram) plus a
+        # handful of length-n accumulators — independent of total variant count.
+        # Modeled as a chip-band matrix (band_variants columns) + O(n) accumulators,
+        # NOT n_samples * n_variants. Uses `n_missing` as a band-width proxy when the
+        # caller supplies the co-windowed chip count; else a conservative default.
+        band = int(n_missing) if n_missing is not None else 4096
+        band_matrix = int(n_samples) * band * 8  # float64 buffered band columns
+        accumulators = 6 * int(n_samples) * 8  # s_true/s_cv + a few length-n vectors
+        return {
+            "band_matrix": band_matrix,
+            "accumulators": accumulators,
+            "total_est": band_matrix + accumulators,
+        }
     return {"total_est": dense_one}
