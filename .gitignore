@@ -37,3 +37,9 @@ htmlcov/
 
 # Analysis
 analysis/
+
+# Benchmark artifacts (keep curated baseline; ignore raw per-run output and downloaded data)
+benchmarks/results/*
+!benchmarks/results/baseline/
+!benchmarks/results/.gitignore
+benchmarks/data/

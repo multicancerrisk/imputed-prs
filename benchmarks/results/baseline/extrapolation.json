@@ -1,0 +1,188 @@
+{
+  "targets": {
+    "n_samples": 500000,
+    "n_variants": 2000000
+  },
+  "n_results": 9,
+  "memory": {
+    "combined": {
+      "model": "b0 + b_v*v + b_sv*(s*v)",
+      "coef": {
+        "b0": 3829.9217337187238,
+        "b_v": -3735437.925590606,
+        "b_sv": 7561.480001268873
+      },
+      "r2": 0.9985828194314522,
+      "n_points": 3,
+      "n_distinct_sizes": 2,
+      "confidence": "low"
+    },
+    "power_law": {
+      "model": "A*x^k",
+      "A": 112318467906.5346,
+      "k": -0.2585166272409286,
+      "r2_log": 0.9993565678257194,
+      "n_points": 3,
+      "confidence": "low"
+    },
+    "per_axis": {
+      "vs_samples_at_fixed_v": {
+        "fixed_v": 313.0,
+        "slope": NaN,
+        "intercept": NaN,
+        "r2": NaN,
+        "n_points": 2,
+        "confidence": "low"
+      },
+      "vs_variants_at_fixed_s": {
+        "fixed_s": 2000.0,
+        "slope": NaN,
+        "intercept": NaN,
+        "r2": NaN,
+        "n_points": 2,
+        "confidence": "low"
+      }
+    },
+    "extrapolation": {
+      "combined": 7554009125421522.0,
+      "power_law": NaN
+    },
+    "measured_range": {
+      "n_samples": [
+        500.0,
+        2000.0
+      ],
+      "n_variants": [
+        313.0,
+        33608.0
+      ]
+    },
+    "analytical": {
+      "dense_one_copy": 4000000000000.0,
+      "dense_concurrent_copies": 16000000000000.0,
+      "cv_predictions": 8000000000000.0,
+      "total": 24000000000000.0
+    },
+    "effective_concurrent_float32_copies": 1890.3700003172182
+  },
+  "time": {
+    "combined": {
+      "model": "b0 + b_v*v + b_sv*(s*v)",
+      "coef": {
+        "b0": 1.9168574710655222e-05,
+        "b_v": -0.018695637503933982,
+        "b_sv": 6.227370316719863e-05
+      },
+      "r2": 0.99971036610584,
+      "n_points": 3,
+      "n_distinct_sizes": 2,
+      "confidence": "low"
+    },
+    "power_law": {
+      "model": "A*x^k",
+      "A": 0.0010939308084448667,
+      "k": 0.7725947085370954,
+      "r2_log": 0.9939291966792282,
+      "n_points": 3,
+      "confidence": "low"
+    },
+    "per_axis": {
+      "vs_samples_at_fixed_v": {
+        "fixed_v": 313.0,
+        "slope": NaN,
+        "intercept": NaN,
+        "r2": NaN,
+        "n_points": 2,
+        "confidence": "low"
+      },
+      "vs_variants_at_fixed_s": {
+        "fixed_s": 2000.0,
+        "slope": NaN,
+        "intercept": NaN,
+        "r2": NaN,
+        "n_points": 2,
+        "confidence": "low"
+      }
+    },
+    "extrapolation": {
+      "combined": 62236311.89220993,
+      "power_law": NaN
+    },
+    "measured_range": {
+      "n_samples": [
+        500.0,
+        2000.0
+      ],
+      "n_variants": [
+        313.0,
+        33608.0
+      ]
+    }
+  },
+  "dense_isolation": {
+    "combined": {
+      "model": "b0 + b_v*v + b_sv*(s*v)",
+      "coef": {
+        "b0": 211366883.47032264,
+        "b_v": 684.3093137139281,
+        "b_sv": 12.107542316594204
+      },
+      "r2": 0.9999999981689762,
+      "n_points": 5,
+      "n_distinct_sizes": 4,
+      "confidence": "ok"
+    },
+    "power_law": {
+      "model": "A*x^k",
+      "A": 1827.487602375386,
+      "k": 0.741846627643106,
+      "r2_log": 0.9918097256538838,
+      "n_points": 5,
+      "confidence": "ok"
+    },
+    "per_axis": {
+      "vs_samples_at_fixed_v": {
+        "fixed_v": 34388.0,
+        "slope": 416410.28266666655,
+        "intercept": 234842794.66666657,
+        "r2": 0.9999999747144851,
+        "n_points": 3,
+        "confidence": "ok"
+      },
+      "vs_variants_at_fixed_s": {
+        "fixed_s": 500.0,
+        "slope": 6738.517094935481,
+        "intercept": 211323810.1393589,
+        "r2": 0.9999999772484749,
+        "n_points": 3,
+        "confidence": "ok"
+      }
+    },
+    "extrapolation": {
+      "combined": 12109122302105.102,
+      "power_law": 1458861190621.7615
+    },
+    "measured_range": {
+      "n_samples": [
+        500.0,
+        2000.0
+      ],
+      "n_variants": [
+        34388.0,
+        132107.0
+      ]
+    },
+    "analytical": {
+      "dense_one_copy": 4000000000000.0,
+      "dense_concurrent_copies": 16000000000000.0,
+      "cv_predictions": 8000000000000.0,
+      "total": 24000000000000.0
+    },
+    "effective_concurrent_float32_copies": 3.026885579148551
+  },
+  "caveats": [
+    "Sample axis measured only up to a few thousand samples; 500K is a large extrapolation (~150x on the sample axis).",
+    "Peak RSS points with tracemalloc enabled are excluded (inflated).",
+    "Wall-time super-linearity from O(n_variants) pandas hotspots is only partially captured by a linear-in-(s*v) model."
+  ]
+}

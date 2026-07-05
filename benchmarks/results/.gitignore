@@ -1,0 +1,5 @@
+# Transient per-run measurement output — keep only the curated, committed baseline/.
+/raw/
+/smoke/
+/*.json
+/*.png

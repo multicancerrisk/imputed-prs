@@ -35,10 +35,14 @@ optuna = [
 plotting = [
     "matplotlib>=3.5.0",
 ]
+bench = [
+    "pyliftover>=0.4",
+]
 
 [tool.pytest.ini_options]
 markers = [
     "integration: marks tests as integration tests (may require network access)",
+    "slow: marks tests that are slow or memory-heavy (deselect with '-m \"not slow\"')",
 ]
 
 [tool.setuptools.packages.find]

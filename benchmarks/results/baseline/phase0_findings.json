@@ -1,0 +1,53 @@
+{
+  "phase": 0,
+  "genome_build": "GRCh38",
+  "reference": "1000G NYGC high-coverage 30x, 3202 samples",
+  "scale_score": {
+    "pgs_id": "PGS000027",
+    "advertised_variants": 2100302,
+    "loaded_variants": 2100168
+  },
+  "baseline_score": {
+    "pgs_id": "PGS000004",
+    "variants": 313
+  },
+  "chip": {
+    "platform": "23andme_v5",
+    "lifted_grch37_to_grch38": "632979/635991 (99.5%)"
+  },
+  "dense_memory_scaling_points": [
+    {
+      "n_variants": 33608,
+      "n_samples": 500,
+      "peak_rss_bytes": 443105280,
+      "wall_seconds": 2.42
+    },
+    {
+      "n_variants": 33608,
+      "n_samples": 2000,
+      "peak_rss_bytes": 1067663360,
+      "wall_seconds": 4.01
+    },
+    {
+      "n_variants": 129517,
+      "n_samples": 500,
+      "peak_rss_bytes": 1101529088,
+      "wall_seconds": 4.82
+    },
+    {
+      "n_variants": 129517,
+      "n_samples": 2000,
+      "peak_rss_bytes": 3500736512,
+      "wall_seconds": 12.45
+    }
+  ],
+  "blocker": {
+    "memory_wall": "dense matrix alone extrapolates to ~4 TB (analytical one copy) / ~12 TB (empirical load, R2=1.0) / ~24 TB with all fit copies + cv_predictions at 500K x 2M",
+    "time_wall": "legacy per-variant imputation fit is impractical: did not finish one chromosome (chr22, 33.6k variants) at 500 samples within 15 min; extrapolated fit time at 500K x 2M ~ hundreds of days",
+    "practical_note": "only practical configs were benchmarked; the impractical legacy imputation path was capped/dropped, not waited on"
+  },
+  "oracle_files": [
+    "baseline/imputation.json",
+    "baseline/projection.json"
+  ]
+}
