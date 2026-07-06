@@ -128,3 +128,62 @@ def streaming_reference_cv_impute(
         fold_imputed_models=fold_models,
         failures=failures,
     )
+
+
+def streaming_reference_cv_project(
+    source,
+    prs_df: pd.DataFrame,
+    platform_variant_set,
+    *,
+    fold_indices: Sequence[np.ndarray],
+    window_size: int = 1_000_000,
+    max_predictors: Optional[int] = None,
+    alpha: float = 0.01,
+    l1_ratio: float = 0.5,
+    cv_folds: int = 5,
+    random_state: Optional[int] = None,
+    device: str = "cpu",
+) -> ReferenceCVModels:
+    """One streaming pass → per-outer-fold **projection** region models by subtraction.
+
+    Projection analogue of :func:`streaming_reference_cv_impute`: builds the projection
+    stream plan (merged regions) and runs a single leave-one-fold-out pass
+    (``StreamingProjectionFitter.run_reference_cv``) over the reference-CV outer partition.
+    """
+    from imputed_prs.compute.projection_stream import (
+        StreamingProjectionFitter,
+        build_projection_stream_plan,
+    )
+    from imputed_prs.compute.sufficient_stats import (
+        GlobalFolds,
+        _chrom_sort_key,
+        collect_reference_variant_info,
+    )
+    from imputed_prs.core.harmonizer import _normalize_chromosome
+
+    chroms = sorted(
+        {_normalize_chromosome(str(c)) for c in prs_df["chromosome"].unique()},
+        key=_chrom_sort_key,
+    )
+    ref_info = collect_reference_variant_info(source, chroms)
+    plan, _drop_reasons = build_projection_stream_plan(
+        ref_info,
+        prs_df,
+        platform_variant_set,
+        sample_ids=source.sample_ids,
+        window_size=window_size,
+        max_predictors=max_predictors,
+        alpha=alpha,
+        l1_ratio=l1_ratio,
+        cv_folds=cv_folds,
+        random_state=random_state,
+    )
+    outer_folds = GlobalFolds.from_partition(fold_indices)
+    fitter = StreamingProjectionFitter(plan, device=device)
+    fold_models, failures = fitter.run_reference_cv(source, outer_folds)
+    return ReferenceCVModels(
+        observed_variants=_observed_variant_infos(prs_df, plan.observed_prs_ids),
+        fold_indices=list(fold_indices),
+        fold_region_models=fold_models,
+        failures=failures,
+    )

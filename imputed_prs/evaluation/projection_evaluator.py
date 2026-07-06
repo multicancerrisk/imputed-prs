@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
+import pandas as pd
 
 from imputed_prs.core.exceptions import ModelNotFittedError
 from imputed_prs.core.types import (
@@ -317,3 +318,177 @@ class ProjectionEvaluator:
                 )
 
         return predicted
+
+    # ------------------------------------------------------------------
+    # Reference cross-validation (Phase 6).
+    # ------------------------------------------------------------------
+    def cross_validate(
+        self,
+        reference_genotypes: Union[str, Path],
+        prs_definition: Union[str, Path, pd.DataFrame],
+        platform_name: Optional[str] = None,
+        platform_manifest: Optional[Union[str, Path]] = None,
+        platform_variants: Optional[List[str]] = None,
+        n_folds: int = 5,
+        random_state: Optional[int] = None,
+        backend: Optional[str] = None,
+    ):
+        """Perform k-fold reference cross-validation for the projection model.
+
+        Splits the reference panel into ``k`` folds, trains region models on ``k-1``
+        folds and scores the held-out fold; repeats for all folds. Phase 6: when the
+        resolved backend streams, all ``k`` training folds are assembled from **one**
+        streaming pass by additive subtraction (``S_full − S_fold(k)``) rather than ``k``
+        independent refits; the dense/small path refits each fold as the size-selected
+        oracle (keeping the golden gate exact). Mirrors
+        :meth:`ImputationEvaluator.cross_validate` and returns the same
+        ``CrossValidationResult``.
+        """
+        from imputed_prs.core.exceptions import ValidationError
+        from imputed_prs.core.linear_projection_prs import LinearProjectionPRS
+        from imputed_prs.evaluation.evaluator import CrossValidationResult
+        from imputed_prs.evaluation.metrics import compute_percentile_concordance
+
+        platform_sources = [
+            platform_name is not None,
+            platform_manifest is not None,
+            platform_variants is not None,
+        ]
+        if sum(platform_sources) != 1:
+            raise ValidationError(
+                "Exactly one platform source must be provided: "
+                "platform_name, platform_manifest, or platform_variants"
+            )
+        if n_folds < 2:
+            raise ValidationError(f"n_folds must be >= 2, got {n_folds}")
+
+        genotype_data = load_genotypes(path=reference_genotypes)
+
+        if self.verbose >= 1:
+            print(f"Loaded {genotype_data.n_samples} samples for cross-validation")
+
+        # Fold partition — identical construction to the imputation evaluator.
+        n_samples = genotype_data.n_samples
+        rng = np.random.default_rng(random_state)
+        indices = np.arange(n_samples)
+        rng.shuffle(indices)
+        fold_size = n_samples // n_folds
+        fold_indices = []
+        for i in range(n_folds):
+            start = i * fold_size
+            end = n_samples if i == n_folds - 1 else start + fold_size
+            fold_indices.append(indices[start:end])
+
+        # Phase 6 fast-path: one streaming pass → per-fold region models by subtraction.
+        cv_driver = LinearProjectionPRS(
+            window_size=self.model.window_size,
+            tuning_scope=self.model.tuning_scope,
+            l1_ratio=self.model.l1_ratio,
+            alpha=self.model.alpha,
+            cv_folds=self.model.cv_folds,
+            n_jobs=self.model.n_jobs,
+            random_state=random_state,
+            max_predictors=self.model.max_predictors,
+            backend=backend if backend is not None else self.model.backend,
+            verbose=0,
+        )
+        cv_models = cv_driver._reference_cv_fold_models(
+            genotype_data,
+            prs_definition,
+            platform_name=platform_name,
+            platform_manifest=platform_manifest,
+            platform_variants=platform_variants,
+            fold_indices=fold_indices,
+        )
+
+        fold_metrics: List[EvaluationMetrics] = []
+        n_samples_per_fold: List[int] = []
+        all_estimated_prs = []
+        all_true_prs = []
+        genome_build = getattr(self.model, "_genome_build", None)
+
+        for fold_idx in range(n_folds):
+            if self.verbose >= 1:
+                print(f"Processing fold {fold_idx + 1}/{n_folds}...")
+
+            test_indices = fold_indices[fold_idx]
+            test_data = self._subset_genotype_data(genotype_data, test_indices)
+
+            if cv_models is not None:
+                fold_model = LinearProjectionPRS._from_components(
+                    cv_models.observed_variants,
+                    cv_models.fold_region_models[fold_idx],
+                    None,
+                    None,
+                    {"genome_build": genome_build},
+                )
+            else:
+                train_indices = np.concatenate(
+                    [fold_indices[i] for i in range(n_folds) if i != fold_idx]
+                )
+                train_data = self._subset_genotype_data(genotype_data, train_indices)
+                fold_model = LinearProjectionPRS(
+                    window_size=self.model.window_size,
+                    tuning_scope=self.model.tuning_scope,
+                    l1_ratio=self.model.l1_ratio,
+                    alpha=self.model.alpha,
+                    cv_folds=self.model.cv_folds,
+                    n_jobs=self.model.n_jobs,
+                    random_state=random_state,
+                    max_predictors=self.model.max_predictors,
+                    backend=backend if backend is not None else self.model.backend,
+                    verbose=0,
+                )
+                fold_model.fit(
+                    reference_genotypes=train_data,
+                    prs_definition=prs_definition,
+                    platform_name=platform_name,
+                    platform_manifest=platform_manifest,
+                    platform_variants=platform_variants,
+                )
+
+            fold_evaluator = ProjectionEvaluator(fold_model, verbose=0)
+            fold_true_prs = fold_evaluator._compute_true_prs(test_data)
+            fold_estimated_prs = fold_evaluator._compute_projected_prs_batch(test_data)
+
+            metrics = compute_prs_metrics(fold_estimated_prs, fold_true_prs)
+            fold_metrics.append(metrics)
+            n_samples_per_fold.append(len(test_indices))
+            all_estimated_prs.extend(fold_estimated_prs.tolist())
+            all_true_prs.extend(fold_true_prs.tolist())
+
+        correlations = [m.correlation for m in fold_metrics]
+        r2_values = [m.r2 for m in fold_metrics]
+        mae_values = [m.mae for m in fold_metrics]
+        rmse_values = [m.rmse for m in fold_metrics]
+        spearman_values = [m.spearman_rho for m in fold_metrics]
+        percentile_concordance = compute_percentile_concordance(
+            np.array(all_estimated_prs),
+            np.array(all_true_prs),
+        )
+
+        return CrossValidationResult(
+            fold_metrics=fold_metrics,
+            mean_correlation=float(np.mean(correlations)),
+            std_correlation=float(np.std(correlations)),
+            mean_r2=float(np.mean(r2_values)),
+            std_r2=float(np.std(r2_values)),
+            mean_mae=float(np.mean(mae_values)),
+            mean_rmse=float(np.mean(rmse_values)),
+            mean_spearman=float(np.mean(spearman_values)),
+            percentile_concordance=percentile_concordance,
+            n_folds=n_folds,
+            n_samples_per_fold=n_samples_per_fold,
+        )
+
+    def _subset_genotype_data(
+        self, genotype_data: GenotypeData, sample_indices: np.ndarray
+    ) -> GenotypeData:
+        """Row-subset the panel for a CV fold (Phase 4 in-RAM fold, no temp-VCF)."""
+        return GenotypeData(
+            dosage_matrix=genotype_data.dosage_matrix[sample_indices, :],
+            variant_info=genotype_data.variant_info.copy(),
+            sample_ids=[genotype_data.sample_ids[i] for i in sample_indices],
+            genome_build=genotype_data.genome_build,
+            source_file=genotype_data.source_file,
+        )

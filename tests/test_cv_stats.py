@@ -432,3 +432,63 @@ def test_cross_validate_fastpath_reproducible(cv_panel):
     r2 = ev.cross_validate(**common)
     assert r1.mean_correlation == r2.mean_correlation
     assert r1.mean_r2 == r2.mean_r2
+
+
+# ---------------------------------------------------------------------------
+# Projection reference CV (new feature): fast-path vs refit oracle (5).
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def cv_proj_panel(tmp_path_factory):
+    pytest.importorskip("cyvcf2")
+    from imputed_prs.core.linear_projection_prs import LinearProjectionPRS
+
+    path = tmp_path_factory.mktemp("cvproj") / "panel.vcf"
+    write_synthetic_vcf(path)
+    prs_df, platform = synthetic_prs()
+    parent = LinearProjectionPRS(
+        window_size=WINDOW, tuning_scope="none", alpha=0.01, l1_ratio=0.5,
+        cv_folds=5, random_state=SEED, backend="dense", verbose=0,
+    )
+    parent.fit(
+        reference_genotypes=path, prs_definition=prs_df,
+        platform_variants=platform, genome_build="GRCh38",
+    )
+    return path, prs_df, platform, parent
+
+
+def test_projection_cross_validate_fastpath_matches_refit_oracle(cv_proj_panel):
+    """Projection reference CV: the streaming additive fast-path matches the dense
+    refit-per-fold oracle metrics (same folds, same seed)."""
+    from imputed_prs.evaluation.projection_evaluator import ProjectionEvaluator
+
+    path, prs_df, platform, parent = cv_proj_panel
+    ev = ProjectionEvaluator(parent, verbose=0)
+    common = dict(
+        reference_genotypes=path, prs_definition=prs_df, platform_variants=platform,
+        n_folds=3, random_state=42,
+    )
+    fast = ev.cross_validate(backend="streaming", **common)
+    oracle = ev.cross_validate(backend="dense", **common)
+
+    assert len(fast.fold_metrics) == len(oracle.fold_metrics) == 3
+    assert abs(fast.mean_r2 - oracle.mean_r2) < 1e-6
+    assert abs(fast.mean_correlation - oracle.mean_correlation) < 1e-6
+    assert abs(fast.mean_mae - oracle.mean_mae) < 1e-6
+    assert abs(fast.mean_rmse - oracle.mean_rmse) < 1e-6
+    for ff, of in zip(fast.fold_metrics, oracle.fold_metrics):
+        assert abs(ff.r2 - of.r2) < 1e-6
+
+
+def test_projection_cross_validate_fastpath_reproducible(cv_proj_panel):
+    from imputed_prs.evaluation.projection_evaluator import ProjectionEvaluator
+
+    path, prs_df, platform, parent = cv_proj_panel
+    ev = ProjectionEvaluator(parent, verbose=0)
+    common = dict(
+        reference_genotypes=path, prs_definition=prs_df, platform_variants=platform,
+        n_folds=3, random_state=42, backend="streaming",
+    )
+    r1 = ev.cross_validate(**common)
+    r2 = ev.cross_validate(**common)
+    assert r1.mean_correlation == r2.mean_correlation
+    assert r1.mean_r2 == r2.mean_r2

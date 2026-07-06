@@ -42,6 +42,7 @@ from imputed_prs.compute.sufficient_stats import (
     _OpenTarget,
     _prepare_column,
     _region_for,
+    _run_cv_batch,
 )
 from imputed_prs.core.harmonizer import normalize_chromosome_array
 from imputed_prs.core.regions import merge_variant_windows
@@ -143,6 +144,9 @@ class StreamingProjectionFitter:
         self._has_terms = False
         # Same batch-cap rationale as imputation (bound the (n×T) working arrays).
         self._batch_cap = max(16, min(4096, (256 * 1024 * 1024) // (max(self.folds.n, 1) * 8)))
+        # Set by run_reference_cv: {fold_k -> {region_id -> ProjectionRegionModel}}.
+        # When non-None the fitter is in leave-one-fold-out reference-CV mode.
+        self._cv_collector = None
         # Regions grouped by chromosome, each sorted by start (== sorted by end, since
         # merged regions are non-overlapping), for the in-order close sweep.
         self._regions_by_chrom: Dict[str, List[int]] = {}
@@ -175,6 +179,47 @@ class StreamingProjectionFitter:
             has_calibration_terms=self._has_terms,
         )
 
+    def run_reference_cv(self, source, outer_folds: GlobalFolds):
+        """Single-pass leave-one-fold-out reference CV over the panel (projection).
+
+        Streams once with the buffer's folds set to ``outer_folds`` (the reference-CV
+        outer partition); every closing region is fit for all ``K`` training folds by the
+        additive subtraction ``S_full − S_fold(k)``. Returns ``(fold_models, failures)``
+        where ``fold_models[k]`` is the list of ``ProjectionRegionModel`` trained on all
+        samples except outer fold ``k``. Observed-variant fallbacks are not trained (the
+        evaluator scores observed terms directly). Runs on the CPU buffer (host-side
+        per-fold solve; device CV is a Phase-3 follow-up).
+        """
+        if getattr(self.backend, "device_name", "cpu") != "cpu":
+            from imputed_prs.compute.device import get_backend
+
+            self.backend = get_backend("cpu")
+        self.folds = outer_folds
+        self.s_true = np.zeros(self.folds.n, dtype=np.float64)
+        self.s_cv = np.zeros(self.folds.n, dtype=np.float64)
+        self._batch_cap = max(
+            16, min(4096, (256 * 1024 * 1024) // (max(self.folds.n, 1) * 8))
+        )
+        K = outer_folds.n_folds
+        self._cv_collector = {k: {} for k in range(K)}
+        failures: Dict[str, str] = {}
+        try:
+            for chrom in self._stream_chromosomes():
+                self._run_chromosome(source, chrom, {}, {}, failures)
+            fold_models = {k: list(self._cv_collector[k].values()) for k in range(K)}
+        finally:
+            self._cv_collector = None
+        return fold_models, failures
+
+    def _cv_region_storer(self, region, s_r):
+        """Store the K per-outer-fold region models for one region into the collector."""
+        def store(fold_results, pred_idx, pred_af_list):
+            for k, res in enumerate(fold_results):
+                self._cv_collector[k][region.region_id] = self._to_region_model(
+                    region, s_r, res, pred_idx, pred_af_list[k]
+                )
+        return store
+
     def _stream_chromosomes(self) -> List[str]:
         chset = {str(r.chromosome) for r in self.plan.regions}
         chset |= {str(t.chromosome) for t in self.plan.fallback_targets.values()}
@@ -196,6 +241,8 @@ class StreamingProjectionFitter:
         frontier = -1
         fb_failures: Dict[str, str] = {}
 
+        cv = self._cv_collector is not None
+
         def close_ready(force: bool):
             nonlocal n_intercept_only, region_ptr
             cutoff = float("inf") if force else frontier
@@ -215,20 +262,29 @@ class StreamingProjectionFitter:
                 else:
                     break
             # Observed-variant fallbacks close like imputation targets (±W window).
+            # In CV mode they are never trained (observed terms are scored directly),
+            # so they are drained without producing fit jobs.
             still_open: List[_OpenTarget] = []
             for tgt in open_fallbacks:
                 if tgt.spec.position + self.W < cutoff:
-                    job = self._fallback_job(tgt, fallback_models, fb_failures)
-                    if job is not None:
-                        jobs.append(job)
+                    if not cv:
+                        job = self._fallback_job(tgt, fallback_models, fb_failures)
+                        if job is not None:
+                            jobs.append(job)
                 else:
                     still_open.append(tgt)
             open_fallbacks[:] = still_open
             if jobs:
-                n_intercept_only += self.backend.run_fit_batch(
-                    jobs, buf, self.folds, plan.alpha, plan.l1_ratio, plan.cv_folds,
-                    self.s_true, self.s_cv, self._batch_cap,
-                )
+                if cv:
+                    _run_cv_batch(
+                        jobs, buf, self.folds, plan.alpha, plan.l1_ratio,
+                        plan.cv_folds, self._batch_cap,
+                    )
+                else:
+                    n_intercept_only += self.backend.run_fit_batch(
+                        jobs, buf, self.folds, plan.alpha, plan.l1_ratio, plan.cv_folds,
+                        self.s_true, self.s_cv, self._batch_cap,
+                    )
 
         region = _region_for(source, chrom)
         for block in source.iter_variant_blocks(region=region):
@@ -314,9 +370,14 @@ class StreamingProjectionFitter:
         except Exception as exc:  # noqa: BLE001
             failures[region.region_id] = f"{type(exc).__name__}: {exc}"
             return None
+        store = (
+            self._cv_region_storer(region, s_r)
+            if self._cv_collector is not None
+            else self._region_storer(region, s_r, region_models)
+        )
         return _FitJob(
             col=s_r, pred_idx=pred_idx, calib_coef=1.0, is_calibrating=True,
-            store=self._region_storer(region, s_r, region_models),
+            store=store,
             fail=self._failer(region.region_id, failures),
         )
 
