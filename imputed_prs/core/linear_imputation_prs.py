@@ -1192,6 +1192,114 @@ class LinearImputationPRS:
             )
         return self
 
+    # ------------------------------------------------------------------
+    # Reference cross-validation (Phase 6): per-outer-fold models by one
+    # streaming pass + additive subtraction S_full − S_fold(k).
+    # ------------------------------------------------------------------
+    def _resolve_reference_cv_inputs(
+        self,
+        prs_definition,
+        platform_name,
+        platform_manifest,
+        platform_variants,
+        genome_build,
+        allow_alt_as_effect,
+    ):
+        """Resolve ``(prs_df, platform_variant_set, all_needed_variants)`` for the
+        reference-CV fast-path.
+
+        Mirrors ``fit`` Steps 2-3/5 (PRS load + platform resolution + needed-variant
+        union) so the fast-path interprets the same inputs identically. The provenance
+        metadata ``fit`` also derives is unneeded here — the per-fold CV models are
+        ephemeral, used only to score their held-out fold.
+        """
+        if isinstance(prs_definition, pd.DataFrame):
+            prs_df = load_prs_from_dataframe(
+                prs_definition, allow_alt_as_effect=allow_alt_as_effect
+            )
+        elif isinstance(prs_definition, str) and prs_definition.upper().startswith("PGS"):
+            prs_df, _ = download_pgs_catalog_score(
+                prs_definition, genome_build=genome_build or "GRCh37"
+            )
+        else:
+            prs_df = load_prs_from_file(
+                Path(prs_definition), allow_alt_as_effect=allow_alt_as_effect
+            )
+
+        if platform_name is not None:
+            platform_variant_set, _ = load_platform_from_name(platform_name)
+        elif platform_manifest is not None:
+            platform_variant_set, _ = load_platform_from_manifest(str(platform_manifest))
+        else:
+            platform_variant_set = load_platform_variants_from_list(platform_variants)
+
+        prs_chrpos = set()
+        _chroms, _pos = hoist_columns(prs_df, "chromosome", "position")
+        for _c, _p in zip(_chroms, _pos):
+            _c = str(_c).upper()
+            if _c.startswith("CHR"):
+                _c = _c[3:]
+            prs_chrpos.add(f"{_c}:{int(_p)}")
+        all_needed_variants = (
+            set(prs_df["variant_id"]) | platform_variant_set | prs_chrpos
+        )
+        return prs_df, platform_variant_set, all_needed_variants
+
+    def _reference_cv_fold_models(
+        self,
+        genotype_data: "GenotypeData",
+        prs_definition,
+        *,
+        platform_name=None,
+        platform_manifest=None,
+        platform_variants=None,
+        fold_indices,
+        genome_build=None,
+        allow_alt_as_effect: bool = False,
+    ):
+        """One streaming pass → per-outer-fold imputation models by additive subtraction.
+
+        Returns a ``ReferenceCVModels`` (per-fold models + fold-independent observed
+        terms) when this model's resolved backend streams, or ``None`` when it is dense /
+        ``exclude_ambiguous`` is set — in which case the caller uses the refit-per-fold
+        oracle. Replaces the ``k`` independent training passes of ``cross_validate``.
+        """
+        from imputed_prs.compute.cv_stats import streaming_reference_cv_impute
+
+        if self.exclude_ambiguous:
+            # The streaming path cannot apply exclude_ambiguous (AF-based QC is a
+            # follow-up); fall back to the dense refit oracle for exact semantics.
+            return None
+        prs_df, platform_variant_set, all_needed = self._resolve_reference_cv_inputs(
+            prs_definition,
+            platform_name,
+            platform_manifest,
+            platform_variants,
+            genome_build,
+            allow_alt_as_effect,
+        )
+        source = InMemoryGenotypeSource(genotype_data, variant_ids=all_needed)
+        use_stream = self.backend == "streaming" or (
+            self.backend == "auto" and self._auto_should_stream(source, all_needed)
+        )
+        if not use_stream:
+            return None
+        # Reference CV runs on the CPU kernel (host-side per-fold solve); device-native
+        # CV composes with Phase 3 later.
+        return streaming_reference_cv_impute(
+            source,
+            prs_df,
+            platform_variant_set,
+            fold_indices=fold_indices,
+            window_size=self.window_size,
+            max_predictors=self.max_predictors,
+            alpha=self.alpha,
+            l1_ratio=self.l1_ratio,
+            cv_folds=self.cv_folds,
+            random_state=self.random_state,
+            device="cpu",
+        )
+
     def _build_variant_dispositions(
         self,
         prs_df: pd.DataFrame,

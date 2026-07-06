@@ -328,3 +328,107 @@ def test_streaming_reference_cv_matches_direct_refit(tmp_path):
                 assert abs(a_coef[pid] - dc) < 1e-9
             assert abs(am.intercept - dm.intercept) < 1e-9
             assert am.is_intercept_only == dm.is_intercept_only
+
+
+# ---------------------------------------------------------------------------
+# End-to-end ImputationEvaluator.cross_validate fast-path (verifications c, d).
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def cv_panel(tmp_path_factory):
+    pytest.importorskip("cyvcf2")
+    from imputed_prs.core.linear_imputation_prs import LinearImputationPRS
+
+    path = tmp_path_factory.mktemp("cv") / "panel.vcf"
+    write_synthetic_vcf(path)
+    prs_df, platform = synthetic_prs()
+    parent = LinearImputationPRS(
+        window_size=WINDOW, tuning_scope="none", alpha=0.01, l1_ratio=0.5,
+        cv_folds=5, random_state=SEED, backend="dense", verbose=0,
+    )
+    parent.fit(
+        reference_genotypes=path, prs_definition=prs_df,
+        platform_variants=platform, genome_build="GRCh38",
+    )
+    return path, prs_df, platform, parent
+
+
+def test_cross_validate_fastpath_matches_refit_oracle(cv_panel):
+    """The streaming additive fast-path yields the same CV metrics as the dense
+    refit-per-fold oracle (same folds, same seed) — within statistical parity."""
+    from imputed_prs.evaluation.evaluator import ImputationEvaluator
+
+    path, prs_df, platform, parent = cv_panel
+    ev = ImputationEvaluator(parent, verbose=0)
+    common = dict(
+        reference_genotypes=path, prs_definition=prs_df, platform_variants=platform,
+        n_folds=3, random_state=42,
+    )
+    fast = ev.cross_validate(backend="streaming", **common)  # additive single pass
+    oracle = ev.cross_validate(backend="dense", **common)  # refit per fold
+
+    assert abs(fast.mean_r2 - oracle.mean_r2) < 1e-6
+    assert abs(fast.mean_correlation - oracle.mean_correlation) < 1e-6
+    assert abs(fast.mean_mae - oracle.mean_mae) < 1e-6
+    assert abs(fast.mean_rmse - oracle.mean_rmse) < 1e-6
+    assert abs(fast.mean_spearman - oracle.mean_spearman) < 1e-6
+    assert fast.percentile_concordance.keys() == oracle.percentile_concordance.keys()
+    for key in fast.percentile_concordance:
+        assert (
+            abs(fast.percentile_concordance[key] - oracle.percentile_concordance[key])
+            < 1e-6
+        )
+    assert len(fast.fold_metrics) == len(oracle.fold_metrics) == 3
+    for ff, of in zip(fast.fold_metrics, oracle.fold_metrics):
+        assert abs(ff.r2 - of.r2) < 1e-6
+        assert abs(ff.correlation - of.correlation) < 1e-6
+
+
+def test_cross_validate_fastpath_is_single_pass(cv_panel, monkeypatch):
+    """The fast-path streams the panel a fixed number of times regardless of n_folds
+    (one accumulation pass), unlike the k independent refit assemblies it replaces."""
+    from imputed_prs.evaluation.evaluator import ImputationEvaluator
+    from imputed_prs.io import genotype_source as gs_mod
+
+    path, prs_df, platform, parent = cv_panel
+    ev = ImputationEvaluator(parent, verbose=0)
+
+    counter = {"n": 0}
+    orig = gs_mod.InMemoryGenotypeSource.iter_variant_blocks
+
+    def counting(self, *args, **kwargs):
+        counter["n"] += 1
+        return orig(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        gs_mod.InMemoryGenotypeSource, "iter_variant_blocks", counting
+    )
+    common = dict(
+        reference_genotypes=path, prs_definition=prs_df, platform_variants=platform,
+        random_state=42, backend="streaming",
+    )
+
+    counter["n"] = 0
+    ev.cross_validate(n_folds=2, **common)
+    c2 = counter["n"]
+    counter["n"] = 0
+    ev.cross_validate(n_folds=5, **common)
+    c5 = counter["n"]
+
+    assert c2 > 0
+    assert c2 == c5  # source iterations do NOT scale with the number of folds
+
+
+def test_cross_validate_fastpath_reproducible(cv_panel):
+    """The streaming fast-path is bit-reproducible run-to-run with a pinned seed."""
+    from imputed_prs.evaluation.evaluator import ImputationEvaluator
+
+    path, prs_df, platform, parent = cv_panel
+    ev = ImputationEvaluator(parent, verbose=0)
+    common = dict(
+        reference_genotypes=path, prs_definition=prs_df, platform_variants=platform,
+        n_folds=3, random_state=42, backend="streaming",
+    )
+    r1 = ev.cross_validate(**common)
+    r2 = ev.cross_validate(**common)
+    assert r1.mean_correlation == r2.mean_correlation
+    assert r1.mean_r2 == r2.mean_r2

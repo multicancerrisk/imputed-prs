@@ -264,50 +264,85 @@ class ImputationEvaluator:
                 end = start + fold_size
             fold_indices.append(indices[start:end])
 
+        # Phase 6 fast-path: assemble every training fold's models from ONE streaming
+        # pass by additive subtraction (S_full − S_fold(k)) instead of k independent
+        # refits. Returns None for the dense oracle, so small/test inputs stay on the
+        # refit-per-fold path below (keeping the golden gate exact). The fold partition
+        # is identical either way, so metrics/reproducibility are preserved.
+        cv_driver = LinearImputationPRS(
+            window_size=self.model.window_size,
+            tuning_scope=self.model.tuning_scope,
+            l1_ratio=self.model.l1_ratio,
+            alpha=self.model.alpha,
+            cv_folds=self.model.cv_folds,
+            n_jobs=self.model.n_jobs,
+            random_state=random_state,
+            max_predictors=self.model.max_predictors,
+            backend=backend if backend is not None else self.model.backend,
+            verbose=0,
+        )
+        cv_models = cv_driver._reference_cv_fold_models(
+            genotype_data,
+            prs_definition,
+            platform_name=platform_name,
+            platform_manifest=platform_manifest,
+            platform_variants=platform_variants,
+            fold_indices=fold_indices,
+        )
+
         # Run cross-validation
         fold_metrics: List[EvaluationMetrics] = []
         n_samples_per_fold: List[int] = []
         all_imputed_prs = []
         all_true_prs = []
 
+        genome_build = getattr(self.model, "_genome_build", None)
         for fold_idx in range(n_folds):
             if self.verbose >= 1:
                 print(f"Processing fold {fold_idx + 1}/{n_folds}...")
 
-            # Split samples
             test_indices = fold_indices[fold_idx]
-            train_indices = np.concatenate(
-                [fold_indices[i] for i in range(n_folds) if i != fold_idx]
-            )
-
-            # Create train/test genotype data
-            train_data = self._subset_genotype_data(genotype_data, train_indices)
             test_data = self._subset_genotype_data(genotype_data, test_indices)
 
-            # Train model on the training fold. Phase 4: fit the in-RAM fold
-            # directly (no temp-VCF round-trip). backend="streaming" streams the
-            # fold via InMemoryGenotypeSource; "auto"/"dense" use the dense matrix
-            # in place. The fold backend defaults to the parent model's.
-            fold_model = LinearImputationPRS(
-                window_size=self.model.window_size,
-                tuning_scope=self.model.tuning_scope,
-                l1_ratio=self.model.l1_ratio,
-                alpha=self.model.alpha,
-                cv_folds=self.model.cv_folds,
-                n_jobs=self.model.n_jobs,
-                random_state=random_state,
-                max_predictors=self.model.max_predictors,
-                backend=backend if backend is not None else self.model.backend,
-                verbose=0,  # Suppress output during CV
-            )
-
-            fold_model.fit(
-                reference_genotypes=train_data,
-                prs_definition=prs_definition,
-                platform_name=platform_name,
-                platform_manifest=platform_manifest,
-                platform_variants=platform_variants,
-            )
+            if cv_models is not None:
+                # Fast-path: a hermetic model from the additive per-fold coefficients
+                # (no refit). Observed terms are fold-independent; only the imputed
+                # models change per fold.
+                fold_model = LinearImputationPRS._from_components(
+                    cv_models.observed_variants,
+                    cv_models.fold_imputed_models[fold_idx],
+                    None,
+                    None,
+                    {"genome_build": genome_build},
+                )
+            else:
+                # Refit oracle: train a fresh model on the training fold. Phase 4: fit
+                # the in-RAM fold directly (no temp-VCF round-trip). backend="streaming"
+                # streams the fold via InMemoryGenotypeSource; "auto"/"dense" use the
+                # dense matrix in place. The fold backend defaults to the parent model's.
+                train_indices = np.concatenate(
+                    [fold_indices[i] for i in range(n_folds) if i != fold_idx]
+                )
+                train_data = self._subset_genotype_data(genotype_data, train_indices)
+                fold_model = LinearImputationPRS(
+                    window_size=self.model.window_size,
+                    tuning_scope=self.model.tuning_scope,
+                    l1_ratio=self.model.l1_ratio,
+                    alpha=self.model.alpha,
+                    cv_folds=self.model.cv_folds,
+                    n_jobs=self.model.n_jobs,
+                    random_state=random_state,
+                    max_predictors=self.model.max_predictors,
+                    backend=backend if backend is not None else self.model.backend,
+                    verbose=0,  # Suppress output during CV
+                )
+                fold_model.fit(
+                    reference_genotypes=train_data,
+                    prs_definition=prs_definition,
+                    platform_name=platform_name,
+                    platform_manifest=platform_manifest,
+                    platform_variants=platform_variants,
+                )
 
             # Create evaluator for fold model and evaluate on test data
             fold_evaluator = ImputationEvaluator(fold_model, verbose=0)
