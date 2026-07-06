@@ -6,9 +6,11 @@ from scipy.stats import truncnorm
 
 from imputed_prs.models.bounding import (
     clip_and_adjust_variance,
+    clip_and_adjust_variance_array,
     compute_truncation_adjustment_factor,
     truncated_normal_mean,
     truncated_normal_variance,
+    truncated_normal_variance_array,
 )
 
 
@@ -441,3 +443,78 @@ class TestEdgeCases:
         mean_upper = truncated_normal_mean(2.0, 0.5)
         assert var_upper >= 0.0
         assert 0.0 <= mean_upper <= 2.0
+
+
+class TestVectorizedBounding:
+    """Array twins must be elementwise-identical to the scalar oracle (atol=1e-12).
+
+    The grids deliberately straddle the guard boundaries — ``sigma`` at/below
+    ``_MIN_SIGMA`` (=1e-10) and ``mu`` far outside ``[lower, upper]`` that drive
+    ``Z = Phi_hi - Phi_lo`` below ``_MIN_Z`` — so the ``np.where`` safe-denominator
+    pattern is exercised where both scalar early-returns fire.
+    """
+
+    _SIGMAS = [0.0, 1e-15, 1e-10, 1e-3, 0.5, 5.0]
+    _MUS = [-1.0, 0.0, 1.0, 2.0, 3.0, 100.0]
+
+    def test_variance_array_equals_scalar(self):
+        mu_grid, sig_grid = np.meshgrid(self._MUS, self._SIGMAS, indexing="ij")
+        got = truncated_normal_variance_array(mu_grid, sig_grid)
+        expected = np.array(
+            [[truncated_normal_variance(m, s) for s in self._SIGMAS] for m in self._MUS]
+        )
+        assert got.shape == expected.shape
+        np.testing.assert_allclose(got, expected, rtol=0.0, atol=1e-12)
+
+    def test_variance_array_custom_bounds_equals_scalar(self):
+        mus = np.array([-1.0, 0.0, 0.5, 1.0, 2.0])
+        sigs = np.array([0.2, 0.5, 0.5, 0.2, 0.5])
+        got = truncated_normal_variance_array(mus, sigs, lower=-1.0, upper=1.0)
+        expected = np.array(
+            [
+                truncated_normal_variance(m, s, lower=-1.0, upper=1.0)
+                for m, s in zip(mus, sigs)
+            ]
+        )
+        np.testing.assert_allclose(got, expected, rtol=0.0, atol=1e-12)
+
+    def test_variance_array_finite_in_guarded_regions(self):
+        # Extreme mu (Z->0) and sub-floor sigma must not leak NaN/inf from the
+        # unused np.where branch.
+        mu_grid, sig_grid = np.meshgrid(
+            [-1e6, -5.0, 0.0, 1.0, 2.0, 7.0, 1e6],
+            [0.0, 1e-20, 1e-12, 1e-10, 0.3, 50.0],
+            indexing="ij",
+        )
+        out = truncated_normal_variance_array(mu_grid, sig_grid)
+        assert np.all(np.isfinite(out))
+        assert np.all(out >= 0.0)
+
+    def test_clip_adjust_array_equals_scalar(self):
+        raws = [-0.5, 0.0, 0.2, 1.0, 1.9, 2.0, 2.5]
+        rvars = [0.0, 1e-25, 1e-20, 1e-3, 0.25, 0.5]
+        raw_grid, rv_grid = np.meshgrid(raws, rvars, indexing="ij")
+        clip_got, adj_got = clip_and_adjust_variance_array(raw_grid, rv_grid)
+        clip_exp = np.empty_like(raw_grid)
+        adj_exp = np.empty_like(raw_grid)
+        for i, r in enumerate(raws):
+            for j, v in enumerate(rvars):
+                c, a = clip_and_adjust_variance(r, v)
+                clip_exp[i, j] = c
+                adj_exp[i, j] = a
+        np.testing.assert_allclose(clip_got, clip_exp, rtol=0.0, atol=1e-12)
+        np.testing.assert_allclose(adj_got, adj_exp, rtol=0.0, atol=1e-12)
+
+    def test_clip_adjust_array_broadcasts_scalar_variance(self):
+        raws = np.array([-0.5, 1.0, 2.5])
+        clip_got, adj_got = clip_and_adjust_variance_array(raws, 0.25)
+        for i, r in enumerate(raws):
+            c, a = clip_and_adjust_variance(r, 0.25)
+            assert np.isclose(clip_got[i], c, rtol=0.0, atol=1e-12)
+            assert np.isclose(adj_got[i], a, rtol=0.0, atol=1e-12)
+
+    def test_clip_adjust_array_negative_variance_raises(self):
+        with pytest.raises(ValueError, match="non-negative"):
+            clip_and_adjust_variance_array(
+                np.array([1.0, 1.0]), np.array([0.1, -0.1])
+            )

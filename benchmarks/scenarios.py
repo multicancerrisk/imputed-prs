@@ -217,6 +217,60 @@ def _op_predict(spec, registry: PhaseRegistry) -> Dict[str, Any]:
     return {"prs": _maybe_float(getattr(result, "prs", None))}
 
 
+def _op_score_arrays(spec, registry: PhaseRegistry) -> Dict[str, Any]:
+    """Phase-4: fit a model, then time the vectorized batch panel scorer vs the
+    per-unit oracle for the estimated component, plus the auto-batched true-PRS.
+
+    The estimated-PRS numeric path is timed both ways via the private ``_force_batch``
+    hook (``compute_score_arrays`` would size-select), so the per-phase wall recorded
+    by the harness yields the evaluator speedup, and ``batch_vs_oracle_max_abs_diff``
+    checks statistical parity at scale on real data.
+    """
+    import numpy as np
+
+    from imputed_prs.evaluation import ImputationEvaluator
+    from imputed_prs.evaluation.projection_evaluator import ProjectionEvaluator
+    from imputed_prs.io.genotype_loader import load_genotypes
+
+    method = spec.params.get("method", "imputation")
+    backend = spec.config.get("backend") or "streaming"
+    model = _make_model(method, {**spec.config, "backend": backend})
+    _RETAINED.append(model)
+    with phase("fit", registry, trace=spec.tracemalloc):
+        model.fit(**_fit_kwargs(spec.params))
+
+    eval_ref = spec.params.get("evaluation_genotypes") or spec.params["reference_genotypes"]
+    with phase("load_eval", registry):
+        gd = load_genotypes(path=eval_ref)
+    _RETAINED.append(gd)
+
+    if method == "imputation":
+        ev = ImputationEvaluator(model, verbose=0)
+        n_targets = len(model.imputed_models)
+    else:
+        ev = ProjectionEvaluator(model, verbose=0)
+        n_targets = len(model.region_models)
+
+    with phase("true_prs", registry):
+        s_true = ev._compute_true_prs(gd)
+    with phase("est_batch", registry):
+        s_batch = ev._predicted_prs_numeric(gd, _force_batch=True)
+    with phase("est_oracle", registry):
+        s_oracle = ev._predicted_prs_numeric(gd, _force_batch=False)
+
+    diff = float(np.max(np.abs(s_batch - s_oracle))) if s_batch.size else 0.0
+    return {
+        "method": method,
+        "n_samples": int(gd.n_samples),
+        "n_targets": int(n_targets),
+        "n_placed": int(len(model.observed_variants) + n_targets),
+        "batch_vs_oracle_max_abs_diff": diff,
+        "s_true_sum": float(np.sum(s_true)),
+        "s_batch_sum": float(np.sum(s_batch)),
+        "s_oracle_sum": float(np.sum(s_oracle)),
+    }
+
+
 def _maybe_float(v):
     return None if v is None else float(v)
 
@@ -238,6 +292,7 @@ SCENARIOS: Dict[str, Callable[[Any, PhaseRegistry], Dict[str, Any]]] = {
     "fit": _op_fit,
     "streaming_fit": _op_streaming_fit,
     "predict": _op_predict,
+    "score_arrays": _op_score_arrays,
 }
 
 

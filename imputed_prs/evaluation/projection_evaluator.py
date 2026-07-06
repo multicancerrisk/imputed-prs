@@ -1,7 +1,7 @@
 """ProjectionEvaluator class for evaluating fitted LinearProjectionPRS models."""
 
 from pathlib import Path
-from typing import List, Set, Tuple, Union
+from typing import List, Optional, Set, Tuple, Union
 
 import numpy as np
 
@@ -10,16 +10,25 @@ from imputed_prs.core.types import (
     EvaluationMetrics,
     GenotypeData,
 )
+from imputed_prs.core.harmonizer import ReferenceAlleleResolver
 from imputed_prs.evaluation._scoring import (
     NeededVariant,
     is_hard_called,
     iter_sample_collections,
     observed_component_numeric,
     oriented_predictor_matrix,
+    should_use_batch,
 )
 from imputed_prs.evaluation.metrics import compute_prs_metrics
 from imputed_prs.io.genotype_loader import load_genotypes
 from imputed_prs.models.projection_predictor import ProjectionPredictor
+from imputed_prs.models.vectorized_predictor import (
+    accumulate_true_prs,
+    build_chip_axis,
+    build_projection_weff,
+    oriented_chip_matrix,
+    panel_project_prs,
+)
 
 
 class ProjectionEvaluator:
@@ -146,46 +155,45 @@ class ProjectionEvaluator:
         Returns:
             Array of true PRS values (n_samples,).
         """
-        from imputed_prs.core.harmonizer import (
-            build_reference_allele_index,
-            match_oriented_dosage,
-        )
+        resolver = ReferenceAlleleResolver(genotype_data.variant_info)
 
-        reference_index = build_reference_allele_index(genotype_data.variant_info)
+        # All placed variants: observed terms + every region's PRS variants, each
+        # effect-allele-oriented per the stored locus + alleles so effect==REF,
+        # strand-flipped, and multiallelic loci score correctly (parity with the
+        # imputation evaluator).
+        placed = [
+            (v.chromosome, v.position, v.effect_allele, v.other_allele, v.beta)
+            for v in self.model.observed_variants
+        ]
+        for region_model in self.model.region_models:
+            for i, beta in enumerate(region_model.betas):
+                placed.append(
+                    (
+                        region_model.chromosome,
+                        int(region_model.prs_positions[i]),
+                        region_model.prs_effect_alleles[i],
+                        region_model.prs_other_alleles[i],
+                        float(beta),
+                    )
+                )
+
+        # Large panels: vectorized gather (float32 product, float64 accumulate).
+        if should_use_batch(len(placed)):
+            return accumulate_true_prs(genotype_data.dosage_matrix, resolver, placed)
+
+        # Small inputs (golden fixtures): byte-exact per-variant oracle loop.
         n_samples = genotype_data.n_samples
         true_prs = np.zeros(n_samples)
-
-        # Observed variant contributions use effect-allele-oriented dosages.
-        for var in self.model.observed_variants:
-            match = match_oriented_dosage(
-                var.chromosome, var.position, var.effect_allele, var.other_allele,
-                genotype_data.variant_info, genotype_data.dosage_matrix,
-                reference_index,
+        for chromosome, position, effect_allele, other_allele, beta in placed:
+            match = resolver.resolve(
+                chromosome, position, effect_allele, other_allele,
+                genotype_data.dosage_matrix,
             )
             if match is None:
                 continue
             dosages = match[1]
             valid_mask = ~np.isnan(dosages)
-            true_prs[valid_mask] += dosages[valid_mask] * var.beta
-
-        # Region (missing) variant contributions, effect-allele-oriented per the
-        # stored locus + alleles so effect==REF, strand-flipped, and multiallelic
-        # loci score correctly (parity with the imputation evaluator).
-        for region_model in self.model.region_models:
-            for i, beta in enumerate(region_model.betas):
-                match = match_oriented_dosage(
-                    region_model.chromosome,
-                    int(region_model.prs_positions[i]),
-                    region_model.prs_effect_alleles[i],
-                    region_model.prs_other_alleles[i],
-                    genotype_data.variant_info, genotype_data.dosage_matrix,
-                    reference_index,
-                )
-                if match is None:
-                    continue
-                dosages = match[1]
-                valid_mask = ~np.isnan(dosages)
-                true_prs[valid_mask] += dosages[valid_mask] * float(beta)
+            true_prs[valid_mask] += dosages[valid_mask] * beta
 
         return true_prs
 
@@ -263,26 +271,42 @@ class ProjectionEvaluator:
             predicted[sample_idx] = result.prs
         return predicted
 
-    def _predicted_prs_numeric(self, genotype_data: GenotypeData) -> np.ndarray:
-        """Continuous path: orient observed and predictor dosages numerically via
-        ``match_oriented_dosage`` and run the region regression (no clipping — the
-        projection target is a PRS contribution, not a dosage)."""
-        from imputed_prs.core.harmonizer import build_reference_allele_index
+    def _predicted_prs_numeric(
+        self, genotype_data: GenotypeData, *, _force_batch: Optional[bool] = None
+    ) -> np.ndarray:
+        """Continuous path: orient observed and predictor dosages numerically and
+        run the region regression (no clipping — the projection target is a PRS
+        contribution, not a dosage).
 
-        reference_index = build_reference_allele_index(genotype_data.variant_info)
-        n_samples = genotype_data.n_samples
+        Size-selected: at/above ``_BATCH_MIN_TARGETS`` regions the projection
+        collapses to a single ``Z @ w_eff + const`` mat-vec (validated at
+        ``atol~1e-9``); below it the byte-exact per-region oracle loop runs (golden
+        ``atol=1e-12``). ``_force_batch`` overrides the size gate for tests.
+        """
+        resolver = ReferenceAlleleResolver(genotype_data.variant_info)
+        models = self.model.region_models
 
         predicted = observed_component_numeric(
-            genotype_data, reference_index, self.model.observed_variants
+            genotype_data, resolver, self.model.observed_variants
         )
 
-        for model in self.model.region_models:
+        use_batch = (
+            should_use_batch(len(models)) if _force_batch is None else _force_batch
+        )
+        if use_batch:
+            axis = build_chip_axis(models, resolver)
+            z_chip = oriented_chip_matrix(genotype_data.dosage_matrix, axis)
+            w_eff, const = build_projection_weff(models, axis.chip_index)
+            predicted += panel_project_prs(z_chip, w_eff, const)
+            return predicted
+
+        for model in models:
             if model.is_intercept_only or not model.predictor_variant_ids:
                 predicted += float(model.intercept)
             else:
                 z = oriented_predictor_matrix(
                     genotype_data,
-                    reference_index,
+                    resolver,
                     model.predictor_chromosomes,
                     model.predictor_positions,
                     model.predictor_counted_alleles,

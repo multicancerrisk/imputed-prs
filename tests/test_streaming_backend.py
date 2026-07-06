@@ -271,3 +271,66 @@ class TestStreamingGuardrails:
         with pytest.warns(UserWarning, match="tuning_scope"):
             model.fit(reference_genotypes=path, prs_definition=prs_df,
                       platform_variants=platform, genome_build="GRCh38")
+
+
+class TestInMemoryFitParity:
+    """Phase 4: fit() ingests in-memory genotypes so cross-validation / sensitivity
+    need not serialize a fold to a temp VCF. A GenotypeData feeds the dense path
+    identically to a file path; an InMemoryGenotypeSource streams to the same
+    result within the streaming parity band."""
+
+    def test_dense_from_genotype_data_matches_path(self, panel):
+        from imputed_prs.io.genotype_loader import load_genotypes
+
+        path, prs_df, platform = panel
+        # Every synthetic variant is in the PRS, so the unfiltered in-RAM load and
+        # the fit's needed-variant filter select the same matrix -> exact parity.
+        gd = load_genotypes(path=path)
+        m_path = _fit(path, prs_df, platform, "dense")
+        m_gd = _fit(gd, prs_df, platform, "dense")
+        dmods = {m.variant_id: m for m in m_path.imputed_models}
+        smods = {m.variant_id: m for m in m_gd.imputed_models}
+        assert set(dmods) == set(smods) and len(dmods) > 10
+        for vid, dm in dmods.items():
+            np.testing.assert_allclose(
+                np.asarray(smods[vid].coefficients),
+                np.asarray(dm.coefficients),
+                rtol=0, atol=1e-12,
+            )
+            assert abs(smods[vid].intercept - dm.intercept) < 1e-12
+
+    def test_streaming_from_in_memory_source_matches_dense(self, panel):
+        from imputed_prs.io.genotype_loader import load_genotypes
+        from imputed_prs.io.genotype_source import InMemoryGenotypeSource
+
+        path, prs_df, platform = panel
+        gd = load_genotypes(path=path)
+        m_dense = _fit(path, prs_df, platform, "dense")
+        m_stream = _fit(
+            InMemoryGenotypeSource(gd), prs_df, platform, "streaming"
+        )
+        dmods = {m.variant_id: m for m in m_dense.imputed_models}
+        smods = {m.variant_id: m for m in m_stream.imputed_models}
+        assert set(dmods) == set(smods) and len(dmods) > 10
+        for vid, dm in dmods.items():
+            np.testing.assert_allclose(
+                np.asarray(smods[vid].coefficients),
+                np.asarray(dm.coefficients),
+                rtol=0, atol=1e-9,
+            )
+            assert abs(smods[vid].intercept - dm.intercept) < 1e-9
+
+    def test_genotype_source_requires_streaming_backend(self, panel):
+        from imputed_prs.io.genotype_loader import load_genotypes
+        from imputed_prs.io.genotype_source import InMemoryGenotypeSource
+
+        path, prs_df, platform = panel
+        gd = load_genotypes(path=path)
+        model = LinearImputationPRS(
+            window_size=WINDOW, tuning_scope="none", backend="dense", verbose=0,
+        )
+        with pytest.raises(ValidationError, match="GenotypeSource"):
+            model.fit(
+                reference_genotypes=InMemoryGenotypeSource(gd),
+                prs_definition=prs_df, platform_variants=platform,
+            )

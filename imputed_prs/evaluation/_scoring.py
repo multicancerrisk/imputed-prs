@@ -23,6 +23,7 @@ from typing import Iterator, List, Sequence, Tuple
 import numpy as np
 
 from imputed_prs.core.harmonizer import (
+    ReferenceAlleleResolver,
     build_reference_allele_index,
     match_oriented_dosage,
 )
@@ -41,6 +42,18 @@ NeededVariant = Tuple[str, str, int, str, str]
 
 # Absolute tolerance for treating a dosage as an integer (hard call).
 _INT_DOSAGE_TOL = 1e-9
+
+# Number of target units (imputed variants / placed variants / regions) at or
+# above which the evaluator switches from the exact per-unit oracle loop to the
+# vectorized CSR batch path (Phase 4). Below it the oracle runs, keeping the
+# golden ``atol=1e-12`` tests on the byte-exact path; the batch path is validated
+# at ``atol~1e-9``. Every golden fixture has far fewer than this many units.
+_BATCH_MIN_TARGETS = 256
+
+
+def should_use_batch(n_units: int) -> bool:
+    """True when the vectorized batch path should score ``n_units`` targets."""
+    return n_units >= _BATCH_MIN_TARGETS
 
 
 def is_hard_called(dosage_matrix: np.ndarray, *, tol: float = _INT_DOSAGE_TOL) -> bool:
@@ -64,25 +77,25 @@ def is_hard_called(dosage_matrix: np.ndarray, *, tol: float = _INT_DOSAGE_TOL) -
 
 def observed_component_numeric(
     genotype_data: GenotypeData,
-    reference_index: dict,
+    resolver: ReferenceAlleleResolver,
     observed_variants: Sequence[VariantInfo],
 ) -> np.ndarray:
     """Effect-allele-oriented observed PRS contribution over all samples.
 
     Identical to the loop both evaluators already used for the observed
     component; kept here so the numeric path shares one implementation.
+    ``resolver.resolve`` is byte-identical to :func:`match_oriented_dosage` but
+    avoids the per-candidate ``variant_info.iloc`` (Phase 4 hotspot fix).
     """
     n_samples = genotype_data.n_samples
     observed_prs = np.zeros(n_samples)
     for var in observed_variants:
-        match = match_oriented_dosage(
+        match = resolver.resolve(
             var.chromosome,
             var.position,
             var.effect_allele,
             var.other_allele,
-            genotype_data.variant_info,
             genotype_data.dosage_matrix,
-            reference_index,
         )
         if match is None:
             continue
@@ -97,7 +110,7 @@ def observed_component_numeric(
 
 def oriented_predictor_matrix(
     genotype_data: GenotypeData,
-    reference_index: dict,
+    resolver: ReferenceAlleleResolver,
     chromosomes: Sequence[str],
     positions: Sequence[int],
     counted_alleles: Sequence[str],
@@ -107,24 +120,23 @@ def oriented_predictor_matrix(
     """Build an ``(n_samples, n_predictors)`` oriented predictor dosage matrix.
 
     Column ``i`` counts copies of ``counted_alleles[i]`` (the stored ALT allele
-    the reference ``Z`` column was built from) via :func:`match_oriented_dosage`.
-    Samples with a NaN dosage, and predictors with no allele-compatible reference
-    row, fall back to the population mean dosage ``2 * allele_frequencies[i]`` —
-    mirroring the per-predictor mean-substitution in the oriented per-user scorers.
+    the reference ``Z`` column was built from) via ``resolver.resolve`` (byte-
+    identical to :func:`match_oriented_dosage`). Samples with a NaN dosage, and
+    predictors with no allele-compatible reference row, fall back to the population
+    mean dosage ``2 * allele_frequencies[i]`` — mirroring the per-predictor
+    mean-substitution in the oriented per-user scorers.
     """
     n_samples = genotype_data.n_samples
     n_pred = len(counted_alleles)
     matrix = np.empty((n_samples, n_pred), dtype=np.float64)
     for i in range(n_pred):
         mean_dosage = 2.0 * float(allele_frequencies[i])
-        match = match_oriented_dosage(
+        match = resolver.resolve(
             chromosomes[i],
             positions[i],
             counted_alleles[i],
             other_alleles[i],
-            genotype_data.variant_info,
             genotype_data.dosage_matrix,
-            reference_index,
         )
         if match is None:
             matrix[:, i] = mean_dosage

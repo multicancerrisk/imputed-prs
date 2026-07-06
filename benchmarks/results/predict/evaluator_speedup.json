@@ -1,0 +1,26 @@
+{
+  "part": "evaluator",
+  "reference": "/Users/jeya/Documents/projects/imputed-prs/benchmarks/data/work/pos/22.vcf.gz",
+  "outcome": "completed",
+  "ok": true,
+  "n_samples": 3202,
+  "n_targets": 24597,
+  "n_placed": 27731,
+  "batch_vs_oracle_max_abs_diff": 7.716050021144838e-15,
+  "phase_wall_seconds": {
+    "fit": 560.0044970000163,
+    "load_eval": 4.503584416117519,
+    "true_prs": 0.27788258297368884,
+    "est_batch": 6.87563083297573,
+    "est_oracle": 67.61645591701381
+  },
+  "estimated_prs_speedup_oracle_over_batch": 9.834218497119315,
+  "peak_rss_gb": 5.227610112,
+  "peak_rss_authoritative": true,
+  "extrapolation_500k_samples": {
+    "model": "batch scoring wall ~ O(n_samples) (Z @ W\u1d40)",
+    "batch_scoring_wall_at_3202": 6.87563083297573,
+    "predicted_batch_scoring_wall_500k_seconds": 1073.6462887220066
+  },
+  "error": null
+}

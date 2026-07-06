@@ -44,5 +44,7 @@ benchmarks/results/*
 !benchmarks/results/baseline/
 !benchmarks/results/streaming/
 benchmarks/results/streaming/raw/
+!benchmarks/results/predict/
+benchmarks/results/predict/raw/
 !benchmarks/results/.gitignore
 benchmarks/data/

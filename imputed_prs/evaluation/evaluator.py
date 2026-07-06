@@ -19,14 +19,23 @@ from imputed_prs.core.types import (
 from imputed_prs.evaluation.metrics import compute_prs_metrics, compute_percentile_concordance
 from imputed_prs.evaluation.quality import summarize_imputation_quality
 from imputed_prs.io.genotype_loader import load_genotypes
+from imputed_prs.core.harmonizer import ReferenceAlleleResolver
 from imputed_prs.evaluation._scoring import (
     NeededVariant,
     is_hard_called,
     iter_sample_collections,
     observed_component_numeric,
     oriented_predictor_matrix,
+    should_use_batch,
 )
 from imputed_prs.models.predictor import PRSPredictor
+from imputed_prs.models.vectorized_predictor import (
+    accumulate_true_prs,
+    build_chip_axis,
+    build_coef_csr,
+    oriented_chip_matrix,
+    panel_impute_prs,
+)
 
 
 @dataclass
@@ -192,6 +201,7 @@ class ImputationEvaluator:
         platform_variants: Optional[List[str]] = None,
         n_folds: int = 5,
         random_state: Optional[int] = None,
+        backend: Optional[str] = None,
     ) -> CrossValidationResult:
         """Perform k-fold cross-validation.
 
@@ -275,7 +285,10 @@ class ImputationEvaluator:
             train_data = self._subset_genotype_data(genotype_data, train_indices)
             test_data = self._subset_genotype_data(genotype_data, test_indices)
 
-            # Train model on training data
+            # Train model on the training fold. Phase 4: fit the in-RAM fold
+            # directly (no temp-VCF round-trip). backend="streaming" streams the
+            # fold via InMemoryGenotypeSource; "auto"/"dense" use the dense matrix
+            # in place. The fold backend defaults to the parent model's.
             fold_model = LinearImputationPRS(
                 window_size=self.model.window_size,
                 tuning_scope=self.model.tuning_scope,
@@ -285,30 +298,17 @@ class ImputationEvaluator:
                 n_jobs=self.model.n_jobs,
                 random_state=random_state,
                 max_predictors=self.model.max_predictors,
+                backend=backend if backend is not None else self.model.backend,
                 verbose=0,  # Suppress output during CV
             )
 
-            # Create temporary file for training data
-            # For CV, we need to fit on train data and evaluate on test data
-            # This requires writing the train data to a temporary file
-            import tempfile
-
-            with tempfile.NamedTemporaryFile(suffix=".vcf", delete=False) as tmp_file:
-                tmp_path = Path(tmp_file.name)
-
-            try:
-                self._write_genotype_data_to_vcf(train_data, tmp_path)
-
-                fold_model.fit(
-                    reference_genotypes=tmp_path,
-                    prs_definition=prs_definition,
-                    platform_name=platform_name,
-                    platform_manifest=platform_manifest,
-                    platform_variants=platform_variants,
-                )
-            finally:
-                if tmp_path.exists():
-                    tmp_path.unlink()
+            fold_model.fit(
+                reference_genotypes=train_data,
+                prs_definition=prs_definition,
+                platform_name=platform_name,
+                platform_manifest=platform_manifest,
+                platform_variants=platform_variants,
+            )
 
             # Create evaluator for fold model and evaluate on test data
             fold_evaluator = ImputationEvaluator(fold_model, verbose=0)
@@ -418,90 +418,78 @@ class ImputationEvaluator:
         if self.verbose >= 1:
             print(f"Testing {len(param_combinations)} parameter combinations...")
 
-        # Load reference genotypes once
+        # Load reference genotypes once, then fit each combo in-memory — Phase 4:
+        # no temp-VCF round-trip (fit accepts a GenotypeData directly).
         genotype_data = load_genotypes(path=reference_genotypes)
 
-        # Create temporary file for genotype data
-        import tempfile
+        # Test each parameter combination
+        parameter_results: List[Dict[str, Any]] = []
+        quality_summaries: List[Dict[str, Any]] = []
+        best_r2 = -np.inf
+        best_params: Dict[str, float] = {}
+        best_metrics: Optional[EvaluationMetrics] = None
 
-        with tempfile.NamedTemporaryFile(suffix=".vcf", delete=False) as tmp_file:
-            tmp_path = Path(tmp_file.name)
+        for idx, combo in enumerate(param_combinations):
+            params = dict(zip(param_names, combo))
 
-        try:
-            self._write_genotype_data_to_vcf(genotype_data, tmp_path)
+            if self.verbose >= 1:
+                print(f"  [{idx + 1}/{len(param_combinations)}] Testing {params}")
 
-            # Test each parameter combination
-            parameter_results: List[Dict[str, Any]] = []
-            quality_summaries: List[Dict[str, Any]] = []
-            best_r2 = -np.inf
-            best_params: Dict[str, float] = {}
-            best_metrics: Optional[EvaluationMetrics] = None
+            try:
+                # Create model with these parameters
+                test_model = LinearImputationPRS(
+                    window_size=params.get("window_size", self.model.window_size),
+                    tuning_scope="none",  # Use specified params directly
+                    l1_ratio=params.get("l1_ratio", self.model.l1_ratio),
+                    alpha=params.get("alpha", self.model.alpha),
+                    cv_folds=cv_folds,
+                    n_jobs=self.model.n_jobs,
+                    random_state=random_state,
+                    verbose=0,
+                )
 
-            for idx, combo in enumerate(param_combinations):
-                params = dict(zip(param_names, combo))
+                test_model.fit(
+                    reference_genotypes=genotype_data,
+                    prs_definition=prs_definition,
+                    platform_name=platform_name,
+                    platform_manifest=platform_manifest,
+                    platform_variants=platform_variants,
+                )
 
+                # Get quality summary
+                if test_model._imputed_models:
+                    models_dict = {
+                        m.variant_id: m for m in test_model._imputed_models
+                    }
+                    quality_summary = summarize_imputation_quality(models_dict)
+                else:
+                    quality_summary = {"mean_r2": None, "n_total": 0}
+
+                # Evaluate using internal CV metrics
+                evaluator = ImputationEvaluator(test_model, verbose=0)
+                metrics = evaluator.evaluate(genotype_data)
+
+                parameter_results.append({
+                    "params": params,
+                    "metrics": metrics,
+                    "quality_summary": quality_summary,
+                })
+                quality_summaries.append(quality_summary)
+
+                # Track best
+                if metrics.r2 > best_r2:
+                    best_r2 = metrics.r2
+                    best_params = params
+                    best_metrics = metrics
+
+            except Exception as e:
                 if self.verbose >= 1:
-                    print(f"  [{idx + 1}/{len(param_combinations)}] Testing {params}")
-
-                try:
-                    # Create model with these parameters
-                    test_model = LinearImputationPRS(
-                        window_size=params.get("window_size", self.model.window_size),
-                        tuning_scope="none",  # Use specified params directly
-                        l1_ratio=params.get("l1_ratio", self.model.l1_ratio),
-                        alpha=params.get("alpha", self.model.alpha),
-                        cv_folds=cv_folds,
-                        n_jobs=self.model.n_jobs,
-                        random_state=random_state,
-                        verbose=0,
-                    )
-
-                    test_model.fit(
-                        reference_genotypes=tmp_path,
-                        prs_definition=prs_definition,
-                        platform_name=platform_name,
-                        platform_manifest=platform_manifest,
-                        platform_variants=platform_variants,
-                    )
-
-                    # Get quality summary
-                    if test_model._imputed_models:
-                        models_dict = {
-                            m.variant_id: m for m in test_model._imputed_models
-                        }
-                        quality_summary = summarize_imputation_quality(models_dict)
-                    else:
-                        quality_summary = {"mean_r2": None, "n_total": 0}
-
-                    # Evaluate using internal CV metrics
-                    evaluator = ImputationEvaluator(test_model, verbose=0)
-                    metrics = evaluator.evaluate(genotype_data)
-
-                    parameter_results.append({
-                        "params": params,
-                        "metrics": metrics,
-                        "quality_summary": quality_summary,
-                    })
-                    quality_summaries.append(quality_summary)
-
-                    # Track best
-                    if metrics.r2 > best_r2:
-                        best_r2 = metrics.r2
-                        best_params = params
-                        best_metrics = metrics
-
-                except Exception as e:
-                    if self.verbose >= 1:
-                        print(f"    Warning: Failed for {params}: {e}")
-                    parameter_results.append({
-                        "params": params,
-                        "metrics": None,
-                        "error": str(e),
-                    })
-
-        finally:
-            if tmp_path.exists():
-                tmp_path.unlink()
+                    print(f"    Warning: Failed for {params}: {e}")
+                parameter_results.append({
+                    "params": params,
+                    "metrics": None,
+                    "error": str(e),
+                })
 
         if best_metrics is None:
             raise ValidationError("All parameter combinations failed")
@@ -545,14 +533,7 @@ class ImputationEvaluator:
         Returns:
             Array of true PRS values (n_samples,).
         """
-        from imputed_prs.core.harmonizer import (
-            build_reference_allele_index,
-            match_oriented_dosage,
-        )
-
-        reference_index = build_reference_allele_index(genotype_data.variant_info)
-        n_samples = genotype_data.n_samples
-        true_prs = np.zeros(n_samples)
+        resolver = ReferenceAlleleResolver(genotype_data.variant_info)
 
         # All placed variants (observed + imputed); dropped variants are absent
         # from both lists and therefore correctly excluded.
@@ -564,11 +545,18 @@ class ImputationEvaluator:
             for m in self.model.imputed_models
         ]
 
+        # Large panels: vectorized gather (float32 product, float64 accumulate),
+        # matching the per-variant oracle up to block-sum re-association (~1e-14).
+        if should_use_batch(len(placed)):
+            return accumulate_true_prs(genotype_data.dosage_matrix, resolver, placed)
+
+        # Small inputs (golden fixtures): byte-exact per-variant oracle loop.
+        n_samples = genotype_data.n_samples
+        true_prs = np.zeros(n_samples)
         for chromosome, position, effect_allele, other_allele, beta in placed:
-            match = match_oriented_dosage(
+            match = resolver.resolve(
                 chromosome, position, effect_allele, other_allele,
-                genotype_data.variant_info, genotype_data.dosage_matrix,
-                reference_index,
+                genotype_data.dosage_matrix,
             )
             if match is None:
                 continue
@@ -652,26 +640,43 @@ class ImputationEvaluator:
             predicted[sample_idx] = result.prs
         return predicted
 
-    def _predicted_prs_numeric(self, genotype_data: GenotypeData) -> np.ndarray:
-        """Continuous path: orient observed and predictor dosages numerically via
-        ``match_oriented_dosage`` and run the imputation regression (clipped to
-        ``[0, 2]`` to match ``clip_and_adjust_variance`` in the per-user scorer)."""
-        from imputed_prs.core.harmonizer import build_reference_allele_index
+    def _predicted_prs_numeric(
+        self, genotype_data: GenotypeData, *, _force_batch: Optional[bool] = None
+    ) -> np.ndarray:
+        """Continuous path: orient observed and predictor dosages numerically and
+        run the imputation regression (clipped to ``[0, 2]`` to match
+        ``clip_and_adjust_variance`` in the per-user scorer).
 
-        reference_index = build_reference_allele_index(genotype_data.variant_info)
+        Size-selected: at/above ``_BATCH_MIN_TARGETS`` imputed variants the
+        vectorized CSR batch scorer runs (validated at ``atol~1e-9``); below it the
+        byte-exact per-model oracle loop runs (golden ``atol=1e-12``).
+        ``_force_batch`` overrides the size gate for tests.
+        """
+        resolver = ReferenceAlleleResolver(genotype_data.variant_info)
         n_samples = genotype_data.n_samples
+        models = self.model.imputed_models
 
         predicted = observed_component_numeric(
-            genotype_data, reference_index, self.model.observed_variants
+            genotype_data, resolver, self.model.observed_variants
         )
 
-        for model in self.model.imputed_models:
+        use_batch = (
+            should_use_batch(len(models)) if _force_batch is None else _force_batch
+        )
+        if use_batch:
+            axis = build_chip_axis(models, resolver)
+            z_chip = oriented_chip_matrix(genotype_data.dosage_matrix, axis)
+            W, intercepts, betas = build_coef_csr(models, axis.chip_index)
+            predicted += panel_impute_prs(z_chip, W, intercepts, betas)
+            return predicted
+
+        for model in models:
             if model.is_intercept_only or not model.predictor_variant_ids:
                 raw = np.full(n_samples, float(model.intercept))
             else:
                 z = oriented_predictor_matrix(
                     genotype_data,
-                    reference_index,
+                    resolver,
                     model.predictor_chromosomes,
                     model.predictor_positions,
                     model.predictor_counted_alleles,
@@ -704,54 +709,3 @@ class ImputationEvaluator:
             genome_build=genotype_data.genome_build,
             source_file=genotype_data.source_file,
         )
-
-    def _write_genotype_data_to_vcf(
-        self, genotype_data: GenotypeData, path: Path
-    ) -> None:
-        """Write GenotypeData to a VCF file.
-
-        Args:
-            genotype_data: GenotypeData to write.
-            path: Output path.
-        """
-        lines = []
-
-        # Header
-        lines.append("##fileformat=VCFv4.2")
-        lines.append('##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">')
-
-        # Column header
-        header_cols = ["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT"]
-        header_cols.extend(genotype_data.sample_ids)
-        lines.append("\t".join(header_cols))
-
-        # Variants
-        for var_idx, row in genotype_data.variant_info.iterrows():
-            chrom = str(row["chromosome"])
-            pos = str(int(row["position"]))
-            var_id = row["variant_id"]
-            ref = row.get("ref_allele", "N")
-            alt = row.get("alt_allele", "N")
-            if pd.isna(ref):
-                ref = "N"
-            if pd.isna(alt):
-                alt = "N"
-
-            record = [chrom, pos, var_id, ref, alt, ".", ".", ".", "GT"]
-
-            # Add genotypes for each sample
-            for sample_idx in range(genotype_data.n_samples):
-                dosage = genotype_data.dosage_matrix[sample_idx, var_idx]
-                if np.isnan(dosage):
-                    gt = "./."
-                elif dosage < 0.5:
-                    gt = "0/0"
-                elif dosage < 1.5:
-                    gt = "0/1"
-                else:
-                    gt = "1/1"
-                record.append(gt)
-
-            lines.append("\t".join(record))
-
-        path.write_text("\n".join(lines) + "\n")

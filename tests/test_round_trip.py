@@ -566,3 +566,64 @@ class TestEmpiricalResidualCalibration:
 
     def test_projection_reports_empirical_se(self, fitted_projection_model):
         self._check(fitted_projection_model)
+
+
+# =============================================================================
+# Phase 4: vectorized batch scorer parity (forced onto the golden fixtures)
+# =============================================================================
+class TestForcedBatchParity:
+    """The size-selected batch path must match the per-unit oracle at atol=1e-9.
+
+    The golden fixtures have only 2 imputed/projected targets, so they naturally
+    take the oracle; ``_force_batch=True`` drives the CSR/collapse path over the
+    same tiny model to compare the two. Bit identity is impossible (SpMM reorder),
+    hence atol=1e-9 rather than the golden 1e-12.
+    """
+
+    def test_imputation_batch_equals_oracle_continuous(
+        self, fitted_imputation_model, continuous_genotype_data
+    ):
+        ev = ImputationEvaluator(fitted_imputation_model, verbose=0)
+        oracle = ev._predicted_prs_numeric(continuous_genotype_data, _force_batch=False)
+        batch = ev._predicted_prs_numeric(continuous_genotype_data, _force_batch=True)
+        np.testing.assert_allclose(batch, oracle, rtol=0.0, atol=1e-9)
+
+    def test_imputation_batch_equals_oracle_integer(
+        self, fitted_imputation_model, integer_genotype_data
+    ):
+        ev = ImputationEvaluator(fitted_imputation_model, verbose=0)
+        oracle = ev._predicted_prs_numeric(integer_genotype_data, _force_batch=False)
+        batch = ev._predicted_prs_numeric(integer_genotype_data, _force_batch=True)
+        np.testing.assert_allclose(batch, oracle, rtol=0.0, atol=1e-9)
+
+    def test_imputation_batch_equals_oracle_flipped(
+        self, fitted_imputation_model, flipped_integer_genotype_data
+    ):
+        ev = ImputationEvaluator(fitted_imputation_model, verbose=0)
+        oracle = ev._predicted_prs_numeric(
+            flipped_integer_genotype_data, _force_batch=False
+        )
+        batch = ev._predicted_prs_numeric(
+            flipped_integer_genotype_data, _force_batch=True
+        )
+        np.testing.assert_allclose(batch, oracle, rtol=0.0, atol=1e-9)
+
+    def test_projection_batch_equals_oracle_continuous(
+        self, fitted_projection_model, continuous_genotype_data
+    ):
+        ev = ProjectionEvaluator(fitted_projection_model, verbose=0)
+        oracle = ev._predicted_prs_numeric(continuous_genotype_data, _force_batch=False)
+        batch = ev._predicted_prs_numeric(continuous_genotype_data, _force_batch=True)
+        np.testing.assert_allclose(batch, oracle, rtol=0.0, atol=1e-9)
+
+    def test_projection_batch_equals_oracle_flipped(
+        self, fitted_projection_model, flipped_integer_genotype_data
+    ):
+        ev = ProjectionEvaluator(fitted_projection_model, verbose=0)
+        oracle = ev._predicted_prs_numeric(
+            flipped_integer_genotype_data, _force_batch=False
+        )
+        batch = ev._predicted_prs_numeric(
+            flipped_integer_genotype_data, _force_batch=True
+        )
+        np.testing.assert_allclose(batch, oracle, rtol=0.0, atol=1e-9)

@@ -25,6 +25,7 @@ from imputed_prs.core.harmonizer import (
 )
 from imputed_prs.core.types import (
     CalibrationParams,
+    GenotypeData,
     ImputedVariantModel,
     PredictionResult,
     ProjectionRegionModel,
@@ -37,7 +38,11 @@ from imputed_prs.evaluation.calibration import (
     mean_impute_columns,
 )
 from imputed_prs.io.genotype_loader import load_genotypes
-from imputed_prs.io.genotype_source import make_genotype_source
+from imputed_prs.io.genotype_source import (
+    GenotypeSource,
+    InMemoryGenotypeSource,
+    make_genotype_source,
+)
 from imputed_prs.io.pgs_catalog import download_pgs_catalog_score
 from imputed_prs.io.platform_loader import (
     load_platform_from_manifest,
@@ -185,7 +190,7 @@ class LinearProjectionPRS:
 
     def fit(
         self,
-        reference_genotypes: Union[str, Path],
+        reference_genotypes: Union[str, Path, GenotypeData, GenotypeSource],
         prs_definition: Union[str, Path, pd.DataFrame],
         platform_name: Optional[str] = None,
         platform_manifest: Optional[Union[str, Path]] = None,
@@ -305,22 +310,53 @@ class LinearProjectionPRS:
             prs_chrpos.add(f"{_c}:{int(_p)}")
         all_needed_variants = set(prs_df["variant_id"]) | platform_variant_set | prs_chrpos
 
+        # Phase 4: accept in-memory genotypes so callers (cross-validation,
+        # sensitivity analysis) need not serialize a fold to a temp VCF. A bare
+        # GenotypeSource is streaming-only; a GenotypeData feeds either backend.
+        if isinstance(reference_genotypes, GenotypeSource):
+            if self.backend == "dense":
+                raise ValidationError(
+                    "backend='dense' cannot ingest a GenotypeSource; pass a path "
+                    "or GenotypeData."
+                )
+            return self._fit_streaming(
+                source=reference_genotypes,
+                prs_df=prs_df,
+                platform_variant_set=platform_variant_set,
+                effective_prs_id=effective_prs_id,
+                effective_platform_name=effective_platform_name,
+                effective_genome_build=effective_genome_build,
+                model_name=model_name,
+                reference_panel_id=reference_panel_id,
+                training_ancestry=training_ancestry,
+            )
+        in_memory_gd = (
+            reference_genotypes
+            if isinstance(reference_genotypes, GenotypeData)
+            else None
+        )
+
         # Backend selection (Phase 2 streaming seam, M3). The dense in-RAM path below
         # is the untouched correctness oracle; the streaming path trains region models
         # from banded sufficient statistics without materializing the dosage matrix.
         # "auto" streams only for large panels, so test-sized inputs stay on the oracle.
         if self.backend != "dense":
-            # "auto" must not regress formats the dense oracle supports: if the
-            # streaming source cannot read this path (e.g. PLINK1 .bed), fall back
-            # to dense. Explicit backend="streaming" surfaces the error instead.
-            try:
-                source = make_genotype_source(
-                    reference_genotypes, variant_ids=all_needed_variants
+            if in_memory_gd is not None:
+                source = InMemoryGenotypeSource(
+                    in_memory_gd, variant_ids=all_needed_variants
                 )
-            except DataLoadError:
-                if self.backend == "streaming":
-                    raise
-                source = None
+            else:
+                # "auto" must not regress formats the dense oracle supports: if the
+                # streaming source cannot read this path (e.g. PLINK1 .bed), fall
+                # back to dense. Explicit backend="streaming" surfaces the error.
+                try:
+                    source = make_genotype_source(
+                        reference_genotypes, variant_ids=all_needed_variants
+                    )
+                except DataLoadError:
+                    if self.backend == "streaming":
+                        raise
+                    source = None
             if source is not None and (
                 self.backend == "streaming"
                 or self._auto_should_stream(source, all_needed_variants)
@@ -337,9 +373,12 @@ class LinearProjectionPRS:
                     training_ancestry=training_ancestry,
                 )
 
-        genotype_data = load_genotypes(
-            path=reference_genotypes, variant_ids=all_needed_variants
-        )
+        if in_memory_gd is not None:
+            genotype_data = in_memory_gd
+        else:
+            genotype_data = load_genotypes(
+                path=reference_genotypes, variant_ids=all_needed_variants
+            )
 
         if self.verbose >= 2:
             print(

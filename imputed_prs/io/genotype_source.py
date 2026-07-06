@@ -411,6 +411,118 @@ class PgenGenotypeSource(GenotypeSource):
             reader.close()
 
 
+class InMemoryGenotypeSource(GenotypeSource):
+    """``GenotypeSource`` view over an in-RAM ``GenotypeData`` (optional subsets).
+
+    Yields ``VariantBlock``\\ s by column-slicing the dense dosage matrix — it never
+    copies the full (subset) matrix, so peak extra RAM is O(n_sub x block_size). This
+    lets cross-validation / sensitivity analysis refit on an in-RAM fold without
+    serializing it to a temporary VCF, and lets the streaming fitter run over a fold
+    subset (the Phase-6 full-streaming-CV seam).
+
+    On the same variants a streamed block is bit-identical to what the dense path
+    reads from the same ``GenotypeData`` (a plain column slice), so a streaming fit
+    from here matches a dense fit within the sanctioned streaming deviations
+    (mean-imputation, float64 accumulation, ``cv_predictions=None``).
+
+    Correctness details:
+
+    - **No ``contigs`` property** — so ``compute.sufficient_stats._region_for`` falls
+      back to the normalized chromosome, and region filtering here is on the
+      normalized chromosome (mirrors :class:`PgenGenotypeSource`).
+    - **Position-sorted within each region** — the streaming fitter advances a
+      position frontier and evicts below it, so an out-of-order region would close
+      targets prematurely.
+
+    Parameters
+    ----------
+    genotype_data : GenotypeData
+        In-RAM panel (dense dosage matrix + variant_info + sample_ids).
+    sample_indices : np.ndarray, optional
+        Row indices selecting a sample subset (e.g. a CV train fold). None → all rows.
+    variant_ids : set of str, optional
+        Restrict to these variants (rsID or ``"chr:pos"``), same semantics as
+        :func:`make_genotype_source`.
+    """
+
+    def __init__(self, genotype_data, *, sample_indices=None, variant_ids=None):
+        self._gd = genotype_data
+        variant_info = genotype_data.variant_info
+        if sample_indices is None:
+            self._sample_rows = np.arange(genotype_data.n_samples, dtype=np.int64)
+        else:
+            self._sample_rows = np.asarray(sample_indices, dtype=np.int64)
+        self._sample_ids = [genotype_data.sample_ids[i] for i in self._sample_rows]
+
+        self._chrom_norm = normalize_chromosome_array(
+            variant_info["chromosome"].to_numpy()
+        )
+        # Grouping codes (order irrelevant) so lexsort keeps each chromosome's
+        # variants contiguous and position-ascending.
+        self._chrom_codes = pd.factorize(self._chrom_norm)[0]
+        self._positions = variant_info["position"].to_numpy()
+        self._vids = variant_info["variant_id"].to_numpy()
+        self._rsid_set, self._chrpos_set = _build_variant_lookup(variant_ids)
+        self._filter = bool(self._rsid_set or self._chrpos_set)
+
+    @property
+    def sample_ids(self) -> List[str]:
+        return self._sample_ids
+
+    def _selected_variant_indices(self, region: Optional[str]) -> np.ndarray:
+        """Row indices passing the region + id filter, position-sorted per chromosome."""
+        n = len(self._positions)
+        mask = np.ones(n, dtype=bool)
+        if region is not None:
+            contig, _, span = region.partition(":")
+            chrom_norm = _normalize_chromosome(contig)
+            mask &= self._chrom_norm == chrom_norm
+            if span:
+                start, _, end = span.partition("-")
+                if start:
+                    mask &= self._positions >= int(start)
+                if end:
+                    mask &= self._positions <= int(end)
+        if self._filter:
+            id_mask = np.array(
+                [
+                    _variant_matches(
+                        self._vids[i],
+                        self._chrom_norm[i],
+                        int(self._positions[i]),
+                        self._rsid_set,
+                        self._chrpos_set,
+                    )
+                    for i in range(n)
+                ]
+            )
+            mask &= id_mask
+        selected = np.nonzero(mask)[0]
+        if selected.size == 0:
+            return selected
+        order = np.lexsort(
+            (self._positions[selected], self._chrom_codes[selected])
+        )
+        return selected[order]
+
+    def iter_variant_blocks(
+        self, region: Optional[str] = None, block_size: int = 4096
+    ) -> Iterator[VariantBlock]:
+        if block_size <= 0:
+            raise ValidationError("block_size must be positive")
+        selected = self._selected_variant_indices(region)
+        if selected.size == 0:
+            return
+        dosage_matrix = self._gd.dosage_matrix
+        variant_info = self._gd.variant_info
+        rows = self._sample_rows
+        for start in range(0, len(selected), block_size):
+            cols = selected[start : start + block_size]
+            dosages = np.asarray(dosage_matrix[np.ix_(rows, cols)], dtype=np.float32)
+            info = variant_info.iloc[cols].reset_index(drop=True)
+            yield VariantBlock(variant_info=info, dosages=dosages)
+
+
 def make_genotype_source(
     path, samples: Optional[List[str]] = None, variant_ids: Optional[Set[str]] = None
 ) -> GenotypeSource:

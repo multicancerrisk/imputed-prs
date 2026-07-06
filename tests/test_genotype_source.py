@@ -17,7 +17,11 @@ pytest.importorskip("cyvcf2")
 
 from imputed_prs.core.exceptions import DataLoadError
 from imputed_prs.io.genotype_loader import load_genotypes
-from imputed_prs.io.genotype_source import VcfGenotypeSource, VariantBlock
+from imputed_prs.io.genotype_source import (
+    InMemoryGenotypeSource,
+    VariantBlock,
+    VcfGenotypeSource,
+)
 
 _VCF = """##fileformat=VCFv4.2
 ##contig=<ID=1>
@@ -134,3 +138,45 @@ class TestContigGuard:
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises(DataLoadError, match="not found"):
             VcfGenotypeSource(tmp_path / "nope.vcf")
+
+
+class TestInMemoryGenotypeSource:
+    """Blocks over an in-RAM GenotypeData must be a bit-identical column slice of
+    the dense read (Phase 4), position-sorted, honoring sample/variant subsets."""
+
+    def test_blocks_match_dense(self, vcf_path):
+        gd = load_genotypes(vcf_path)
+        src = InMemoryGenotypeSource(gd)
+        info, dosages = _concat_blocks(src, block_size=2)  # force >1 block
+        pd.testing.assert_frame_equal(
+            info, gd.variant_info.reset_index(drop=True)
+        )
+        np.testing.assert_array_equal(dosages, gd.dosage_matrix)
+
+    def test_region_filter_position_sorted(self, vcf_path):
+        gd = load_genotypes(vcf_path)
+        src = InMemoryGenotypeSource(gd)
+        info, _ = _concat_blocks(src, region="1")
+        assert set(info["chromosome"].astype(str)) == {"1"}
+        assert list(info["position"]) == sorted(info["position"])
+
+    def test_region_span(self, vcf_path):
+        gd = load_genotypes(vcf_path)
+        src = InMemoryGenotypeSource(gd)
+        info, _ = _concat_blocks(src, region="1:150-350")
+        assert list(info["position"]) == sorted(info["position"])
+        assert info["position"].min() >= 150 and info["position"].max() <= 350
+
+    def test_sample_subset(self, vcf_path):
+        gd = load_genotypes(vcf_path)
+        rows = np.array([0, 2, 4])
+        src = InMemoryGenotypeSource(gd, sample_indices=rows)
+        assert src.sample_ids == [gd.sample_ids[i] for i in rows]
+        _, dosages = _concat_blocks(src)
+        np.testing.assert_array_equal(dosages, gd.dosage_matrix[rows, :])
+
+    def test_variant_filter(self, vcf_path):
+        gd = load_genotypes(vcf_path)
+        src = InMemoryGenotypeSource(gd, variant_ids={"rs1", "rs4"})
+        info, _ = _concat_blocks(src)
+        assert set(info["variant_id"]) == {"rs1", "rs4"}
