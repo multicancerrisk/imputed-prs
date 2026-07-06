@@ -43,6 +43,7 @@ from imputed_prs.compute.sufficient_stats import (
     _prepare_column,
     _region_for,
     _run_cv_batch,
+    reduce_cv_collectors,
 )
 from imputed_prs.core.harmonizer import normalize_chromosome_array
 from imputed_prs.core.regions import merge_variant_windows
@@ -110,6 +111,64 @@ class ProjectionStreamResult:
     fallback_models: Dict[str, ImputedVariantModel] = field(default_factory=dict)
     has_calibration_terms: bool = False
 
+    @classmethod
+    def reduce(cls, partials: Sequence["_ProjectChromPartial"], n: int) -> "ProjectionStreamResult":
+        """Order-independent merge of per-chromosome partials (Phase 7 fan-out).
+
+        Region/fallback/failure dicts are key-disjoint across chromosomes (dict-union);
+        ``s_true``/``s_cv`` sum in canonical ``_chrom_sort_key`` order. ``diag_var`` is
+        derived as ``Σ region.cv_mse`` over the merged models in that same canonical order
+        (bit-identical to the serial ``self.diag_var +=``, which accumulated in region-close
+        order per chromosome). ``has_calibration_terms`` is the OR of the shards.
+        """
+        ordered = sorted(partials, key=lambda p: _chrom_sort_key(p.chrom))
+        region_models: Dict[str, ProjectionRegionModel] = {}
+        fallback_models: Dict[str, ImputedVariantModel] = {}
+        failures: Dict[str, str] = {}
+        s_true = np.zeros(n, dtype=np.float64)
+        s_cv = np.zeros(n, dtype=np.float64)
+        n_io = 0
+        has_terms = False
+        for p in ordered:
+            assert region_models.keys().isdisjoint(p.region_models), (
+                "chromosome shards must have disjoint region ids"
+            )
+            region_models.update(p.region_models)
+            fallback_models.update(p.fallback_models)
+            failures.update(p.failures)
+            s_true += p.s_true
+            s_cv += p.s_cv
+            n_io += p.n_intercept_only
+            has_terms = has_terms or p.has_obs or bool(p.region_models)
+        diag_var = sum(float(m.cv_mse) for m in region_models.values())
+        return cls(
+            region_models=region_models,
+            s_true=s_true,
+            s_cv=s_cv,
+            diag_var=diag_var,
+            n_regions_trained=len(region_models),
+            n_intercept_only=n_io,
+            n_regions_failed=len(failures),
+            failures=failures,
+            fallback_models=fallback_models,
+            has_calibration_terms=has_terms,
+        )
+
+
+@dataclass
+class _ProjectChromPartial:
+    """One chromosome's contribution to a streaming projection fit (Phase 7 shard unit)."""
+
+    chrom: str
+    region_models: Dict[str, ProjectionRegionModel]
+    fallback_models: Dict[str, ImputedVariantModel]
+    failures: Dict[str, str]
+    s_true: np.ndarray
+    s_cv: np.ndarray
+    has_obs: bool
+    n_intercept_only: int
+    cv_collector: Optional[Dict[int, Dict[str, ProjectionRegionModel]]] = None
+
 
 # ---------------------------------------------------------------------------
 # Fitter.
@@ -155,67 +214,59 @@ class StreamingProjectionFitter:
         for lst in self._regions_by_chrom.values():
             lst.sort(key=lambda i: (plan.regions[i].start, plan.regions[i].end))
 
-    def run(self, source) -> ProjectionStreamResult:
-        region_models: Dict[str, ProjectionRegionModel] = {}
-        fallback_models: Dict[str, ImputedVariantModel] = {}
-        failures: Dict[str, str] = {}
-        n_intercept_only = 0
+    def run(self, source, *, n_workers: int = 1) -> ProjectionStreamResult:
+        """Stream the panel and fit every region, optionally sharding by chromosome.
 
-        for chrom in self._stream_chromosomes():
-            n_intercept_only += self._run_chromosome(
-                source, chrom, region_models, fallback_models, failures
-            )
+        ``n_workers > 1`` fans the per-chromosome accumulation + solves across a process
+        pool; the per-chromosome partials are reduced in canonical order. ``n_workers=1``
+        (default) runs a serial in-process map, bit-identical to the pre-Phase-7 loop.
+        """
+        from imputed_prs.compute.parallel import fan_out_chromosomes
 
-        return ProjectionStreamResult(
-            region_models=region_models,
-            s_true=self.s_true,
-            s_cv=self.s_cv,
-            diag_var=self.diag_var,
-            n_regions_trained=len(region_models),
-            n_intercept_only=n_intercept_only,
-            n_regions_failed=len(failures),
-            failures=failures,
-            fallback_models=fallback_models,
-            has_calibration_terms=self._has_terms,
+        device = getattr(self.backend, "device_name", "cpu")
+        partials = fan_out_chromosomes(
+            self, source, self._stream_chromosomes(), n_workers=n_workers, device=device
         )
+        return ProjectionStreamResult.reduce(partials, self.folds.n)
 
-    def run_reference_cv(self, source, outer_folds: GlobalFolds):
+    def run_reference_cv(self, source, outer_folds: GlobalFolds, *, n_workers: int = 1):
         """Single-pass leave-one-fold-out reference CV over the panel (projection).
 
         Streams once with the buffer's folds set to ``outer_folds`` (the reference-CV
         outer partition); every closing region is fit for all ``K`` training folds by the
-        additive subtraction ``S_full − S_fold(k)``. Returns ``(fold_models, failures)``
-        where ``fold_models[k]`` is the list of ``ProjectionRegionModel`` trained on all
-        samples except outer fold ``k``. Observed-variant fallbacks are not trained (the
-        evaluator scores observed terms directly). Runs on the CPU buffer (host-side
-        per-fold solve; device CV is a Phase-3 follow-up).
+        additive subtraction ``S_full − S_fold(k)``. ``n_workers > 1`` shards that single
+        pass by chromosome across processes. Returns ``(fold_models, failures)`` where
+        ``fold_models[k]`` is the list of ``ProjectionRegionModel`` trained on all samples
+        except outer fold ``k``. Observed-variant fallbacks are not trained (the evaluator
+        scores observed terms directly). Runs on the CPU buffer (host-side per-fold solve;
+        device CV is a Phase-3 follow-up).
         """
+        from imputed_prs.compute.parallel import fan_out_chromosomes
+
         if getattr(self.backend, "device_name", "cpu") != "cpu":
             from imputed_prs.compute.device import get_backend
 
             self.backend = get_backend("cpu")
         self.folds = outer_folds
-        self.s_true = np.zeros(self.folds.n, dtype=np.float64)
-        self.s_cv = np.zeros(self.folds.n, dtype=np.float64)
         self._batch_cap = max(
             16, min(4096, (256 * 1024 * 1024) // (max(self.folds.n, 1) * 8))
         )
-        K = outer_folds.n_folds
-        self._cv_collector = {k: {} for k in range(K)}
-        failures: Dict[str, str] = {}
+        # Marker only (non-None ⇒ CV mode); the real per-fold collector is per-chromosome.
+        self._cv_collector = {}
         try:
-            for chrom in self._stream_chromosomes():
-                self._run_chromosome(source, chrom, {}, {}, failures)
-            fold_models = {k: list(self._cv_collector[k].values()) for k in range(K)}
+            partials = fan_out_chromosomes(
+                self, source, self._stream_chromosomes(), n_workers=n_workers, device="cpu"
+            )
+            fold_models, failures = reduce_cv_collectors(partials, outer_folds.n_folds)
         finally:
             self._cv_collector = None
         return fold_models, failures
 
-    def _cv_region_storer(self, region, s_r):
-        """Store the K per-outer-fold region models for one region into the collector."""
+    def _cv_region_storer(self, region, s_r, cv_collector):
+        """Store the K per-outer-fold region models for one region into ``cv_collector``."""
         def store(fold_results, pred_idx, pred_af_list):
             for k, res in enumerate(fold_results):
-                self._cv_collector[k][region.region_id] = self._to_region_model(
+                cv_collector[k][region.region_id] = self._to_region_model(
                     region, s_r, res, pred_idx, pred_af_list[k]
                 )
         return store
@@ -225,14 +276,32 @@ class StreamingProjectionFitter:
         chset |= {str(t.chromosome) for t in self.plan.fallback_targets.values()}
         return sorted(chset, key=_chrom_sort_key)
 
-    def _run_chromosome(
-        self, source, chrom, region_models, fallback_models, failures
-    ) -> int:
+    def _run_one_chromosome(self, source, chrom) -> "_ProjectChromPartial":
+        """Stream one chromosome and return its partial (Phase 7 shard unit).
+
+        All accumulators are **local** (region/fallback/failure dicts, the two calibration
+        vectors, ``has_obs``, and — in CV mode — the per-fold collector), so this is a pure
+        function with no shared-``self`` mutation, safe to run in a worker and reduce in the
+        parent. ``self.diag_var``/``self._has_terms`` written by the storers land on the
+        throwaway worker ``self`` and are discarded — ``diag_var`` is re-derived (``Σ cv_mse``)
+        and ``has_calibration_terms`` OR-ed in ``ProjectionStreamResult.reduce``.
+        """
         plan = self.plan
         # Projection units are few + wide (merged regions span ≫ 2W), so the per-fold Gram
         # is materialised on-demand per region (≤max_predictors) rather than kept as a
         # (K, cap, cap) band tensor — Finding-#1 band-limited per-fold Gram (Phase 3E).
         buf = self.backend.make_buffer(self.folds.n, self.folds, lazy_fold_gram=True)
+        region_models: Dict[str, ProjectionRegionModel] = {}
+        fallback_models: Dict[str, ImputedVariantModel] = {}
+        failures: Dict[str, str] = {}
+        s_true = np.zeros(self.folds.n, dtype=np.float64)
+        s_cv = np.zeros(self.folds.n, dtype=np.float64)
+        has_obs = False
+        cv_collector = (
+            {k: {} for k in range(self.folds.n_folds)}
+            if self._cv_collector is not None
+            else None
+        )
         region_ptr = 0  # next region (in start order) not yet closed
         chrom_regions = self._regions_by_chrom.get(str(chrom), [])
         open_sr: Dict[int, np.ndarray] = {}  # region_idx -> accumulating S_R
@@ -241,7 +310,7 @@ class StreamingProjectionFitter:
         frontier = -1
         fb_failures: Dict[str, str] = {}
 
-        cv = self._cv_collector is not None
+        cv = cv_collector is not None
 
         def close_ready(force: bool):
             nonlocal n_intercept_only, region_ptr
@@ -255,7 +324,9 @@ class StreamingProjectionFitter:
                     s_r = open_sr.pop(ridx, None)
                     if s_r is None:
                         s_r = np.zeros(self.folds.n, dtype=np.float64)
-                    job = self._region_job(region, s_r, buf, region_models, failures)
+                    job = self._region_job(
+                        region, s_r, buf, region_models, failures, cv_collector
+                    )
                     if job is not None:
                         jobs.append(job)
                     region_ptr += 1
@@ -283,7 +354,7 @@ class StreamingProjectionFitter:
                 else:
                     n_intercept_only += self.backend.run_fit_batch(
                         jobs, buf, self.folds, plan.alpha, plan.l1_ratio, plan.cv_folds,
-                        self.s_true, self.s_cv, self._batch_cap,
+                        s_true, s_cv, self._batch_cap,
                     )
 
         region = _region_for(source, chrom)
@@ -311,9 +382,9 @@ class StreamingProjectionFitter:
                     chip_af.append(af)
                 if obs is not None:  # observed PRS calibration term (effect-oriented)
                     x_eff, _, _ = _prepare_column(raw, flip=obs.effect_flip, folds=self.folds)
-                    self.s_true += obs.beta * x_eff
-                    self.s_cv += obs.beta * x_eff
-                    self._has_terms = True
+                    s_true += obs.beta * x_eff
+                    s_cv += obs.beta * x_eff
+                    has_obs = True
                 if members:  # missing PRS variant → accumulate into its region's S_R
                     for region_idx, beta, flip in members:
                         x_eff, _, _ = _prepare_column(raw, flip=flip, folds=self.folds)
@@ -335,7 +406,17 @@ class StreamingProjectionFitter:
 
         close_ready(force=True)
         buf.clear()
-        return n_intercept_only
+        return _ProjectChromPartial(
+            chrom=str(chrom),
+            region_models=region_models,
+            fallback_models=fallback_models,
+            failures=failures,
+            s_true=s_true,
+            s_cv=s_cv,
+            has_obs=has_obs,
+            n_intercept_only=n_intercept_only,
+            cv_collector=cv_collector,
+        )
 
     def _evict(self, buf, chrom_regions, region_ptr, frontier) -> None:
         """Evict chip columns below the earliest still-open region's start, but never
@@ -364,15 +445,17 @@ class StreamingProjectionFitter:
             idx = idx[np.argsort(distances)[:mp]]
         return idx
 
-    def _region_job(self, region, s_r, buf, region_models, failures) -> Optional[_FitJob]:
+    def _region_job(
+        self, region, s_r, buf, region_models, failures, cv_collector
+    ) -> Optional[_FitJob]:
         try:
             pred_idx = self._region_predictors(region)
         except Exception as exc:  # noqa: BLE001
             failures[region.region_id] = f"{type(exc).__name__}: {exc}"
             return None
         store = (
-            self._cv_region_storer(region, s_r)
-            if self._cv_collector is not None
+            self._cv_region_storer(region, s_r, cv_collector)
+            if cv_collector is not None
             else self._region_storer(region, s_r, region_models)
         )
         return _FitJob(
