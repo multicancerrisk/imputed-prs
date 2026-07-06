@@ -38,28 +38,41 @@ replay by design (`is_hard_called` → the browser-parity path); the batch numer
 the 2M-variant *continuous* / measurement path and is what the ≥256-target size-select
 selects. The true-PRS vectorization applies on both modes.
 
-## 2. Reference CV — no temp-VCF round-trip (bounded: chr22, 3 folds)
-`ImputationEvaluator.cross_validate` was reworked to fit each fold from an in-memory
+## 2. Reference CV — additive single pass, no temp-VCF (bounded: chr22, 3 folds)
+`ImputationEvaluator.cross_validate` fits each fold from an in-memory
 `InMemoryGenotypeSource` (streaming, no serialization). **The "no temp-VCF is written"
 guarantee is locked by construction and the unit suite** —
 `tests/test_streaming_backend.py::TestInMemoryFitParity` plus the deletion of
 `_write_genotype_data_to_vcf` — not by this timing run.
 
-The real-data timing run (`--part refcv`, chr22 + 3 folds) was **not carried to
-completion**. On this *hard-called* 1000G reference the per-fold **held-out scoring**
-routes through the per-sample string-replay path (`_predicted_prs_via_strings`, the
-browser-parity path — see the hard-called note in §1), which is O(held-out samples ×
-variants) pure-Python and is *not* what Phase 4 vectorized. It dominated wall-clock
-(killed at >2 h; the four streaming fits themselves were ~9 min each and completed
-early) while telling us nothing about the no-temp-VCF seam actually under test. A
-bounded real-data CV number needs either a much smaller PRS subset or a **vectorized
-hard-called scorer** (a recommended follow-up); the full 2M / 10-fold run is Phase 6
-regardless.
+**Update (Phase 5 + 6).** The stale note this section carried — that per-fold held-out
+scoring routed through the per-sample string-replay path and blew past 2 h — no longer
+holds: **Phase 5 moved held-out scoring onto the vectorized numeric scorer**
+(`_predicted_prs_numeric`; the string replay survives only as the golden browser-parity
+oracle), and **Phase 6 replaced the ``k`` independent per-fold refits with a single
+additive accumulation pass**. Because the streaming sufficient statistics are sums over
+samples, each training fold's Gram is `S_full − S_fold(k)`, so `cross_validate` (and the
+new `ProjectionEvaluator.cross_validate`) streams the panel a **fixed** number of times
+regardless of `n_folds`, then subtracts. `--part refcv` now times the additive path (A,
+`backend="streaming"`) against the retained refit-per-fold oracle (B, `backend="dense"`),
+asserts their metrics agree (statistical parity), proves the panel-stream count is
+independent of `n_folds`, and extrapolates the k-fold saving (~`k×`) from one streaming
+fit-pass. `--part refcv_projection` does the same for projection.
+
+**Scope caveats.**
+- *Parity is exact-to-float only on a no-missing panel* (dense 1000G has no NaN). Under
+  panel missingness the single pass mean-imputes with the full-panel column mean while a
+  true refit uses the training-fold mean — a small, documented deviation (mirrors the
+  Phase-2 mean-imputation convention); use `backend="dense"` for exact per-fold semantics.
+- *The fast-path still loads the full dense panel* (`load_genotypes`) and slices it per
+  fold. It delivers the k→1 **fit-pass** saving, not out-of-core CV — peak RAM is
+  unchanged. True out-of-core CV (stream from the path, never materialize) is Phase 11.
 
 ## Reproduce
 ```
 .venv/bin/python -m benchmarks.verify_predict_scale --part evaluator   # ~10 min (fit + score)
-.venv/bin/python -m benchmarks.verify_predict_scale --part refcv --folds 3   # bounded CV, no temp VCF
+.venv/bin/python -m benchmarks.verify_predict_scale --part refcv --folds 3            # additive vs refit, no temp VCF
+.venv/bin/python -m benchmarks.verify_predict_scale --part refcv_projection --folds 3 # projection additive vs refit
 .venv/bin/python -m benchmarks.verify_predict_scale --part masking     # run_masking_validation, timed
 ```
 Requires the cached chr22 reference `benchmarks/data/work/pos/22.vcf.gz` (built by

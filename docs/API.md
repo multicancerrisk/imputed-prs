@@ -716,6 +716,7 @@ def cross_validate(
     platform_variants: Optional[List[str]] = None,
     n_folds: int = 5,
     random_state: Optional[int] = None,
+    backend: Optional[str] = None,
 ) -> CrossValidationResult
 ```
 
@@ -730,8 +731,18 @@ def cross_validate(
 | `platform_variants` | `List[str]` | `None` | List of platform variant IDs. |
 | `n_folds` | `int` | `5` | Number of CV folds (must be >= 2). |
 | `random_state` | `int` | `None` | Random seed for reproducibility. |
+| `backend` | `str` | `None` | `"streaming"` / `"dense"` / `"auto"`; defaults to the parent model's. |
 
 **Returns:** `CrossValidationResult` with fold metrics and aggregated statistics.
+
+**Scaling (Phase 6).** When the resolved backend streams (`"streaming"`, or `"auto"`
+above the size threshold), all `k` training folds are assembled from a **single**
+streaming pass by additive subtraction of sufficient statistics (`S_full − S_fold(k)`),
+rather than `k` independent refits — a ~`k×` reduction in accumulation work with metrics
+matching the refit path within statistical parity. The dense/small path keeps the
+refit-per-fold oracle. Exact-to-float parity holds on a no-missing panel; under panel
+missingness the streaming path mean-imputes (a documented deviation) — use
+`backend="dense"` for exact per-fold semantics.
 
 **Example:**
 
@@ -836,7 +847,7 @@ metrics = evaluator.evaluate("held_out_data.vcf.gz")
 print(f"R²: {metrics.r2:.3f}, Correlation: {metrics.correlation:.3f}")
 ```
 
-**Note:** Unlike `ImputationEvaluator`, `ProjectionEvaluator` provides only `evaluate()` (and the lower-level `compute_score_arrays(evaluation_genotypes) -> Tuple[np.ndarray, np.ndarray]`, returning the raw `(s_estimated, s_true)` PRS arrays). It does **not** provide `cross_validate()` or `sensitivity_analysis()`.
+**Note:** `ProjectionEvaluator` provides `evaluate()`, the lower-level `compute_score_arrays(evaluation_genotypes) -> Tuple[np.ndarray, np.ndarray]` (returning the raw `(s_estimated, s_true)` PRS arrays), and — as of Phase 6 — `cross_validate(...)` with the same signature and `CrossValidationResult` as `ImputationEvaluator` (including the additive single-pass streaming fast-path). It does **not** provide `sensitivity_analysis()`.
 
 ---
 
