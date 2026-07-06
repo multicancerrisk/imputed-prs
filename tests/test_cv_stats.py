@@ -8,6 +8,7 @@ is validated. Runs in seconds; no streaming/panel needed.
 """
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from imputed_prs.compute.gram_solve import (
@@ -16,6 +17,15 @@ from imputed_prs.compute.gram_solve import (
     fit_reference_folds,
 )
 from imputed_prs.compute.sufficient_stats import GlobalFolds
+
+pytestmark = pytest.mark.filterwarnings("ignore")
+
+# Synthetic panel geometry — big enough for real ±W windows (many predictors/target).
+N_SAMPLES = 60
+N_VARIANTS = 120
+SPACING = 10_000
+WINDOW = 200_000
+SEED = 42
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +56,49 @@ def reference_cv_folds(n, n_folds, random_state):
         end = n if i == n_folds - 1 else start + fold_size
         folds.append(idx[start:end])
     return folds
+
+
+def write_synthetic_vcf(path, n_samples=N_SAMPLES, n_variants=N_VARIANTS, seed=7):
+    """chr1 VCF with random biallelic genotypes (no missing calls)."""
+    rng = np.random.RandomState(seed)
+    samples = [f"S{i}" for i in range(n_samples)]
+    alleles = [("A", "G"), ("C", "T"), ("G", "A"), ("T", "C")]
+    lines = [
+        "##fileformat=VCFv4.2",
+        "##contig=<ID=1,length=249250621>",
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" + "\t".join(samples),
+    ]
+    gt_str = {0: "0/0", 1: "0/1", 2: "1/1"}
+    for v in range(n_variants):
+        pos = 100_000 + v * SPACING
+        ref, alt = alleles[v % len(alleles)]
+        p = 0.2 + 0.6 * rng.rand()
+        dos = rng.binomial(2, p, size=n_samples)
+        gts = "\t".join(gt_str[int(d)] for d in dos)
+        lines.append(f"1\t{pos}\trs{v}\t{ref}\t{alt}\t.\t.\t.\tGT\t{gts}")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def synthetic_prs(seed=0):
+    """A PRS over the synthetic panel; ~1/3 on-platform (observed), rest missing."""
+    rng = np.random.RandomState(seed)
+    alleles = [("A", "G"), ("C", "T"), ("G", "A"), ("T", "C")]
+    rows, platform = [], []
+    for v in range(N_VARIANTS):
+        pos = 100_000 + v * SPACING
+        ref, alt = alleles[v % len(alleles)]
+        flip = v % 3 == 0  # exercise both effect orientations
+        rows.append(dict(
+            variant_id=f"rs{v}", chromosome="1", position=pos,
+            effect_allele=(ref if flip else alt),
+            other_allele=(alt if flip else ref),
+            beta=float(rng.uniform(-0.5, 0.5)),
+        ))
+        if v % 3 == 1:
+            platform.append(f"rs{v}")
+    return pd.DataFrame(rows), platform
 
 
 def plain_block(X, y):
@@ -204,3 +257,74 @@ def test_fit_reference_folds_intercept_only_uses_training_fold_mean():
         assert results[k].is_intercept_only
         assert results[k].coefficients.size == 0
         assert abs(results[k].intercept - float(y[train_idx].mean())) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# End-to-end streaming: one-pass additive CV vs a direct per-fold refit (b).
+# ---------------------------------------------------------------------------
+def test_streaming_reference_cv_matches_direct_refit(tmp_path):
+    """streaming_reference_cv_impute's per-fold models (one pass, S_full − S_fold(k))
+    reproduce a direct streaming refit on each training fold — within streaming tol."""
+    pytest.importorskip("cyvcf2")
+    from imputed_prs.compute.cv_stats import streaming_reference_cv_impute
+    from imputed_prs.core.linear_imputation_prs import LinearImputationPRS
+    from imputed_prs.io.genotype_loader import load_genotypes
+    from imputed_prs.io.genotype_source import InMemoryGenotypeSource
+    from imputed_prs.io.platform_loader import load_platform_variants_from_list
+
+    path = tmp_path / "panel.vcf"
+    write_synthetic_vcf(path)
+    prs_df, platform = synthetic_prs()
+    # Resolve the platform the same way LinearImputationPRS.fit does internally, so the
+    # additive path and the direct refit build predictors in the same order.
+    platform_set = load_platform_variants_from_list(platform)
+    gd = load_genotypes(path=path)
+    n = gd.n_samples
+    n_folds = 3
+    fold_indices = reference_cv_folds(n, n_folds, random_state=42)
+    hp = dict(window_size=WINDOW, alpha=0.01, l1_ratio=0.5, cv_folds=5)
+
+    # One streaming pass → per-outer-fold models by additive subtraction.
+    cv = streaming_reference_cv_impute(
+        InMemoryGenotypeSource(gd),
+        prs_df,
+        platform_set,
+        fold_indices=fold_indices,
+        random_state=SEED,
+        device="cpu",
+        **hp,
+    )
+    assert cv.fold_imputed_models is not None
+    assert set(cv.fold_imputed_models) == set(range(n_folds))
+
+    for k in range(n_folds):
+        train_idx = np.concatenate(
+            [fold_indices[i] for i in range(n_folds) if i != k]
+        )
+        # The refit oracle: a full streaming fit on exactly the fold-k-excluded rows.
+        direct = LinearImputationPRS(
+            backend="streaming", device="cpu", tuning_scope="none",
+            random_state=SEED, verbose=0, **hp,
+        )
+        direct.fit(
+            reference_genotypes=InMemoryGenotypeSource(gd, sample_indices=train_idx),
+            prs_definition=prs_df,
+            platform_variants=platform,
+            genome_build="GRCh38",
+        )
+        dmods = {m.variant_id: m for m in direct.imputed_models}
+        amods = {m.variant_id: m for m in cv.fold_imputed_models[k]}
+        assert set(amods) == set(dmods)
+        assert len(amods) > 5  # a meaningful number of targets were trained
+        for vid, dm in dmods.items():
+            am = amods[vid]
+            # Compare per predictor id (permutation-equivariant), not by position.
+            d_coef = dict(zip(dm.predictor_variant_ids, np.asarray(dm.coefficients)))
+            a_coef = dict(zip(am.predictor_variant_ids, np.asarray(am.coefficients)))
+            assert set(a_coef) == set(d_coef)
+            # Same solver, same training samples (subtraction vs direct) ⇒ ~1e-9.
+            # Also the R1 guard: a wrong n_train would rescale the penalty >> 1e-9.
+            for pid, dc in d_coef.items():
+                assert abs(a_coef[pid] - dc) < 1e-9
+            assert abs(am.intercept - dm.intercept) < 1e-9
+            assert am.is_intercept_only == dm.is_intercept_only

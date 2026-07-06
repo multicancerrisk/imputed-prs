@@ -32,7 +32,11 @@ import pandas as pd
 from sklearn.model_selection import KFold
 
 from imputed_prs.compute.device import resolve_streaming_backend
-from imputed_prs.compute.gram_solve import LocalGramBlock, fit_from_local_gram
+from imputed_prs.compute.gram_solve import (
+    LocalGramBlock,
+    fit_from_local_gram,
+    fit_reference_folds,
+)
 from imputed_prs.core.harmonizer import normalize_chromosome_array
 from imputed_prs.core.types import ImputedVariantModel
 from imputed_prs.core.window_index import ChromosomeIndex
@@ -432,24 +436,20 @@ def _run_fit_batch(jobs, buf, folds, alpha, l1_ratio, cv_folds, s_true, s_cv, ba
     return n_io
 
 
-def _run_fit_chunk(jobs, buf, folds, alpha, l1_ratio, cv_folds, s_true, s_cv):
-    """Batched banded-Gram fit of one chunk of co-located units.
+def _batch_cross_products(jobs, buf, folds):
+    """Shared banded cross-products for a chunk of co-located units.
 
-    The per-unit O(n·p) cross-products (``Zᵀy``) and out-of-fold predictions — the
-    cost that dominates at 500K samples — are lifted to banded BLAS-3 GEMMs over the
-    contiguous ``Z[:, :m]`` band shared by every unit in the chunk, replacing ``T``
-    gathered ``Z`` copies + ``T`` level-2 mat-vecs with a handful of GEMMs. Each unit's
-    Gram sub-block (O(p²)) and ElasticNet solve stay per-unit (cheap, sample-free).
-    This is also the natural GPU seam (Phase 3): the banded GEMMs map onto batched
-    cuBLAS. ``s_true``/``s_cv`` are mutated in place. Returns #calibrating
-    intercept-only models.
+    The per-unit O(n·p) cross-products (``Zᵀy``) — the cost that dominates at 500K
+    samples — are lifted to banded BLAS-3 GEMMs over the contiguous ``Z[:, :m]`` band
+    shared by every unit in the chunk (one GEMM for the full ``Zᵀy`` + one per fold
+    for the held-out ``Zᵀy``). Returns the dict of stacked targets + full/per-fold
+    moments consumed by :func:`_assemble_block` (used by both the single-model fit and
+    the reference-CV fit).
     """
     n, K, T = folds.n, folds.n_folds, len(jobs)
     m = buf.m
     Zband = buf.Z[:, :m]  # (n, m) contiguous-row band view — never copied
 
-    # Stack target columns + batch their y-moments (O(n·T)); then the banded
-    # cross-products: one GEMM for the full Zᵀy + one per fold for the held-out Zᵀy.
     Y = np.empty((n, T), dtype=np.float64)
     for j, job in enumerate(jobs):
         Y[:, j] = job.col
@@ -467,6 +467,69 @@ def _run_fit_chunk(jobs, buf, folds, alpha, l1_ratio, cv_folds, s_true, s_cv):
         fold_ysqsum[k] = np.einsum("ij,ij->j", Yk, Yk)
         fold_n[k] = sl.stop - sl.start
         Ck.append(Zband[sl].T @ Yk)  # (m, T) held-out cross-product
+    return {
+        "n": n, "K": K, "T": T, "m": m, "Zband": Zband, "Y": Y,
+        "ysum_all": ysum_all, "ysqsum_all": ysqsum_all, "C": C, "Ck": Ck,
+        "fold_ysum": fold_ysum, "fold_ysqsum": fold_ysqsum, "fold_n": fold_n,
+    }
+
+
+def _assemble_block(job, j, buf, cross):
+    """Assemble unit ``j``'s :class:`LocalGramBlock` from the shared cross-products
+    (+ its gathered predictor Gram). Returns ``(block, idx, pred_af)``; ``idx`` is
+    ``None`` for a no-predictor unit. ``buf.gather`` may raise on a missing slot — the
+    caller wraps this (record-don't-crash) and routes it to ``job.fail``.
+
+    ``fold_ysum``/``fold_ysqsum``/``fold_n`` are populated even for a no-predictor unit
+    (they are needed by :func:`fit_reference_folds` for per-fold intercept-only models;
+    the single-model path early-returns on ``p==0`` before touching them, so this is
+    behaviour-preserving there).
+    """
+    n, K = cross["n"], cross["K"]
+    C, Ck = cross["C"], cross["Ck"]
+    ysum_all, ysqsum_all = cross["ysum_all"], cross["ysqsum_all"]
+    fold_ysum, fold_ysqsum, fold_n = (
+        cross["fold_ysum"], cross["fold_ysqsum"], cross["fold_n"],
+    )
+    pred_idx = job.pred_idx
+    if len(pred_idx):
+        idx, gg = buf.gather(pred_idx)
+        block = LocalGramBlock(
+            n=n, G=gg["G"], c=C[idx, j], zsum=gg["zsum"],
+            zsqsum=gg["zsqsum"], ysum=float(ysum_all[j]),
+            ysqsum=float(ysqsum_all[j]), fold_G=gg["fold_G"],
+            fold_c=[Ck[k][idx, j] for k in range(K)],
+            fold_zsum=gg["fold_zsum"], fold_zsqsum=gg["fold_zsqsum"],
+            fold_ysum=fold_ysum[:, j], fold_ysqsum=fold_ysqsum[:, j],
+            fold_n=fold_n,
+        )
+        pred_af = gg["af"]
+    else:
+        idx = None
+        block = LocalGramBlock(
+            n=n, G=np.empty((0, 0)), c=np.empty(0), zsum=np.empty(0),
+            zsqsum=np.empty(0), ysum=float(ysum_all[j]),
+            ysqsum=float(ysqsum_all[j]),
+            fold_ysum=fold_ysum[:, j], fold_ysqsum=fold_ysqsum[:, j],
+            fold_n=fold_n,
+        )
+        pred_af = np.empty(0)
+    return block, idx, pred_af
+
+
+def _run_fit_chunk(jobs, buf, folds, alpha, l1_ratio, cv_folds, s_true, s_cv):
+    """Batched banded-Gram fit of one chunk of co-located units.
+
+    Each unit's Gram sub-block (O(p²)) and ElasticNet solve stay per-unit (cheap,
+    sample-free); the shared cross-products come from :func:`_batch_cross_products`.
+    This is also the natural GPU seam (Phase 3): the banded GEMMs map onto batched
+    cuBLAS. ``s_true``/``s_cv`` are mutated in place. Returns #calibrating
+    intercept-only models.
+    """
+    cross = _batch_cross_products(jobs, buf, folds)
+    n, K, T, m, Zband, Y = (
+        cross["n"], cross["K"], cross["T"], cross["m"], cross["Zband"], cross["Y"],
+    )
 
     # Per-unit solve; scatter each fold model's raw coefficients into the band slots
     # so the OOF becomes a single GEMM per fold below.
@@ -476,31 +539,11 @@ def _run_fit_chunk(jobs, buf, folds, alpha, l1_ratio, cv_folds, s_true, s_cv):
     n_io = 0
     for j, job in enumerate(jobs):
         try:
-            pred_idx = job.pred_idx
-            if len(pred_idx):
-                idx, gg = buf.gather(pred_idx)
-                block = LocalGramBlock(
-                    n=n, G=gg["G"], c=C[idx, j], zsum=gg["zsum"],
-                    zsqsum=gg["zsqsum"], ysum=float(ysum_all[j]),
-                    ysqsum=float(ysqsum_all[j]), fold_G=gg["fold_G"],
-                    fold_c=[Ck[k][idx, j] for k in range(K)],
-                    fold_zsum=gg["fold_zsum"], fold_zsqsum=gg["fold_zsqsum"],
-                    fold_ysum=fold_ysum[:, j], fold_ysqsum=fold_ysqsum[:, j],
-                    fold_n=fold_n,
-                )
-                pred_af = gg["af"]
-            else:
-                idx = None
-                block = LocalGramBlock(
-                    n=n, G=np.empty((0, 0)), c=np.empty(0), zsum=np.empty(0),
-                    zsqsum=np.empty(0), ysum=float(ysum_all[j]),
-                    ysqsum=float(ysqsum_all[j]),
-                )
-                pred_af = np.empty(0)
+            block, idx, pred_af = _assemble_block(job, j, buf, cross)
             result = fit_from_local_gram(
                 block, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv_folds
             )
-            job.store(result, pred_idx, pred_af)
+            job.store(result, job.pred_idx, pred_af)
             if job.is_calibrating:
                 if result.fold_models:
                     for k, fm in enumerate(result.fold_models):
@@ -529,6 +572,47 @@ def _run_fit_chunk(jobs, buf, folds, alpha, l1_ratio, cv_folds, s_true, s_cv):
     return n_io
 
 
+def _run_cv_batch(jobs, buf, folds, alpha, l1_ratio, cv_folds, batch_cap):
+    """Reference-CV analogue of :func:`_run_fit_batch`, chunked to bound working arrays."""
+    for s in range(0, len(jobs), batch_cap):
+        _run_cv_chunk(jobs[s : s + batch_cap], buf, folds, alpha, l1_ratio, cv_folds)
+
+
+def _run_cv_chunk(jobs, buf, folds, alpha, l1_ratio, cv_folds):
+    """Leave-one-fold-out reference-CV fit of one chunk (host/CPU only).
+
+    Shares :func:`_batch_cross_products`/:func:`_assemble_block` with the single-model
+    path, but ``folds`` here are the **reference-CV outer folds**, so each unit's
+    per-fold slabs are the outer-fold statistics. Per unit it calls
+    :func:`fit_reference_folds` (the additive ``S_full − S_fold(k)`` per-fold solve) and
+    hands the ``K`` per-fold results + per-fold predictor AF to the CV ``store``. No
+    OOF / ``s_cv`` reduction — reference CV scores raw.
+
+    Per-fold predictor AF is derived from the shared per-slot moments
+    ``(zsum − fold_zsum[k]) / (2·n_train)`` so one predictor slot has one AF across every
+    target in a fold (satisfies ``build_chip_axis``'s consistency guard, R6).
+    """
+    cross = _batch_cross_products(jobs, buf, folds)
+    K = cross["K"]
+    for j, job in enumerate(jobs):
+        try:
+            block, _idx, _pred_af = _assemble_block(job, j, buf, cross)
+            fold_results = fit_reference_folds(
+                block, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv_folds
+            )
+            if block.n_predictors > 0:
+                pred_af_per_fold = []
+                for k in range(K):
+                    n_tr = block.n - int(block.fold_n[k])
+                    denom = 2.0 * n_tr if n_tr > 0 else 1.0
+                    pred_af_per_fold.append((block.zsum - block.fold_zsum[k]) / denom)
+            else:
+                pred_af_per_fold = [np.empty(0) for _ in range(K)]
+            job.store(fold_results, job.pred_idx, pred_af_per_fold)
+        except Exception as exc:  # noqa: BLE001 - mirror legacy: record, don't crash
+            job.fail(exc)
+
+
 class StreamingImputationFitter:
     """Fit all missing-variant models by streaming the panel once per chromosome."""
 
@@ -552,6 +636,9 @@ class StreamingImputationFitter:
         # 500K samples; the ≥16 floor keeps the GEMMs wide enough to run near BLAS-3
         # peak. At 1000G scale n is tiny, so the cap never binds.
         self._batch_cap = max(16, min(4096, (256 * 1024 * 1024) // (max(self.folds.n, 1) * 8)))
+        # Set by run_reference_cv: {fold_k -> {prs_id -> ImputedVariantModel}}. When
+        # non-None the fitter is in leave-one-fold-out reference-CV mode (see _fit_batch).
+        self._cv_collector: Optional[Dict[int, Dict[str, ImputedVariantModel]]] = None
 
     def run(self, source) -> StreamingFitResult:
         models: Dict[str, ImputedVariantModel] = {}
@@ -676,10 +763,18 @@ class StreamingImputationFitter:
         Predictor selection (``chrom_index.window``) is buffer-independent, so it is
         done here up front; a window failure is recorded (record-don't-crash) and the
         target skipped. Returns the number of non-fallback intercept-only models.
+
+        In reference-CV mode (``self._cv_collector`` set) each target routes to a CV
+        store that collects per-outer-fold models via :func:`_run_cv_chunk`; observed-
+        variant fallbacks are skipped entirely (the evaluator scores observed terms
+        directly, so they are never trained during CV).
         """
+        cv = self._cv_collector is not None
         jobs: List[_FitJob] = []
         for tgt in batch:
             spec = tgt.spec
+            if cv and tgt.is_fallback:
+                continue
             dest = fallback_models if tgt.is_fallback else models
             fmap = fb_failures if tgt.is_fallback else failures
             try:
@@ -690,20 +785,85 @@ class StreamingImputationFitter:
             except Exception as exc:  # noqa: BLE001
                 fmap[spec.prs_variant_id] = f"{type(exc).__name__}: {exc}"
                 continue
+            store = (
+                self._cv_storer(spec, tgt.af)
+                if cv
+                else self._impute_storer(spec, tgt.af, dest)
+            )
             jobs.append(_FitJob(
                 col=tgt.col, pred_idx=win.variant_indices, calib_coef=float(spec.beta),
                 is_calibrating=not tgt.is_fallback,
-                store=self._impute_storer(spec, tgt.af, dest),
+                store=store,
                 fail=self._impute_failer(spec.prs_variant_id, fmap),
             ))
+        if cv:
+            _run_cv_batch(
+                jobs, buf, self.folds, self.plan.alpha, self.plan.l1_ratio,
+                self.plan.cv_folds, self._batch_cap,
+            )
+            return 0
         return self.backend.run_fit_batch(
             jobs, buf, self.folds, self.plan.alpha, self.plan.l1_ratio,
             self.plan.cv_folds, self.s_true, self.s_cv, self._batch_cap,
         )
 
+    def run_reference_cv(self, source, outer_folds: "GlobalFolds"):
+        """Single-pass leave-one-fold-out reference CV over the panel.
+
+        Streams the panel **once** with the buffer's folds set to ``outer_folds`` (the
+        reference-CV outer partition), accumulating the full-panel band Gram and each
+        per-fold slab; every closing target is fit for *all* ``K`` training folds by the
+        additive subtraction ``S_full − S_fold(k)`` (:func:`_run_cv_chunk`). Replaces the
+        ``k`` independent refit passes of ``ImputationEvaluator.cross_validate``.
+
+        Returns ``(fold_models, failures)`` where ``fold_models[k]`` is the list of
+        ``ImputedVariantModel`` trained on all samples except outer fold ``k``.
+
+        The per-fold solve is host-side (numpy), so CV runs on the CPU buffer even when
+        the fitter was constructed with a GPU device (the device-native kernel returns
+        device tensors that :func:`fit_reference_folds` cannot consume — device CV is a
+        Phase-3 follow-up).
+        """
+        if getattr(self.backend, "device_name", "cpu") != "cpu":
+            from imputed_prs.compute.device import get_backend
+
+            self.backend = get_backend("cpu")
+        self.folds = outer_folds
+        self.s_true = np.zeros(self.folds.n, dtype=np.float64)
+        self.s_cv = np.zeros(self.folds.n, dtype=np.float64)
+        self._batch_cap = max(
+            16, min(4096, (256 * 1024 * 1024) // (max(self.folds.n, 1) * 8))
+        )
+        K = outer_folds.n_folds
+        self._cv_collector = {k: {} for k in range(K)}
+        failures: Dict[str, str] = {}
+        try:
+            for chrom in self._stream_chromosomes():
+                # models/fallback dicts are unused in CV mode (targets route to the
+                # CV collector; fallbacks are skipped in _fit_batch).
+                self._run_chromosome(source, chrom, {}, {}, failures)
+            fold_models = {k: list(self._cv_collector[k].values()) for k in range(K)}
+        finally:
+            self._cv_collector = None
+        return fold_models, failures
+
     def _impute_storer(self, spec, af, dest):
         def store(result, pred_idx, pred_af):
             dest[spec.prs_variant_id] = self._to_model(spec, af, result, pred_idx, pred_af)
+        return store
+
+    def _cv_storer(self, spec, af):
+        """Store the K per-outer-fold models for one target into the CV collector.
+
+        ``af`` is the target's full-panel effect-allele frequency, used only for the
+        cosmetic ``allele_frequency``/``residual_variance`` fields (not on the held-out
+        scoring path); the predictors carry per-fold training AFs from ``pred_af_list``.
+        """
+        def store(fold_results, pred_idx, pred_af_list):
+            for k, res in enumerate(fold_results):
+                self._cv_collector[k][spec.prs_variant_id] = self._to_model(
+                    spec, af, res, pred_idx, pred_af_list[k]
+                )
         return store
 
     @staticmethod
