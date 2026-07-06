@@ -64,6 +64,38 @@ class GlobalFolds:
         self.perm = np.concatenate(parts).astype(np.int64)
         self.bounds = np.asarray(bounds, dtype=np.int64)
 
+    @classmethod
+    def from_partition(cls, fold_indices: Sequence[np.ndarray]) -> "GlobalFolds":
+        """Build folds from an explicit disjoint sample partition, bypassing KFold.
+
+        ``fold_indices[k]`` is the natural-order sample-row index set held out in fold
+        ``k`` (the reference-CV outer chunks from
+        ``ImputationEvaluator.cross_validate``). Concatenated they **must** be a
+        complete, disjoint partition of ``range(n)`` — otherwise the additive
+        ``S_full − S_fold(k)`` subtraction silently corrupts every training Gram (R5),
+        so this validates the partition and raises on any gap/overlap.
+        """
+        parts = [np.asarray(f, dtype=np.int64).ravel() for f in fold_indices]
+        perm = (
+            np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+        )
+        n = int(perm.size)
+        if not np.array_equal(np.sort(perm), np.arange(n, dtype=np.int64)):
+            raise ValueError(
+                "GlobalFolds.from_partition requires a complete, disjoint partition "
+                "of range(n); the concatenated fold indices are not a permutation of "
+                "[0, n)."
+            )
+        obj = cls.__new__(cls)  # bypass __init__ (no KFold — partition is given)
+        obj.n = n
+        obj.n_folds = len(parts)
+        obj.perm = perm
+        bounds = [0]
+        for part in parts:
+            bounds.append(bounds[-1] + len(part))
+        obj.bounds = np.asarray(bounds, dtype=np.int64)
+        return obj
+
     def permute(self, rows_natural: np.ndarray) -> np.ndarray:
         """Reorder a (n,) or (n, m) array from natural into fold-block order."""
         return rows_natural[self.perm]

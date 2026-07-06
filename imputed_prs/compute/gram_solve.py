@@ -517,3 +517,76 @@ def fit_from_local_gram(
         n_samples=n,
         fold_models=fold_models,
     )
+
+
+# ---------------------------------------------------------------------------
+# Leave-one-fold-out reference CV: per-outer-fold models by additive subtraction.
+# ---------------------------------------------------------------------------
+def fit_reference_folds(
+    full_block: LocalGramBlock,
+    alpha: float,
+    l1_ratio: float,
+    cv_folds: int = 5,
+    max_iter: int = 10000,
+    tol: float = 1e-4,
+) -> List[GramFitResult]:
+    """Fit one target's per-outer-fold models for leave-one-fold-out reference CV.
+
+    ``full_block``'s per-fold entries are the **reference-CV outer folds** — a
+    disjoint sample partition. For each outer fold ``k`` this returns the model
+    trained on the *training fold* (all samples except fold ``k``), assembled by the
+    additive subtraction ``S_train(k) = S_full − S_fold(k)`` and solved via the same
+    :func:`fit_from_local_gram` main-fit path a direct refit on those samples would
+    use. It reproduces ``fold_model.fit(train_data_k)`` (the refit oracle) without
+    re-streaming the panel ``k`` times — the whole point of Phase 6.
+
+    Two correctness invariants (verified by tests):
+
+    * **R1** — each subtracted training block carries ``n = n_full − fold_n[k]`` and
+      *every* moment subtracted consistently, so the ElasticNet penalty
+      (``l1_reg = α·l1_ratio·n``) scales with the training-fold sample count. Passing
+      the full ``n`` would over-penalize every fold by ``k/(k−1)``.
+    * **R2** — ``cv_folds`` is the model's **inner** CV count (the ``n < cv_folds``
+      intercept-only guard), *not* the number of outer folds; pass the same value the
+      refit oracle would. Each training block's own fold lists are left empty, so the
+      nested CV loop in :func:`fit_from_local_gram` is a no-op (its ``cv_mse``/``cv_r2``
+      are 0 and unused — reference CV scores raw).
+    """
+    n_folds = len(full_block.fold_n)
+    has_predictors = full_block.n_predictors > 0
+    results: List[GramFitResult] = []
+    for k in range(n_folds):
+        n_tr = int(full_block.n - full_block.fold_n[k])
+        ysum_tr = float(full_block.ysum - full_block.fold_ysum[k])
+        ysqsum_tr = float(full_block.ysqsum - full_block.fold_ysqsum[k])
+        if has_predictors:
+            train_block = LocalGramBlock(
+                n=n_tr,
+                G=full_block.G - full_block.fold_G[k],
+                c=full_block.c - full_block.fold_c[k],
+                zsum=full_block.zsum - full_block.fold_zsum[k],
+                zsqsum=full_block.zsqsum - full_block.fold_zsqsum[k],
+                ysum=ysum_tr,
+                ysqsum=ysqsum_tr,
+            )
+        else:
+            train_block = LocalGramBlock(
+                n=n_tr,
+                G=np.empty((0, 0)),
+                c=np.empty(0),
+                zsum=np.empty(0),
+                zsqsum=np.empty(0),
+                ysum=ysum_tr,
+                ysqsum=ysqsum_tr,
+            )
+        results.append(
+            fit_from_local_gram(
+                train_block,
+                alpha=alpha,
+                l1_ratio=l1_ratio,
+                cv_folds=cv_folds,
+                max_iter=max_iter,
+                tol=tol,
+            )
+        )
+    return results
