@@ -214,6 +214,18 @@ class TestAlleleCounting:
         assert count_allele("TT", "A", "G", allow_ambiguous=False, allow_strand_flip=False) is None
         assert count_allele("TT", "A", "G", allow_ambiguous=False, allow_strand_flip=True) == 2.0
 
+    def test_indel_allele_counting(self):
+        """Item 6: arbitrary-length indel alleles count as whole tokens (structured
+        allele/dosage browser scorer), both orientations, matching the numeric path."""
+        k = dict(allow_ambiguous=True, allow_strand_flip=True)
+        # counted = insertion ALT "AT": A/A, A/AT, AT/AT -> 0, 1, 2.
+        assert count_allele("A/A", "AT", "A", **k) == 0.0
+        assert count_allele("A/AT", "AT", "A", **k) == 1.0
+        assert count_allele("AT/AT", "AT", "A", **k) == 2.0
+        # deletion (counted = shorter allele) and a foreign allele -> unresolved.
+        assert count_allele("AT/A", "A", "AT", **k) == 1.0
+        assert count_allele("A/C", "AT", "A", **k) is None
+
 
 # =============================================================================
 # Items 1,3,11 in the observed-scoring contract

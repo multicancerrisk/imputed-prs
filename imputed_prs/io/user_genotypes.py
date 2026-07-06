@@ -41,6 +41,19 @@ MISSING_TOKENS = ("--", "", "NA", "N/A", "NULL", "..", "NN", "00")
 _VALID_BASES = frozenset({"A", "C", "G", "T"})
 
 
+def _is_valid_allele(allele: object) -> bool:
+    """True for a non-empty allele token of one or more A/C/G/T bases.
+
+    Accepts single-base SNP alleles *and* arbitrary-length indel / multi-character
+    alleles (``"A"``, ``"AT"``, ``"GTT"``), matching the grammar the PRS-definition
+    loader already applies to effect alleles (``prs_loader._ALLELE_RE`` = ``[ACGT]+``).
+    Rejects the empty string and symbolic/indel tokens (``"I"``, ``"D"``, ``"-"``,
+    ``"N"``). This is the multi-char generalization of ``x in _VALID_BASES``.
+    """
+    s = str(allele).strip().upper()
+    return len(s) > 0 and all(base in _VALID_BASES for base in s)
+
+
 def load_user_genotypes(
     input_data: Union[str, Path, "SNPs", pd.DataFrame],
     expected_variants: Optional[Set[str]] = None,
@@ -143,20 +156,30 @@ def genotype_to_dosage(genotype: str) -> Optional[float]:
     return None  # Unrecognized format
 
 
-def _parse_snp_genotype(genotype: object) -> Optional[List[str]]:
-    """Parse a diploid SNP genotype string into its two alleles.
+def _parse_genotype(genotype: object) -> Optional[List[str]]:
+    """Parse a diploid genotype string into its two alleles.
 
-    Normalizes case/whitespace, strips ``/`` and ``|`` separators (so ``"A/G"``
-    and ``"A|G"`` parse like ``"AG"``), and rejects missing, haploid, indel, and
-    non-SNP tokens. Returns the two alleles as a *list* (order preserved, so the
-    caller can count multiplicity), or ``None`` when the genotype is not a clean
-    A/C/G/T diploid call.
+    Handles two forms so arbitrary-length (indel / multi-character) alleles are
+    first-class alongside single-base SNP calls:
+
+    - **Delimited** (``/`` or ``|``): split into exactly two allele tokens, each
+      one-or-more A/C/G/T bases — ``"A/AT" -> ["A", "AT"]``, ``"AT|A" -> ["AT",
+      "A"]``, ``"G/GTT" -> ["G", "GTT"]``. This is the structured-allele path a
+      multi-character upload uses.
+    - **Concatenated two-character SNP** (``"AG"``): returned as ``["A", "G"]`` —
+      **byte-identical** to the legacy SNP parser, so hard-called SNP scoring is
+      unchanged.
+
+    Rejects missing, haploid, symbolic-indel (``I``/``D``/``-``), and any
+    *undelimited* multi-character string (``"AAT"`` is ambiguous). Returns the two
+    alleles as a *list* (order preserved, so the caller can count multiplicity),
+    or ``None``.
 
     Args:
         genotype: Raw genotype cell (str, NaN, numeric, etc.).
 
     Returns:
-        ``[allele1, allele2]`` with both in {A, C, G, T}, or ``None``.
+        ``[allele1, allele2]`` (each a valid A/C/G/T allele token), or ``None``.
     """
     if genotype is None:
         return None
@@ -165,14 +188,30 @@ def _parse_snp_genotype(genotype: object) -> Optional[List[str]]:
     if isinstance(genotype, float) and pd.isna(genotype):
         return None
 
-    s = str(genotype).strip().upper().replace("/", "").replace("|", "")
+    raw = str(genotype).strip().upper()
 
-    if s in MISSING_TOKENS:
-        return None
-    if len(s) != 2 or any(base not in _VALID_BASES for base in s):
+    # Missing check on the separator-collapsed form, exactly as the legacy parser:
+    # catches "--"/".."/"NN"/"00"/"" and "N/A" -> "NA".
+    collapsed = raw.replace("/", "").replace("|", "")
+    if collapsed in MISSING_TOKENS:
         return None
 
-    return [s[0], s[1]]
+    # Delimited form carries arbitrary-length alleles (indels / MNVs).
+    if "/" in raw or "|" in raw:
+        tokens = raw.replace("|", "/").split("/")
+        if len(tokens) != 2 or not all(_is_valid_allele(t) for t in tokens):
+            return None
+        return tokens
+
+    # Concatenated two-character SNP call: byte-identical to the legacy parser.
+    if len(raw) != 2 or any(base not in _VALID_BASES for base in raw):
+        return None
+    return [raw[0], raw[1]]
+
+
+# Back-compat alias: the parser now handles multi-character alleles, but the old
+# name is still imported by callers and tests.
+_parse_snp_genotype = _parse_genotype
 
 
 def count_allele(
@@ -187,15 +226,20 @@ def count_allele(
 
     This is the oriented-scoring primitive: it mirrors the training-side
     :func:`imputed_prs.core.harmonizer.match_oriented_dosage` semantics on raw
-    genotype strings instead of a reference dosage matrix. The genotype is only
+    genotype strings instead of a reference dosage matrix — including
+    arbitrary-length **indel / multi-character** alleles, which are compared as
+    whole tokens exactly as the numeric resolver does. The genotype is only
     counted when its alleles are a subset of the declared ``{counted, other}``
     pair; a partial overlap (e.g. ``"AC"`` against ``{A, G}``) is *unresolved*
     (``None``), never silently scored as a single copy.
 
     Args:
-        genotype: Raw user genotype string (e.g. ``"AG"``, ``"A/G"``, ``"GG"``).
+        genotype: Raw user genotype string. Single-base SNPs may be concatenated
+            (``"AG"``) or delimited (``"A/G"``); multi-character alleles must be
+            delimited (``"A/AT"``, ``"AT/A"``, ``"G/GTT"``).
         counted_allele: Allele whose copies are counted (role-specific: the
-            effect allele for observed terms, the ALT allele for predictors).
+            effect allele for observed terms, the ALT allele for predictors). May
+            be a single base or a multi-character indel allele.
         other_allele: The complementary allele of the biallelic pair. Always
             required (browser-safe scoring depends on it).
         allow_ambiguous: If False, palindromic loci (A/T, C/G) return ``None``
@@ -207,13 +251,13 @@ def count_allele(
         ``0.0`` / ``1.0`` / ``2.0`` copies of ``counted_allele``, or ``None`` if
         the genotype is missing/invalid or cannot be resolved against the pair.
     """
-    alleles = _parse_snp_genotype(genotype)
+    alleles = _parse_genotype(genotype)
     if alleles is None:
         return None
 
     counted = str(counted_allele).strip().upper()
     other = str(other_allele).strip().upper()
-    if counted not in _VALID_BASES or other not in _VALID_BASES:
+    if not _is_valid_allele(counted) or not _is_valid_allele(other):
         return None
     if counted == other:
         # Degenerate pair: not a valid biallelic locus. (_is_ambiguous_snp does
@@ -254,15 +298,21 @@ def render_genotype_string(
     count a role-specific allele from it via :func:`count_allele`, which re-orients
     per role. Rendering an already-oriented dosage would double-orient.
 
+    Single-base SNP alleles render as a concatenated two-character string
+    (``"AG"``); multi-character indel alleles render **delimited** (``"A/AT"``) so
+    :func:`_parse_genotype` can split them back into whole allele tokens.
+
     Args:
-        ref_allele: Reference allele (single A/C/G/T base).
-        alt_allele: Alternate allele (single A/C/G/T base).
+        ref_allele: Reference allele — a single A/C/G/T base or a multi-character
+            indel allele (``"AT"``).
+        alt_allele: Alternate allele — single base or multi-character indel allele.
         dosage: ALT-allele count; only an integer 0/1/2 (within ``tol``) renders.
         tol: Absolute tolerance for treating ``dosage`` as an integer.
 
     Returns:
         The genotype string, or ``None`` when the dosage is missing / non-integer /
-        out of ``[0, 2]`` or the alleles are not a clean, distinct A/C/G/T pair.
+        out of ``[0, 2]`` or the alleles are not a clean, distinct pair of A/C/G/T
+        allele tokens.
     """
     if dosage is None:
         return None
@@ -278,11 +328,16 @@ def render_genotype_string(
 
     ref = str(ref_allele).strip().upper()
     alt = str(alt_allele).strip().upper()
-    if ref not in _VALID_BASES or alt not in _VALID_BASES or ref == alt:
+    if not _is_valid_allele(ref) or not _is_valid_allele(alt) or ref == alt:
         return None
 
     n_alt = int(n_alt)
-    return ref * (2 - n_alt) + alt * n_alt
+    # Single-base SNP: concatenated form, byte-identical to the legacy renderer.
+    if len(ref) == 1 and len(alt) == 1:
+        return ref * (2 - n_alt) + alt * n_alt
+    # Multi-character (indel / MNV) alleles: delimit so _parse_genotype can split
+    # them back into whole allele tokens ("A/AT" for dosage 1, "AT/AT" for 2).
+    return "/".join([ref] * (2 - n_alt) + [alt] * n_alt)
 
 
 def detect_genome_build(input_data: Union[str, Path, "SNPs"]) -> Optional[int]:
@@ -520,6 +575,11 @@ class RawUserGenotypeCollection:
     def resolve(self, identity: VariantIdentity) -> GenotypeResolution:
         """Resolve one variant's user genotype across all of its identifiers.
 
+        A record whose ``raw_id`` exactly matches the identity's ``variant_id`` or
+        canonical ``feature_id`` takes precedence, so co-predictors sharing a
+        multiallelic ``chr:pos`` each resolve to their own ALT instead of
+        colliding in the disagreement guard.
+
         Args:
             identity: The variant to look up; its ``accepted_ids`` and chr:pos
                 are all tried.
@@ -560,6 +620,24 @@ class RawUserGenotypeCollection:
                 matched[id(record)] = record
 
         records = list(matched.values())
+
+        # Exact-id-first: a record whose raw_id equals this identity's variant_id
+        # or canonical feature_id pins the exact per-ALT call. At a multiallelic
+        # locus the string-replay oracle keys each co-predictor's record by its
+        # own variant_id (e.g. "1:100:A:G" vs "1:100:A:T"), but the id-classifier
+        # collapses those to the shared "1:100" chr:pos sweep, which then trips the
+        # genotype-disagreement guard. Restricting to the exact-id record routes
+        # each co-predictor to its own ALT. Only overrides when such a match
+        # exists; otherwise the chr:pos sweep stands (byte-identical to before).
+        exact: Dict[int, RawUserGenotype] = {}
+        for wanted in (identity.variant_id, identity.feature_id):
+            if not wanted:
+                continue
+            for record in self._by_rsid.get(str(wanted).lower(), []):
+                exact[id(record)] = record
+        if exact:
+            records = list(exact.values())
+
         if not records:
             return GenotypeResolution(None, "not_found", None)
 
@@ -568,7 +646,7 @@ class RawUserGenotypeCollection:
         # the raw string so two distinct unparseable calls still conflict.
         genotype_groups = set()
         for record in records:
-            parsed = _parse_snp_genotype(record.genotype)
+            parsed = _parse_genotype(record.genotype)
             if parsed is not None:
                 genotype_groups.add(tuple(sorted(parsed)))
             else:

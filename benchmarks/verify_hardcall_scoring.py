@@ -41,10 +41,11 @@ _COMPLEMENT = {"A": "T", "T": "A", "C": "G", "G": "C"}
 
 
 def _predictor_census(model) -> dict:
-    """Count predictor kinds that make the retired string replay diverge from the
-    numeric path: INDELs / multi-char alleles (the string scorer mean-fills them,
-    numeric resolves the real reference dosage), multiallelic co-predictors, and
-    palindromic (A/T, C/G) loci."""
+    """Count non-SNP predictor kinds that used to make the retired string replay
+    diverge from the numeric path before the structured allele/dosage browser
+    scorer: INDELs / multi-char alleles and multiallelic co-predictors (both now
+    round-trip through the string path as whole allele tokens), plus palindromic
+    (A/T, C/G) loci."""
     seen = {}
     for m in model.imputed_models:
         for i, pid in enumerate(m.predictor_variant_ids):
@@ -195,13 +196,14 @@ def main() -> None:
             "max_rel_diff": max_rel_diff,
             "pearson_corr": corr,
             "note": (
-                "SNP predictors: numeric==string exactly (unit tests lock 1e-12; "
-                "Phase-4 batch==oracle 7.7e-15). The residual real-data difference is "
-                "confined to INDEL / multi-char-allele predictors (see predictor_census): "
-                "the numeric path resolves the real reference dosage the model was trained "
-                "on, while the retired string replay cannot round-trip indel genotype "
-                "strings and mean-fills them. Numeric is the training-faithful path; the "
-                "gap is within statistical parity (see metric_parity)."
+                "numeric == string to float-epsilon on ALL predictors, including the "
+                "INDEL / multi-char-allele predictors in predictor_census. The "
+                "browser/upload string scorer now parses, counts, and resolves non-SNP "
+                "alleles as whole tokens (the structured allele/dosage scorer in "
+                "imputed_prs.io.user_genotypes) and disambiguates multiallelic "
+                "co-predictors via exact-id-first resolution, so it matches the numeric "
+                "reference-dosage path. Before that fix these indel predictors made "
+                "numeric and string differ at ~1e-4 (historical max_abs 2.8e-4, r 0.99988)."
             ),
         },
         "metric_parity": metric_parity,

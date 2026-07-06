@@ -12,34 +12,26 @@ the ``PRSPredictor`` / ``ProjectionPredictor`` constructor default).
 The **string-replay** path (render genotype strings and replay the browser scorer
 with ``raw_genotypes``, i.e. *literally* the upload path) is retained on the
 evaluators as ``_predicted_prs_via_strings`` but is no longer on the metric path.
-On hard-called integer biallelic data the numeric path is byte-identical to it —
-locked by the golden test in ``tests/test_round_trip.py`` — so it now serves only
-as the browser-faithful oracle for those tests. Before P5 the hard-called metric
-path replayed strings per sample (O(samples × variants) pure-Python), which
-dominated reference-CV wall-clock; routing it through the numeric scorer removes
-that cost while keeping metrics within statistical parity.
+On hard-called integer data the numeric path is byte-identical to it — including
+**indel / multi-character alleles** and **multiallelic co-predictor loci**, now
+that the browser/upload primitives parse, count, and resolve non-SNP alleles as
+whole tokens (the structured allele/dosage scorer in
+:mod:`imputed_prs.io.user_genotypes`; parity locked by ``TestIndelBrowserParity``
+and ``TestMultiallelicCoPredictorParity`` in ``tests/test_round_trip.py``). So the
+string replay now serves only as the browser-faithful oracle for those tests.
+Before P5 the hard-called metric path replayed strings per sample
+(O(samples × variants) pure-Python), which dominated reference-CV wall-clock;
+routing it through the numeric scorer removes that cost while keeping metrics
+byte-identical.
 
-Two documented, benign deviations from the retired string path. In both, the
-numeric path resolves the reference dosage the model was **trained** on (by
-``chr:pos`` + alleles, via :class:`ReferenceAlleleResolver`), so it is the
-training-faithful path; the divergence is confined to the retired string replay
-and is within statistical parity:
+One documented, benign deviation from the retired string path:
 
 - **P1.8 observed fallback.** :func:`observed_component_numeric` does not recover
   an unresolvable/no-call observed variant from its trained fallback model (a
   loud :class:`UserWarning` fires if it ever could) — see its docstring. Not
-  exercised on fully-called panels.
-- **Non-SNP predictors (indels / multiallelic loci).** The string replay renders
-  and re-parses per-sample **genotype strings**, which faithfully carry only
-  biallelic SNP calls; it therefore mean-fills INDEL / multi-character-allele
-  predictors, and conflates a multiallelic locus whose distinct ALT alleles are
-  co-predictors (``chr:pos`` duplicate-conflict → mean-fill). The numeric path
-  resolves each to the real reference dosage. On dense hard-called 1000G
-  (``SNV_INDEL_SV``) a small number of indel predictors make the numeric and
-  string PRS differ at the ~1e-4 level (Pearson r ≈ 0.9999; R²/calibration
-  unchanged within statistical parity — see ``benchmarks/results/predict-hardcall``);
-  the numeric result is the more faithful one. Pure-SNP scores are exact
-  (``tests/test_round_trip.py`` locks numeric==string at ``atol=1e-12``).
+  exercised on fully-called panels. The numeric path resolves the reference dosage
+  the model was **trained** on (by ``chr:pos`` + alleles, via
+  :class:`ReferenceAlleleResolver`), so it is the training-faithful path.
 """
 
 import warnings

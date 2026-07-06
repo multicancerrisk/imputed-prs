@@ -11,6 +11,7 @@ import pytest
 from imputed_prs.core.exceptions import DataLoadError, ValidationError
 from imputed_prs.core.types import VariantIdentity
 from imputed_prs.io.user_genotypes import (
+    _parse_genotype,
     count_allele,
     detect_genome_build,
     genotype_to_dosage,
@@ -18,6 +19,7 @@ from imputed_prs.io.user_genotypes import (
     load_user_genotype_strings,
     load_user_genotypes,
     render_genotype_string,
+    resolve_counted_dosage,
 )
 
 
@@ -515,7 +517,8 @@ class TestCountAllele:
         assert count_allele("AG", "-", "G", allow_ambiguous=False, allow_strand_flip=False) is None
         # Empty string is a substring of "ACGT"; must still be rejected.
         assert count_allele("AG", "", "G", allow_ambiguous=False, allow_strand_flip=False) is None
-        # Multi-base allele argument must be rejected.
+        # A multi-char counted allele is now valid, but the SNP genotype "AG" parses
+        # to single bases [A, G] which are not a subset of {"AG", "G"} -> unresolved.
         assert count_allele("AG", "AG", "G", allow_ambiguous=False, allow_strand_flip=False) is None
 
     def test_numeric_cell_unresolved(self):
@@ -562,7 +565,83 @@ class TestRenderGenotypeString:
         assert render_genotype_string("A", "A", 1) is None  # degenerate pair
         assert render_genotype_string("A", "I", 1) is None  # indel/non-base
         assert render_genotype_string("", "G", 0) is None
-        assert render_genotype_string("AG", "C", 1) is None  # multi-base allele
+        assert render_genotype_string("AT", "AT", 1) is None  # degenerate multi-char pair
+        assert render_genotype_string("A", "AN", 1) is None  # 'N' is not a valid base
+
+
+class TestMultiCharAlleles:
+    """Arbitrary-length indel / multi-character alleles are first-class: the
+    upload primitives parse, count, and render them exactly as the numeric
+    resolver does (structured allele/dosage browser scorer), while SNP behavior
+    stays byte-for-byte identical."""
+
+    def test_parse_delimited_multichar(self):
+        assert _parse_genotype("A/AT") == ["A", "AT"]
+        assert _parse_genotype("AT/A") == ["AT", "A"]
+        assert _parse_genotype("G/GTT") == ["G", "GTT"]
+        assert _parse_genotype("AT|A") == ["AT", "A"]  # phased separator too
+        assert _parse_genotype("AT/AT") == ["AT", "AT"]
+
+    def test_parse_snp_byte_parity(self):
+        # Concatenated and delimited SNP forms are unchanged.
+        assert _parse_genotype("AG") == ["A", "G"]
+        assert _parse_genotype("A/G") == ["A", "G"]
+        assert _parse_genotype("A|G") == ["A", "G"]
+        assert _parse_genotype("GA") == ["G", "A"]
+
+    def test_parse_rejects_ambiguous_and_symbolic(self):
+        for bad in ["AAT", "A/G/T", "II", "DD", "DI", "A/", "/G", "A/N", "--", "N/A", ""]:
+            assert _parse_genotype(bad) is None, bad
+
+    def test_count_indel_both_orientations(self):
+        k = dict(allow_ambiguous=True, allow_strand_flip=True)
+        # counted = ALT (insertion allele "AT"): A/A, A/AT, AT/AT -> 0, 1, 2.
+        assert count_allele("A/A", "AT", "A", **k) == 0.0
+        assert count_allele("A/AT", "AT", "A", **k) == 1.0
+        assert count_allele("AT/AT", "AT", "A", **k) == 2.0
+        # counted = REF ("A"): symmetric -> 2, 1, 0.
+        assert count_allele("A/A", "A", "AT", **k) == 2.0
+        assert count_allele("A/AT", "A", "AT", **k) == 1.0
+        assert count_allele("AT/AT", "A", "AT", **k) == 0.0
+
+    def test_count_deletion_and_longer_alleles(self):
+        k = dict(allow_ambiguous=True, allow_strand_flip=True)
+        # Deletion: REF "AT", ALT "A" (the shorter allele is the counted ALT).
+        assert count_allele("AT/A", "A", "AT", **k) == 1.0
+        assert count_allele("A/A", "A", "AT", **k) == 2.0
+        assert count_allele("G/GTT", "GTT", "G", **k) == 1.0
+        assert count_allele("GTT/GTT", "GTT", "G", **k) == 2.0
+
+    def test_count_indel_off_pair_and_invalid_are_unresolved(self):
+        k = dict(allow_ambiguous=True, allow_strand_flip=True)
+        # A foreign allele (C) at an A/AT locus -> unresolved, never mis-scored.
+        assert count_allele("A/C", "AT", "A", **k) is None
+        # Symbolic / invalid allele arguments stay rejected.
+        assert count_allele("A/AT", "AT", "I", **k) is None
+        assert count_allele("A/AT", "-", "A", **k) is None
+
+    def test_count_indel_strand_flip_is_noop(self):
+        # _complement leaves multi-char tokens unchanged, so a flip cannot
+        # spuriously resolve a foreign indel (mirrors the numeric resolver).
+        assert count_allele("A/AT", "AT", "A", allow_ambiguous=True, allow_strand_flip=True) == 1.0
+        assert count_allele("A/AT", "AT", "A", allow_ambiguous=True, allow_strand_flip=False) == 1.0
+
+    def test_render_indel_delimited(self):
+        assert render_genotype_string("A", "AT", 0) == "A/A"
+        assert render_genotype_string("A", "AT", 1) == "A/AT"
+        assert render_genotype_string("A", "AT", 2) == "AT/AT"
+        assert render_genotype_string("AT", "A", 1) == "AT/A"  # deletion
+        # SNPs stay concatenated (no delimiter) for byte-parity.
+        assert render_genotype_string("A", "G", 1) == "AG"
+
+    def test_render_then_count_round_trip_indels(self):
+        k = dict(allow_ambiguous=True, allow_strand_flip=True)
+        for ref, alt in [("A", "AT"), ("AT", "A"), ("G", "GTT"), ("CT", "C")]:
+            for d in (0, 1, 2):
+                geno = render_genotype_string(ref, alt, d)
+                assert geno is not None, (ref, alt, d)
+                assert count_allele(geno, alt, ref, **k) == float(d)
+                assert count_allele(geno, ref, alt, **k) == float(2 - d)
 
 
 class TestLoadUserGenotypeStrings:
@@ -753,3 +832,54 @@ class TestVariantIdentityResolver:
 
         coll_mt = self._collection([("rs_user", "MT", 50, "AG")])
         assert coll_mt.resolve(_identity(["M:50"], "M", 50)).status == "resolved"
+
+    def test_multiallelic_copredictors_resolve_per_alt(self):
+        # Two ALT alleles of one locus, each rendered as its own per-ALT record
+        # keyed by the model's variant_id (as the string-replay oracle does). Each
+        # co-predictor must resolve to ITS record, not collide in the guard.
+        coll = self._collection([
+            ("1:100:A:G", "1", 100, "GG"),   # A/G row: 2 copies of G
+            ("1:100:A:T", "1", 100, "AA"),   # A/T row: 0 copies of T
+        ])
+        d_g = resolve_counted_dosage(
+            coll, variant_id="1:100:A:G", chromosome="1", position=100,
+            counted_allele="G", other_allele="A",
+            allow_ambiguous=True, allow_strand_flip=True,
+        )
+        d_t = resolve_counted_dosage(
+            coll, variant_id="1:100:A:T", chromosome="1", position=100,
+            counted_allele="T", other_allele="A",
+            allow_ambiguous=True, allow_strand_flip=True,
+        )
+        assert d_g == 2.0
+        assert d_t == 0.0  # was mean-filled (None) before exact-id-first resolution
+
+    def test_multiallelic_indel_and_snp_share_locus(self):
+        # An indel ALT and a SNP ALT at the same position both resolve per-ALT.
+        coll = self._collection([
+            ("1:100:A:AT", "1", 100, "A/AT"),  # het for the insertion
+            ("1:100:A:G", "1", 100, "AA"),     # 0 copies of the G SNP
+        ])
+        assert resolve_counted_dosage(
+            coll, variant_id="1:100:A:AT", chromosome="1", position=100,
+            counted_allele="AT", other_allele="A",
+            allow_ambiguous=True, allow_strand_flip=True,
+        ) == 1.0
+        assert resolve_counted_dosage(
+            coll, variant_id="1:100:A:G", chromosome="1", position=100,
+            counted_allele="G", other_allele="A",
+            allow_ambiguous=True, allow_strand_flip=True,
+        ) == 0.0
+
+    def test_exact_id_does_not_mask_genuine_same_id_conflict(self):
+        # Two records with the SAME variant_id but conflicting genotypes still
+        # exact-match both -> duplicate_conflict (never an arbitrary pick).
+        coll = self._collection([
+            ("1:100:A:G", "1", 100, "AG"),
+            ("1:100:A:G", "1", 100, "GG"),
+        ])
+        assert resolve_counted_dosage(
+            coll, variant_id="1:100:A:G", chromosome="1", position=100,
+            counted_allele="G", other_allele="A",
+            allow_ambiguous=True, allow_strand_flip=True,
+        ) is None

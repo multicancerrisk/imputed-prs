@@ -780,6 +780,22 @@ _NOCALL_OBSERVED = [
 _P_DIRECT = ("1:100:A:G", "1", 100, "G", "A", 0.3)
 _P_FLIP = ("1:200:C:T", "1", 200, "C", "T", 0.4)
 
+# An indel-bearing hard-called panel: an insertion predictor scored directly
+# (counted == ALT), a deletion predictor scored flipped (counted == REF), a SNP
+# predictor, and an insertion observed term. Exercises arbitrary-length alleles
+# end-to-end through the browser (string-replay) path so it must match the numeric
+# evaluator on indels, both orientations, for observed terms and predictors.
+_INDEL_RECORDS = [
+    ("1", 100, "A", "AT", [0.0, 1.0, 2.0, 1.0, 0.0]),  # insertion, direct predictor
+    ("1", 200, "AT", "A", [2.0, 1.0, 0.0, 1.0, 2.0]),  # deletion, flipped predictor
+    ("1", 300, "C", "T", [0.0, 2.0, 1.0, 0.0, 1.0]),   # SNP predictor
+    ("1", 400, "G", "GA", [1.0, 0.0, 2.0, 1.0, 0.0]),  # insertion, observed term
+]
+_INDEL_OBSERVED = [VariantInfo("1:400:G:GA", "1", 400, "GA", "G", 0.6, fallback=None)]
+_P_INS = ("1:100:A:AT", "1", 100, "AT", "A", 0.3)  # counted == ALT -> direct
+_P_DEL = ("1:200:AT:A", "1", 200, "AT", "A", 0.4)  # counted == REF (AT) -> flipped
+_P_SNP = ("1:300:C:T", "1", 300, "T", "C", 0.5)    # single-base SNP predictor
+
 
 class TestHardCalledNoCallParity:
     """On a hard-called panel with no-call (NaN) samples, the numeric metric path
@@ -864,15 +880,13 @@ class TestP18FallbackGuard:
         assert not [w for w in caught if "P1.8" in str(w.message)]
 
 
-class TestMultiallelicCoPredictorDeviation:
-    """P5 deviation: when two ALT alleles of one multiallelic locus are both used
-    as co-predictors for the same target, the retired string replay conflates the
-    locus (chr:pos duplicate-conflict -> mean-fill) while the numeric path
-    resolves each allele into its own column, exactly as the model was trained.
-    The numeric result is the training-faithful one; routing hard-called panels
-    through it is an intended improvement, not a regression. (Biallelic loci and
-    multiallelic loci with a single used allele agree exactly -- see the no-call
-    and golden parity tests.)"""
+class TestMultiallelicCoPredictorParity:
+    """When two ALT alleles of one multiallelic locus are both used as
+    co-predictors for the same target, the browser (string-replay) scorer resolves
+    each allele into its own per-ALT column via exact-id-first resolution -- exactly
+    as the numeric path (and the model's training) does. Previously the string path
+    conflated the locus into a chr:pos duplicate-conflict and mean-filled it; the
+    structured allele/dosage browser scorer now makes both paths agree."""
 
     _RECORDS = [
         ("1", 100, "A", "G", [0.0, 1.0, 2.0, 0.0]),
@@ -903,10 +917,62 @@ class TestMultiallelicCoPredictorDeviation:
             ev._predicted_prs_numeric(panel, _force_batch=True), oracle, rtol=0, atol=1e-9
         )
 
-    def test_documents_divergence_from_retired_string_path(self):
-        """Executable documentation of the intended behavior change: the numeric
-        path and the retired string replay differ at multiallelic co-predictors."""
+    def test_string_replay_matches_numeric_per_alt(self):
+        """The browser string replay now equals the numeric path at a multiallelic
+        locus: each co-predictor resolves to its own ALT instead of mean-filling."""
         ev, panel = self._ev()
         numeric = ev._predicted_prs_numeric(panel)
         string = ev._predicted_prs_via_strings(panel)
-        assert np.max(np.abs(numeric - string)) > 0.1
+        np.testing.assert_allclose(numeric, string, rtol=0, atol=1e-9)
+
+
+class TestIndelBrowserParity:
+    """The browser/upload (string-replay) scorer and the numeric evaluator agree on
+    arbitrary-length indel alleles -- directly (counted == ALT) and flipped
+    (counted == REF), for observed terms and predictors, both products. This is the
+    structured allele/dosage browser scorer: parity holds because both implement
+    correct allele-aware dosage semantics, not because either mean-fills indels.
+    The dispatch/oracle match the string oracle exactly; the vectorized batch
+    agrees within SpMM-reordering tolerance."""
+
+    def test_imputation_indel_parity(self):
+        panel = _panel(_INDEL_RECORDS)
+        model = _imputation_model(
+            _INDEL_OBSERVED,
+            [
+                _imputed_model(
+                    "1:500:A:G", "1", 500, 1.5, 0.1,
+                    [_P_INS, _P_DEL, _P_SNP], [0.5, -0.3, 0.25],
+                )
+            ],
+        )
+        ev = ImputationEvaluator(model, verbose=0)
+        string = ev._predicted_prs_via_strings(panel)
+        # dispatch (size-gated -> oracle for one target) and the oracle are exact.
+        np.testing.assert_allclose(ev._compute_imputed_prs_batch(panel), string, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(
+            ev._predicted_prs_numeric(panel, _force_batch=False), string, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            ev._predicted_prs_numeric(panel, _force_batch=True), string, rtol=0, atol=1e-9
+        )
+
+    def test_projection_indel_parity(self):
+        panel = _panel(_INDEL_RECORDS)
+        model = _projection_model(
+            _INDEL_OBSERVED,
+            [
+                _region_model(
+                    "r1", "1", [0.8, -0.4], [_P_INS, _P_DEL, _P_SNP], [0.5, -0.3, 0.25], 0.1
+                )
+            ],
+        )
+        ev = ProjectionEvaluator(model, verbose=0)
+        string = ev._predicted_prs_via_strings(panel)
+        np.testing.assert_allclose(ev._compute_projected_prs_batch(panel), string, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(
+            ev._predicted_prs_numeric(panel, _force_batch=False), string, rtol=0, atol=1e-12
+        )
+        np.testing.assert_allclose(
+            ev._predicted_prs_numeric(panel, _force_batch=True), string, rtol=0, atol=1e-9
+        )
