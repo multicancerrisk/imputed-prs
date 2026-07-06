@@ -174,6 +174,80 @@ class StreamingFitResult:
     # Observed-variant fallback models keyed by PRS variant_id (see StreamPlan).
     fallback_models: Dict[str, ImputedVariantModel] = field(default_factory=dict)
 
+    @classmethod
+    def reduce(cls, partials: Sequence["_ImputeChromPartial"], n: int) -> "StreamingFitResult":
+        """Order-independent merge of per-chromosome partials (Phase 7 fan-out).
+
+        Chromosome shards are key-disjoint (a target belongs to exactly one chromosome),
+        so ``models``/``fallback_models``/``failures`` merge by dict-union (asserted
+        disjoint — a spuriously shared id is loud, not silent). ``s_true``/``s_cv`` are
+        additive over units; summed in canonical ``_chrom_sort_key`` order they are
+        bit-identical to the pre-Phase-7 in-place running sum (same order, same terms).
+        """
+        ordered = sorted(partials, key=lambda p: _chrom_sort_key(p.chrom))
+        models: Dict[str, ImputedVariantModel] = {}
+        fallback_models: Dict[str, ImputedVariantModel] = {}
+        failures: Dict[str, str] = {}
+        s_true = np.zeros(n, dtype=np.float64)
+        s_cv = np.zeros(n, dtype=np.float64)
+        n_io = 0
+        for p in ordered:
+            assert models.keys().isdisjoint(p.models), (
+                "chromosome shards must have disjoint target ids"
+            )
+            models.update(p.models)
+            fallback_models.update(p.fallback_models)
+            failures.update(p.failures)
+            s_true += p.s_true
+            s_cv += p.s_cv
+            n_io += p.n_intercept_only
+        return cls(
+            models=models,
+            s_true=s_true,
+            s_cv=s_cv,
+            n_trained=len(models),
+            n_intercept_only=n_io,
+            n_failed=len(failures),
+            failures=failures,
+            fallback_models=fallback_models,
+        )
+
+
+@dataclass
+class _ImputeChromPartial:
+    """One chromosome's contribution to a streaming fit (Phase 7 shard unit).
+
+    ``s_true``/``s_cv`` are this chromosome's terms only (zero elsewhere); the parent
+    sums them across shards. ``cv_collector`` is populated only in reference-CV mode
+    (``{fold_k -> {prs_id -> model}}``); ``None`` for a plain fit.
+    """
+
+    chrom: str
+    models: Dict[str, ImputedVariantModel]
+    fallback_models: Dict[str, ImputedVariantModel]
+    failures: Dict[str, str]
+    s_true: np.ndarray
+    s_cv: np.ndarray
+    n_intercept_only: int
+    cv_collector: Optional[Dict[int, Dict[str, ImputedVariantModel]]] = None
+
+
+def reduce_cv_collectors(partials: Sequence[object], n_folds: int):
+    """Merge per-chromosome reference-CV collectors → ``(fold_models, failures)``.
+
+    Shared by the imputation and projection reference-CV fan-out. Per-outer-fold model
+    dicts are key-disjoint across chromosomes, so the merge is a per-fold dict-union in
+    canonical chromosome order; returns ``{k: list(models)}`` matching the serial path.
+    """
+    ordered = sorted(partials, key=lambda p: _chrom_sort_key(p.chrom))
+    merged = {k: {} for k in range(n_folds)}
+    failures: Dict[str, str] = {}
+    for p in ordered:
+        for k in range(n_folds):
+            merged[k].update(p.cv_collector[k])
+        failures.update(p.failures)
+    return {k: list(merged[k].values()) for k in range(n_folds)}, failures
+
 
 # ---------------------------------------------------------------------------
 # Incrementally-maintained band Gram over buffered chip (predictor) columns.
@@ -640,29 +714,21 @@ class StreamingImputationFitter:
         # non-None the fitter is in leave-one-fold-out reference-CV mode (see _fit_batch).
         self._cv_collector: Optional[Dict[int, Dict[str, ImputedVariantModel]]] = None
 
-    def run(self, source) -> StreamingFitResult:
-        models: Dict[str, ImputedVariantModel] = {}
-        fallback_models: Dict[str, ImputedVariantModel] = {}
-        failures: Dict[str, str] = {}
-        n_intercept_only = 0
+    def run(self, source, *, n_workers: int = 1) -> StreamingFitResult:
+        """Stream the panel and fit every unit, optionally sharding by chromosome.
 
-        chroms = self._stream_chromosomes()
-        for chrom in chroms:
-            n_io = self._run_chromosome(
-                source, chrom, models, fallback_models, failures
-            )
-            n_intercept_only += n_io
+        ``n_workers > 1`` fans the per-chromosome accumulation + local solves across a
+        process pool (Phase 7); the per-chromosome partials are reduced in canonical
+        order. ``n_workers=1`` (default) runs a serial in-process map — bit-identical to
+        the pre-Phase-7 loop. GPU keeps a single process (``fan_out_chromosomes`` clamps).
+        """
+        from imputed_prs.compute.parallel import fan_out_chromosomes
 
-        return StreamingFitResult(
-            models=models,
-            s_true=self.s_true,
-            s_cv=self.s_cv,
-            n_trained=len(models),
-            n_intercept_only=n_intercept_only,
-            n_failed=len(failures),
-            failures=failures,
-            fallback_models=fallback_models,
+        device = getattr(self.backend, "device_name", "cpu")
+        partials = fan_out_chromosomes(
+            self, source, self._stream_chromosomes(), n_workers=n_workers, device=device
         )
+        return StreamingFitResult.reduce(partials, self.folds.n)
 
     def _stream_chromosomes(self) -> List[str]:
         chset = set()
@@ -674,11 +740,28 @@ class StreamingImputationFitter:
         # Preserve a stable, human order (1..22 then others).
         return sorted(chset, key=lambda c: _chrom_sort_key(c))
 
-    def _run_chromosome(
-        self, source, chrom, models, fallback_models, failures
-    ) -> int:
+    def _run_one_chromosome(self, source, chrom) -> "_ImputeChromPartial":
+        """Stream one chromosome and return its partial (Phase 7 shard unit).
+
+        All accumulators are **local** (the models/failure dicts, the two calibration
+        vectors, and — in reference-CV mode — the per-fold collector), so this is a pure
+        function of ``(self.plan, self.folds, source, chrom)`` with no shared-``self``
+        mutation: safe to run in a worker process and reduce in the parent. The fresh
+        per-chromosome band buffer + within-chromosome windows make it bit-identical
+        regardless of sharding. ``self._cv_collector`` is read only as a **mode marker**.
+        """
         plan = self.plan
         buf = self.backend.make_buffer(self.folds.n, self.folds)
+        models: Dict[str, ImputedVariantModel] = {}
+        fallback_models: Dict[str, ImputedVariantModel] = {}
+        failures: Dict[str, str] = {}
+        s_true = np.zeros(self.folds.n, dtype=np.float64)
+        s_cv = np.zeros(self.folds.n, dtype=np.float64)
+        cv_collector = (
+            {k: {} for k in range(self.folds.n_folds)}
+            if self._cv_collector is not None
+            else None
+        )
         open_targets: List[_OpenTarget] = []
         n_intercept_only = 0
         frontier = -1
@@ -701,7 +784,8 @@ class StreamingImputationFitter:
                 # Fit every co-windowed target that closes together as one batch, so
                 # their cross-products / OOF collapse into banded GEMMs (_fit_chunk).
                 n_intercept_only += self._fit_batch(
-                    ready, buf, models, fallback_models, failures, fb_failures
+                    ready, buf, models, fallback_models, failures, fb_failures,
+                    s_true, s_cv, cv_collector,
                 )
 
         region = _region_for(source, chrom)
@@ -729,8 +813,8 @@ class StreamingImputationFitter:
                     chip_af.append(af)
                 if obs is not None:  # observed PRS calibration term (effect-oriented)
                     x_eff, _, _ = _prepare_column(raw, flip=obs.effect_flip, folds=self.folds)
-                    self.s_true += obs.beta * x_eff
-                    self.s_cv += obs.beta * x_eff
+                    s_true += obs.beta * x_eff
+                    s_cv += obs.beta * x_eff
                 if is_target:
                     spec = plan.targets[sid]
                     col_perm, af, _ = _prepare_column(
@@ -755,9 +839,21 @@ class StreamingImputationFitter:
 
         close_ready(force=True)
         buf.clear()
-        return n_intercept_only
+        return _ImputeChromPartial(
+            chrom=str(chrom),
+            models=models,
+            fallback_models=fallback_models,
+            failures=failures,
+            s_true=s_true,
+            s_cv=s_cv,
+            n_intercept_only=n_intercept_only,
+            cv_collector=cv_collector,
+        )
 
-    def _fit_batch(self, batch, buf, models, fallback_models, failures, fb_failures) -> int:
+    def _fit_batch(
+        self, batch, buf, models, fallback_models, failures, fb_failures,
+        s_true, s_cv, cv_collector,
+    ) -> int:
         """Build a fit job per closing target and hand them to the shared batched kernel.
 
         Predictor selection (``chrom_index.window``) is buffer-independent, so it is
@@ -769,7 +865,7 @@ class StreamingImputationFitter:
         variant fallbacks are skipped entirely (the evaluator scores observed terms
         directly, so they are never trained during CV).
         """
-        cv = self._cv_collector is not None
+        cv = cv_collector is not None
         jobs: List[_FitJob] = []
         for tgt in batch:
             spec = tgt.spec
@@ -786,7 +882,7 @@ class StreamingImputationFitter:
                 fmap[spec.prs_variant_id] = f"{type(exc).__name__}: {exc}"
                 continue
             store = (
-                self._cv_storer(spec, tgt.af)
+                self._cv_storer(spec, tgt.af, cv_collector)
                 if cv
                 else self._impute_storer(spec, tgt.af, dest)
             )
@@ -804,10 +900,10 @@ class StreamingImputationFitter:
             return 0
         return self.backend.run_fit_batch(
             jobs, buf, self.folds, self.plan.alpha, self.plan.l1_ratio,
-            self.plan.cv_folds, self.s_true, self.s_cv, self._batch_cap,
+            self.plan.cv_folds, s_true, s_cv, self._batch_cap,
         )
 
-    def run_reference_cv(self, source, outer_folds: "GlobalFolds"):
+    def run_reference_cv(self, source, outer_folds: "GlobalFolds", *, n_workers: int = 1):
         """Single-pass leave-one-fold-out reference CV over the panel.
 
         Streams the panel **once** with the buffer's folds set to ``outer_folds`` (the
@@ -815,6 +911,8 @@ class StreamingImputationFitter:
         per-fold slab; every closing target is fit for *all* ``K`` training folds by the
         additive subtraction ``S_full − S_fold(k)`` (:func:`_run_cv_chunk`). Replaces the
         ``k`` independent refit passes of ``ImputationEvaluator.cross_validate``.
+        ``n_workers > 1`` shards that single pass by chromosome across processes (still
+        one pass total — the additive subtraction stays within each shard).
 
         Returns ``(fold_models, failures)`` where ``fold_models[k]`` is the list of
         ``ImputedVariantModel`` trained on all samples except outer fold ``k``.
@@ -824,25 +922,24 @@ class StreamingImputationFitter:
         device tensors that :func:`fit_reference_folds` cannot consume — device CV is a
         Phase-3 follow-up).
         """
+        from imputed_prs.compute.parallel import fan_out_chromosomes
+
         if getattr(self.backend, "device_name", "cpu") != "cpu":
             from imputed_prs.compute.device import get_backend
 
             self.backend = get_backend("cpu")
         self.folds = outer_folds
-        self.s_true = np.zeros(self.folds.n, dtype=np.float64)
-        self.s_cv = np.zeros(self.folds.n, dtype=np.float64)
         self._batch_cap = max(
             16, min(4096, (256 * 1024 * 1024) // (max(self.folds.n, 1) * 8))
         )
-        K = outer_folds.n_folds
-        self._cv_collector = {k: {} for k in range(K)}
-        failures: Dict[str, str] = {}
+        # Marker only (non-None ⇒ CV mode): the real per-fold collector is allocated
+        # per chromosome inside _run_one_chromosome and returned in each partial.
+        self._cv_collector = {}
         try:
-            for chrom in self._stream_chromosomes():
-                # models/fallback dicts are unused in CV mode (targets route to the
-                # CV collector; fallbacks are skipped in _fit_batch).
-                self._run_chromosome(source, chrom, {}, {}, failures)
-            fold_models = {k: list(self._cv_collector[k].values()) for k in range(K)}
+            partials = fan_out_chromosomes(
+                self, source, self._stream_chromosomes(), n_workers=n_workers, device="cpu"
+            )
+            fold_models, failures = reduce_cv_collectors(partials, outer_folds.n_folds)
         finally:
             self._cv_collector = None
         return fold_models, failures
@@ -852,16 +949,17 @@ class StreamingImputationFitter:
             dest[spec.prs_variant_id] = self._to_model(spec, af, result, pred_idx, pred_af)
         return store
 
-    def _cv_storer(self, spec, af):
-        """Store the K per-outer-fold models for one target into the CV collector.
+    def _cv_storer(self, spec, af, cv_collector):
+        """Store the K per-outer-fold models for one target into ``cv_collector``.
 
         ``af`` is the target's full-panel effect-allele frequency, used only for the
         cosmetic ``allele_frequency``/``residual_variance`` fields (not on the held-out
         scoring path); the predictors carry per-fold training AFs from ``pred_af_list``.
+        ``cv_collector`` is the chromosome-local ``{fold_k -> {prs_id -> model}}`` map.
         """
         def store(fold_results, pred_idx, pred_af_list):
             for k, res in enumerate(fold_results):
-                self._cv_collector[k][spec.prs_variant_id] = self._to_model(
+                cv_collector[k][spec.prs_variant_id] = self._to_model(
                     spec, af, res, pred_idx, pred_af_list[k]
                 )
         return store
