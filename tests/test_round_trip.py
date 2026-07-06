@@ -14,13 +14,20 @@ Two guarantees are locked here:
    numeric path can run.
 """
 
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from imputed_prs import LinearImputationPRS, LinearProjectionPRS
 from imputed_prs.core.exceptions import DataLoadError
-from imputed_prs.core.types import GenotypeData
+from imputed_prs.core.types import (
+    GenotypeData,
+    ImputedVariantModel,
+    ProjectionRegionModel,
+    VariantInfo,
+)
 from imputed_prs.evaluation import ImputationEvaluator
 from imputed_prs.evaluation._scoring import is_hard_called
 from imputed_prs.evaluation.projection_evaluator import ProjectionEvaluator
@@ -471,14 +478,39 @@ class TestNumericVsStringGolden:
 
 
 class TestDosageModeDispatch:
-    def test_hardcall_dispatches_to_string_path(
-        self, fitted_imputation_model, integer_genotype_data
+    def test_hardcall_dispatches_to_numeric_path(
+        self, fitted_imputation_model, integer_genotype_data, monkeypatch
     ):
+        """P5: hard-called panels now score through the numeric path, not the
+        per-sample string replay. Proven by making the string path raise: the
+        dispatch must not touch it, and must return the numeric result."""
         ev = ImputationEvaluator(fitted_imputation_model, verbose=0)
         assert is_hard_called(integer_genotype_data.dosage_matrix)
+
+        def _boom(*_a, **_k):
+            raise AssertionError("string replay must not run on the metric path (P5)")
+
+        monkeypatch.setattr(ev, "_predicted_prs_via_strings", _boom)
         np.testing.assert_allclose(
             ev._compute_imputed_prs_batch(integer_genotype_data),
-            ev._predicted_prs_via_strings(integer_genotype_data),
+            ev._predicted_prs_numeric(integer_genotype_data),
+            rtol=0,
+            atol=1e-12,
+        )
+
+    def test_projection_hardcall_dispatches_to_numeric_path(
+        self, fitted_projection_model, integer_genotype_data, monkeypatch
+    ):
+        ev = ProjectionEvaluator(fitted_projection_model, verbose=0)
+        assert is_hard_called(integer_genotype_data.dosage_matrix)
+
+        def _boom(*_a, **_k):
+            raise AssertionError("string replay must not run on the metric path (P5)")
+
+        monkeypatch.setattr(ev, "_predicted_prs_via_strings", _boom)
+        np.testing.assert_allclose(
+            ev._compute_projected_prs_batch(integer_genotype_data),
+            ev._predicted_prs_numeric(integer_genotype_data),
             rtol=0,
             atol=1e-12,
         )
@@ -627,3 +659,254 @@ class TestForcedBatchParity:
             flipped_integer_genotype_data, _force_batch=True
         )
         np.testing.assert_allclose(batch, oracle, rtol=0.0, atol=1e-9)
+
+
+# =============================================================================
+# P5: hard-called panels score through the numeric path (string replay retired
+# from the metric path). The module fixtures above are fully-called biallelic
+# panels; these lock the parity the routing relies on on the two panels the
+# fixtures do not reach — no-call (NaN) samples, and multiallelic loci — using
+# hermetic fitted models that drive the *real* evaluator methods. Observed
+# variants carry NO fallback here so the P1.8 deviation cannot confound the
+# biallelic parity checks (that deviation is exercised in TestP18FallbackGuard).
+# =============================================================================
+
+
+def _imputed_model(
+    vid, chrom, pos, beta, intercept, predictors, coeffs, *, is_intercept_only=False
+):
+    """predictors: list of (pid, chrom, pos, counted, other, af)."""
+    return ImputedVariantModel(
+        variant_id=vid,
+        chromosome=chrom,
+        position=pos,
+        effect_allele="A",
+        other_allele="G",
+        beta=beta,
+        allele_frequency=0.1,
+        imputation_r2=0.5,
+        residual_variance=0.1,
+        intercept=intercept,
+        predictor_variant_ids=[p[0] for p in predictors],
+        coefficients=np.asarray(coeffs, dtype=np.float64),
+        is_intercept_only=is_intercept_only,
+        predictor_chromosomes=[p[1] for p in predictors],
+        predictor_positions=[p[2] for p in predictors],
+        predictor_counted_alleles=[p[3] for p in predictors],
+        predictor_other_alleles=[p[4] for p in predictors],
+        predictor_allele_frequencies=np.asarray(
+            [p[5] for p in predictors], dtype=np.float64
+        ),
+    )
+
+
+def _region_model(rid, chrom, betas, predictors, coeffs, intercept):
+    return ProjectionRegionModel(
+        region_id=rid,
+        chromosome=chrom,
+        start=0,
+        end=10_000,
+        prs_variant_ids=[f"{rid}:prs{i}" for i in range(len(betas))],
+        betas=np.asarray(betas, dtype=np.float64),
+        predictor_variant_ids=[p[0] for p in predictors],
+        coefficients=np.asarray(coeffs, dtype=np.float64),
+        intercept=intercept,
+        cv_mse=0.1,
+        cv_r2=0.5,
+        is_intercept_only=False,
+        mean_prs_contribution=0.0,
+        predictor_allele_frequencies=np.asarray(
+            [p[5] for p in predictors], dtype=np.float64
+        ),
+        predictor_chromosomes=[p[1] for p in predictors],
+        predictor_positions=[p[2] for p in predictors],
+        predictor_counted_alleles=[p[3] for p in predictors],
+        predictor_other_alleles=[p[4] for p in predictors],
+    )
+
+
+def _panel(records):
+    """records: (chrom, pos, ref, alt, dosages) -> hard-called GenotypeData with
+    variant_id 'chrom:pos:ref:alt'. A NaN dosage models a no-call."""
+    vi = pd.DataFrame(
+        [
+            {
+                "variant_id": f"{c}:{p}:{r}:{a}",
+                "chromosome": c,
+                "position": p,
+                "ref_allele": r,
+                "alt_allele": a,
+            }
+            for c, p, r, a, _ in records
+        ]
+    )
+    dm = np.array([d for *_, d in records], dtype=np.float32).T
+    return GenotypeData(
+        dosage_matrix=dm,
+        variant_info=vi,
+        sample_ids=[f"s{i}" for i in range(dm.shape[0])],
+        genome_build="GRCh37",
+        source_file=None,
+    )
+
+
+def _imputation_model(observed, imputed):
+    return LinearImputationPRS._from_components(
+        observed, imputed, None, None, {"genome_build": "GRCh37"}
+    )
+
+
+def _projection_model(observed, regions):
+    m = LinearProjectionPRS()
+    m._is_fitted = True
+    m._observed_variants = observed
+    m._region_models = regions
+    return m
+
+
+# A biallelic hard-called panel with no-calls (NaN) in a direct predictor, a
+# flipped (counted==REF) predictor, and an observed term. Observed variants carry
+# no fallback, so both paths drop no-call observed samples identically.
+_NOCALL_RECORDS = [
+    ("1", 100, "A", "G", [0.0, 1.0, 2.0, np.nan, 1.0, 2.0]),  # p_direct, no-call s3
+    ("1", 200, "C", "T", [0.0, 2.0, 1.0, 2.0, np.nan, 0.0]),  # p_flip (2-dosage), no-call s4
+    ("1", 300, "A", "G", [1.0, 1.0, np.nan, 0.0, 2.0, 1.0]),  # observed obs1, no-call s2
+    ("2", 50, "G", "C", [1.0, 0.0, 2.0, 1.0, 0.0, 2.0]),      # observed obs2
+]
+_NOCALL_OBSERVED = [
+    VariantInfo("1:300:A:G", "1", 300, "G", "A", 0.3, fallback=None),
+    VariantInfo("2:50:G:C", "2", 50, "C", "G", -0.2, fallback=None),
+]
+_P_DIRECT = ("1:100:A:G", "1", 100, "G", "A", 0.3)
+_P_FLIP = ("1:200:C:T", "1", 200, "C", "T", 0.4)
+
+
+class TestHardCalledNoCallParity:
+    """On a hard-called panel with no-call (NaN) samples, the numeric metric path
+    must equal the retired string replay element-wise: both mean-substitute a
+    predictor no-call by ``2*AF`` and drop a fallback-free observed no-call. The
+    dispatch, the per-unit oracle, and the vectorized batch must all agree with
+    the string oracle at ``atol=1e-9``."""
+
+    def test_imputation_no_call_matches_string(self):
+        panel = _panel(_NOCALL_RECORDS)
+        model = _imputation_model(
+            _NOCALL_OBSERVED,
+            [
+                _imputed_model(
+                    "1:400:A:G", "1", 400, 1.5, 0.1, [_P_DIRECT, _P_FLIP], [0.5, 0.25]
+                ),
+                _imputed_model("1:500:A:G", "1", 500, 0.7, -0.2, [], [], is_intercept_only=True),
+            ],
+        )
+        ev = ImputationEvaluator(model, verbose=0)
+        string = ev._predicted_prs_via_strings(panel)
+        np.testing.assert_allclose(ev._compute_imputed_prs_batch(panel), string, rtol=0, atol=1e-9)
+        np.testing.assert_allclose(
+            ev._predicted_prs_numeric(panel, _force_batch=False), string, rtol=0, atol=1e-9
+        )
+        np.testing.assert_allclose(
+            ev._predicted_prs_numeric(panel, _force_batch=True), string, rtol=0, atol=1e-9
+        )
+
+    def test_projection_no_call_matches_string(self):
+        panel = _panel(_NOCALL_RECORDS)
+        model = _projection_model(
+            _NOCALL_OBSERVED,
+            [
+                _region_model(
+                    "r1", "1", [0.8, -0.4], [_P_DIRECT, _P_FLIP], [0.5, 0.25], 0.1
+                ),
+            ],
+        )
+        ev = ProjectionEvaluator(model, verbose=0)
+        string = ev._predicted_prs_via_strings(panel)
+        np.testing.assert_allclose(ev._compute_projected_prs_batch(panel), string, rtol=0, atol=1e-9)
+        np.testing.assert_allclose(
+            ev._predicted_prs_numeric(panel, _force_batch=False), string, rtol=0, atol=1e-9
+        )
+        np.testing.assert_allclose(
+            ev._predicted_prs_numeric(panel, _force_batch=True), string, rtol=0, atol=1e-9
+        )
+
+
+class TestP18FallbackGuard:
+    """The numeric observed scorer drops (does not fallback-recover) an
+    unresolvable/no-call observed variant that carries a trained fallback (P1.8).
+    That deviation must be loud, never silent."""
+
+    def test_warns_when_fallback_variant_unresolved(self):
+        fb = _imputed_model(
+            "fb", "1", 100, 1.0, 0.0, [_P_DIRECT], [0.5]
+        )
+        # Observed locus 9:999 is absent from the panel -> resolver returns None.
+        observed = [VariantInfo("9:999:G:A", "9", 999, "G", "A", 0.3, fallback=fb)]
+        panel = _panel([("1", 100, "A", "G", [0.0, 1.0, 2.0])])
+        ev = ImputationEvaluator(_imputation_model(observed, []), verbose=0)
+        with pytest.warns(UserWarning, match="P1.8"):
+            ev._predicted_prs_numeric(panel)
+
+    def test_warns_when_fallback_variant_has_no_call(self):
+        fb = _imputed_model("fb", "1", 100, 1.0, 0.0, [_P_DIRECT], [0.5])
+        observed = [VariantInfo("1:300:A:G", "1", 300, "G", "A", 0.3, fallback=fb)]
+        panel = _panel([("1", 300, "A", "G", [1.0, np.nan, 2.0])])  # no-call at s1
+        ev = ImputationEvaluator(_imputation_model(observed, []), verbose=0)
+        with pytest.warns(UserWarning, match="P1.8"):
+            ev._predicted_prs_numeric(panel)
+
+    def test_no_warning_when_fully_resolved(self, fitted_imputation_model, integer_genotype_data):
+        # fitted fixture's observed variants carry fallbacks, but are fully
+        # resolved/called here -> the guard must stay silent.
+        ev = ImputationEvaluator(fitted_imputation_model, verbose=0)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            ev._predicted_prs_numeric(integer_genotype_data)
+        assert not [w for w in caught if "P1.8" in str(w.message)]
+
+
+class TestMultiallelicCoPredictorDeviation:
+    """P5 deviation: when two ALT alleles of one multiallelic locus are both used
+    as co-predictors for the same target, the retired string replay conflates the
+    locus (chr:pos duplicate-conflict -> mean-fill) while the numeric path
+    resolves each allele into its own column, exactly as the model was trained.
+    The numeric result is the training-faithful one; routing hard-called panels
+    through it is an intended improvement, not a regression. (Biallelic loci and
+    multiallelic loci with a single used allele agree exactly -- see the no-call
+    and golden parity tests.)"""
+
+    _RECORDS = [
+        ("1", 100, "A", "G", [0.0, 1.0, 2.0, 0.0]),
+        ("1", 100, "A", "T", [2.0, 1.0, 0.0, 1.0]),  # multiallelic sibling at 1:100
+        ("1", 200, "C", "T", [0.0, 2.0, 1.0, 2.0]),
+    ]
+    _P_G = ("1:100:A:G", "1", 100, "G", "A", 0.3)
+    _P_T = ("1:100:A:T", "1", 100, "T", "A", 0.2)
+
+    def _ev(self):
+        model = _imputation_model(
+            [],
+            [
+                _imputed_model(
+                    "1:400:A:G", "1", 400, 1.5, 0.1,
+                    [self._P_G, self._P_T, _P_FLIP], [0.5, -0.3, 0.25],
+                )
+            ],
+        )
+        return ImputationEvaluator(model, verbose=0), _panel(self._RECORDS)
+
+    def test_numeric_paths_are_self_consistent(self):
+        ev, panel = self._ev()
+        oracle = ev._predicted_prs_numeric(panel, _force_batch=False)
+        # The dispatch routes to numeric, and the vectorized batch agrees with it.
+        np.testing.assert_allclose(ev._compute_imputed_prs_batch(panel), oracle, rtol=0, atol=1e-12)
+        np.testing.assert_allclose(
+            ev._predicted_prs_numeric(panel, _force_batch=True), oracle, rtol=0, atol=1e-9
+        )
+
+    def test_documents_divergence_from_retired_string_path(self):
+        """Executable documentation of the intended behavior change: the numeric
+        path and the retired string replay differ at multiallelic co-predictors."""
+        ev, panel = self._ev()
+        numeric = ev._predicted_prs_numeric(panel)
+        string = ev._predicted_prs_via_strings(panel)
+        assert np.max(np.abs(numeric - string)) > 0.1

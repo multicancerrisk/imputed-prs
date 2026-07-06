@@ -22,7 +22,6 @@ from imputed_prs.io.genotype_loader import load_genotypes
 from imputed_prs.core.harmonizer import ReferenceAlleleResolver
 from imputed_prs.evaluation._scoring import (
     NeededVariant,
-    is_hard_called,
     iter_sample_collections,
     observed_component_numeric,
     oriented_predictor_matrix,
@@ -569,17 +568,19 @@ class ImputationEvaluator:
     def _compute_imputed_prs_batch(self, genotype_data: GenotypeData) -> np.ndarray:
         """Compute predicted (observed + imputed) PRS for all samples.
 
-        Routes through the same allele-oriented semantics as the browser/upload
-        path so train/eval and browser cannot diverge (P1.6):
+        Both dosage modes score through the role-aware **numeric** path
+        (``_predicted_prs_numeric``): it orients observed and predictor dosages
+        from the stored P1.3 allele metadata and runs the imputation regression,
+        size-selecting the vectorized CSR batch scorer at/above
+        ``_BATCH_MIN_TARGETS`` targets and the byte-exact per-model oracle below.
 
-        - **hard-called** integer dosages → render genotype strings per sample and
-          replay ``PRSPredictor.predict`` (the literal upload path);
-        - **continuous** DS/GP dosages → a role-aware numeric scorer that orients
-          each predictor via ``match_oriented_dosage`` from the stored P1.3 allele
-          metadata.
-
-        The two paths agree on integer biallelic data (golden test in
-        ``tests/test_round_trip.py``).
+        This is what allows hard-called reference CV / masking validation to score
+        at matvec speed instead of the per-sample string replay (P5). On hard-called
+        integer dosages the numeric path is byte-identical to the string replay
+        (golden ``TestNumericVsStringGolden`` at ``atol=1e-12``; CSR batch matches
+        the oracle at ``atol~1e-9``), so metrics are unchanged within statistical
+        parity. ``_predicted_prs_via_strings`` is retained as the browser-faithful
+        oracle for the golden tests; it is no longer on the metric path.
 
         Args:
             genotype_data: GenotypeData containing all samples.
@@ -587,8 +588,6 @@ class ImputationEvaluator:
         Returns:
             Array of predicted PRS values (n_samples,).
         """
-        if is_hard_called(genotype_data.dosage_matrix):
-            return self._predicted_prs_via_strings(genotype_data)
         return self._predicted_prs_numeric(genotype_data)
 
     def _needed_for_render(self) -> List[NeededVariant]:

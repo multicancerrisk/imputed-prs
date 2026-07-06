@@ -1155,7 +1155,9 @@ from imputed_prs import LinearImputationPRS, LinearProjectionPRS  # noqa: E402
 from imputed_prs.core.exceptions import ModelNotFittedError, ValidationError  # noqa: E402
 from imputed_prs.core.types import GenotypeData  # noqa: E402
 from imputed_prs.evaluation import (  # noqa: E402
+    ImputationEvaluator,
     MaskingValidationReport,
+    ProjectionEvaluator,
     mask_reference_to_platform,
     run_masking_validation,
 )
@@ -1352,6 +1354,66 @@ class TestRunMaskingValidationEndToEnd:
         assert "correlation" in lowered
         assert "top-decile" in lowered
         assert "empirical error" in lowered
+
+
+class TestMaskingValidationNumericStringMetricParity:
+    """P5: the masking-validation estimate now flows through the numeric scorer
+    instead of the per-sample string replay. On a fully-called biallelic reference
+    the two are equal, so the end-to-end report metrics (R², calibration, error,
+    concordance) must match the string oracle to numerical precision."""
+
+    @staticmethod
+    def _assert_metrics_match(numeric, string):
+        assert numeric.correlation == pytest.approx(string.correlation, abs=1e-9)
+        assert numeric.r2 == pytest.approx(string.r2, abs=1e-9)
+        assert numeric.calibration_slope == pytest.approx(string.calibration_slope, abs=1e-9)
+        assert numeric.calibration_intercept == pytest.approx(
+            string.calibration_intercept, abs=1e-9
+        )
+        assert numeric.empirical_error_sd == pytest.approx(string.empirical_error_sd, abs=1e-9)
+        assert numeric.empirical_error_mean == pytest.approx(
+            string.empirical_error_mean, abs=1e-9
+        )
+        assert numeric.top_decile_concordance == pytest.approx(
+            string.top_decile_concordance, abs=1e-9
+        )
+
+    def test_imputation_metrics_match_string_oracle(
+        self, mv_imputation_model, mv_vcf_file, monkeypatch
+    ):
+        numeric = run_masking_validation(
+            mv_imputation_model, mv_vcf_file, run_raw_parser_check=False,
+            random_state=1, verbose=0,
+        )
+        # Force the whole run's estimate back onto the retired string replay.
+        monkeypatch.setattr(
+            ImputationEvaluator,
+            "_compute_imputed_prs_batch",
+            lambda self, gd: self._predicted_prs_via_strings(gd),
+        )
+        string = run_masking_validation(
+            mv_imputation_model, mv_vcf_file, run_raw_parser_check=False,
+            random_state=1, verbose=0,
+        )
+        self._assert_metrics_match(numeric, string)
+
+    def test_projection_metrics_match_string_oracle(
+        self, mv_projection_model, mv_vcf_file, monkeypatch
+    ):
+        numeric = run_masking_validation(
+            mv_projection_model, mv_vcf_file, run_raw_parser_check=False,
+            random_state=1, verbose=0,
+        )
+        monkeypatch.setattr(
+            ProjectionEvaluator,
+            "_compute_projected_prs_batch",
+            lambda self, gd: self._predicted_prs_via_strings(gd),
+        )
+        string = run_masking_validation(
+            mv_projection_model, mv_vcf_file, run_raw_parser_check=False,
+            random_state=1, verbose=0,
+        )
+        self._assert_metrics_match(numeric, string)
 
 
 class TestPerfectRecoveryMaskingValidation:

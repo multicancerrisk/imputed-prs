@@ -1,23 +1,48 @@
-"""Shared allele-oriented scoring helpers for the evaluators (P1.6).
+"""Shared allele-oriented scoring helpers for the evaluators (P1.6, P5).
 
-Both evaluators route their *predicted*-PRS computation through one of two
-allele-oriented paths, selected by the reference dosage mode, so the evaluation
-path stays in lock-step with the browser/upload path and they cannot diverge:
+Both evaluators compute their *predicted*-PRS through the role-aware **numeric**
+scorer (:func:`observed_component_numeric` + the vectorized/oracle imputation or
+projection solve), for **both** hard-called and continuous dosage modes (P5). It
+orients each predictor via :func:`match_oriented_dosage` (through
+:class:`ReferenceAlleleResolver`) using the stored counted/other alleles, so the
+evaluation path applies the same effective orientation as the browser/upload path
+under the orchestrator policy (``allow_ambiguous=True, allow_strand_flip=True``,
+the ``PRSPredictor`` / ``ProjectionPredictor`` constructor default).
 
-- **hard-called** integer dosages (parsed from VCF ``GT``) → render genotype
-  strings and replay the browser scorer (``PRSPredictor`` / ``ProjectionPredictor``
-  with ``raw_genotypes``). The evaluation path is then *literally* the upload path.
-- **continuous** DS/GP dosages → a role-aware numeric scorer that orients each
-  predictor via :func:`match_oriented_dosage` using the stored counted/other
-  alleles (no string can be rendered from a fractional dosage).
+The **string-replay** path (render genotype strings and replay the browser scorer
+with ``raw_genotypes``, i.e. *literally* the upload path) is retained on the
+evaluators as ``_predicted_prs_via_strings`` but is no longer on the metric path.
+On hard-called integer biallelic data the numeric path is byte-identical to it —
+locked by the golden test in ``tests/test_round_trip.py`` — so it now serves only
+as the browser-faithful oracle for those tests. Before P5 the hard-called metric
+path replayed strings per sample (O(samples × variants) pure-Python), which
+dominated reference-CV wall-clock; routing it through the numeric scorer removes
+that cost while keeping metrics within statistical parity.
 
-The two paths agree on integer biallelic data — locked by the golden test in
-``tests/test_round_trip.py``. ``match_oriented_dosage`` and ``count_allele`` apply
-the same effective orientation under the orchestrator policy
-(``allow_ambiguous=True, allow_strand_flip=True``), which is also the
-``PRSPredictor`` / ``ProjectionPredictor`` constructor default.
+Two documented, benign deviations from the retired string path. In both, the
+numeric path resolves the reference dosage the model was **trained** on (by
+``chr:pos`` + alleles, via :class:`ReferenceAlleleResolver`), so it is the
+training-faithful path; the divergence is confined to the retired string replay
+and is within statistical parity:
+
+- **P1.8 observed fallback.** :func:`observed_component_numeric` does not recover
+  an unresolvable/no-call observed variant from its trained fallback model (a
+  loud :class:`UserWarning` fires if it ever could) — see its docstring. Not
+  exercised on fully-called panels.
+- **Non-SNP predictors (indels / multiallelic loci).** The string replay renders
+  and re-parses per-sample **genotype strings**, which faithfully carry only
+  biallelic SNP calls; it therefore mean-fills INDEL / multi-character-allele
+  predictors, and conflates a multiallelic locus whose distinct ALT alleles are
+  co-predictors (``chr:pos`` duplicate-conflict → mean-fill). The numeric path
+  resolves each to the real reference dosage. On dense hard-called 1000G
+  (``SNV_INDEL_SV``) a small number of indel predictors make the numeric and
+  string PRS differ at the ~1e-4 level (Pearson r ≈ 0.9999; R²/calibration
+  unchanged within statistical parity — see ``benchmarks/results/predict-hardcall``);
+  the numeric result is the more faithful one. Pure-SNP scores are exact
+  (``tests/test_round_trip.py`` locks numeric==string at ``atol=1e-12``).
 """
 
+import warnings
 from typing import Iterator, List, Sequence, Tuple
 
 import numpy as np
@@ -75,6 +100,22 @@ def is_hard_called(dosage_matrix: np.ndarray, *, tol: float = _INT_DOSAGE_TOL) -
     )
 
 
+def _warn_dropped_fallback(variant_id: str, reason: str) -> None:
+    """Loud P1.8 guard: the numeric observed scorer dropped a fallback-eligible
+    variant that the string-replay path would have recovered. Unreachable in
+    normal evaluator usage (see :func:`observed_component_numeric`); surfaced so
+    the deviation is never silent."""
+    warnings.warn(
+        f"Observed variant {variant_id!r} has a trained fallback model but "
+        f"cannot be scored directly ({reason}); the numeric evaluator path drops "
+        f"it, whereas the browser/string path would recover it from the fallback "
+        f"(P1.8), so evaluator metrics may differ for this variant. Use the "
+        f"_predicted_prs_via_strings oracle for exact browser parity.",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
 def observed_component_numeric(
     genotype_data: GenotypeData,
     resolver: ReferenceAlleleResolver,
@@ -86,6 +127,18 @@ def observed_component_numeric(
     component; kept here so the numeric path shares one implementation.
     ``resolver.resolve`` is byte-identical to :func:`match_oriented_dosage` but
     avoids the per-candidate ``variant_info.iloc`` (Phase 4 hotspot fix).
+
+    **P1.8 deviation (documented, not silent).** Unlike the string-replay path
+    (:func:`~imputed_prs.models.predictor.compute_observed_prs_oriented`), this
+    does not recover an unresolvable or no-call observed variant from its trained
+    fallback model: an unresolved variant (``match is None``) is dropped and NaN
+    (no-call) samples contribute zero. In evaluator usage this is unreachable —
+    observed variants are on the genotyping platform, always retained by
+    ``mask_reference_to_platform``, and fully called on hard-called GT — and it is
+    already the behavior of the pre-P5 continuous path. Should it ever occur (an
+    observed variant carrying a fallback that is unresolved or has any NaN
+    sample), a loud :class:`UserWarning` naming the variant is emitted; the
+    retained ``_predicted_prs_via_strings`` oracle gives exact browser parity.
     """
     n_samples = genotype_data.n_samples
     observed_prs = np.zeros(n_samples)
@@ -98,12 +151,16 @@ def observed_component_numeric(
             genotype_data.dosage_matrix,
         )
         if match is None:
+            if var.fallback is not None:
+                _warn_dropped_fallback(var.variant_id, "no allele-compatible reference row")
             continue
         # Compute in float64: the reference matrix is float32, and a float32
         # dosage * beta loses ~1e-7 precision (NEP-50 weak-scalar promotion),
         # which would split the numeric path from the float64 string path.
         dosages = np.asarray(match[1], dtype=np.float64)
         valid_mask = ~np.isnan(dosages)
+        if var.fallback is not None and not valid_mask.all():
+            _warn_dropped_fallback(var.variant_id, "no-call (NaN) samples")
         observed_prs[valid_mask] += dosages[valid_mask] * var.beta
     return observed_prs
 
