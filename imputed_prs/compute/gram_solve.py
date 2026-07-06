@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 import numpy as np
+from scipy.linalg import LinAlgError, cho_factor, cho_solve
 
 from imputed_prs.models.metrics import compute_cv_r2
 
@@ -314,6 +315,34 @@ def _select_solver() -> bool:
     return _USE_PRIVATE
 
 
+def ridge_gram_fit(
+    G_std: np.ndarray, q_std: np.ndarray, n: int, alpha: float
+) -> np.ndarray:
+    """Closed-form ridge (``l1_ratio=0``) coefficients from a standardized Gram block.
+
+    With no L1 term the ElasticNet objective ``½wᵀG_std w − q_stdᵀw + ½·l2·‖w‖²`` is a
+    strictly-convex quadratic (``l2 = α·(1−0)·n = α·n``), minimized in closed form by
+
+        w = (G_std + α·n·I)⁻¹ q_std
+
+    solved via Cholesky (``G_std + α·n·I`` is symmetric positive-definite for ``α>0``).
+    This is exact — it equals the coordinate-descent optimum but skips the iteration —
+    and is the batched-Cholesky ridge fast-path (Phase 3, item c). It replaces routing
+    ``l1_ratio=0`` through the (correct but iterative) ElasticNet coordinate descent.
+    """
+    p = G_std.shape[0]
+    if p == 0:
+        return np.zeros(0, dtype=np.float64)
+    l2 = alpha * n
+    a = np.array(G_std, dtype=np.float64, copy=True)
+    a[np.diag_indices(p)] += l2
+    try:
+        return cho_solve(cho_factor(a, check_finite=False), q_std, check_finite=False)
+    except LinAlgError:
+        # α≈0 (unregularized) or a numerically singular Gram: least-squares fallback.
+        return np.linalg.lstsq(a, q_std, rcond=None)[0]
+
+
 def enet_gram_fit(
     G_std: np.ndarray,
     q_std: np.ndarray,
@@ -324,7 +353,14 @@ def enet_gram_fit(
     max_iter: int = 10000,
     tol: float = 1e-4,
 ) -> np.ndarray:
-    """Fit standardized-scale ElasticNet coefficients ``w_std`` from a Gram block."""
+    """Fit standardized-scale ElasticNet coefficients ``w_std`` from a Gram block.
+
+    ``l1_ratio == 0`` (pure ridge) takes the exact closed-form :func:`ridge_gram_fit`
+    fast-path; any L1 component routes through sklearn's compiled Gram coordinate
+    descent (or the hand-rolled fallback).
+    """
+    if l1_ratio == 0.0:
+        return ridge_gram_fit(G_std, q_std, n, alpha)
     if _select_solver():
         return _enet_gram_private(G_std, q_std, yc2, n, alpha, l1_ratio, max_iter, tol)
     return _enet_gram_handrolled(G_std, q_std, yc2, n, alpha, l1_ratio, max_iter, tol)

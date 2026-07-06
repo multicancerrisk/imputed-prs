@@ -1,0 +1,36 @@
+{
+  "finding": "band-limited per-fold Gram (lazy on-demand projection Gram, Phase 3E)",
+  "reference": "/Users/jeya/Documents/projects/imputed-prs/benchmarks/data/work/pos/22+21+20.vcf.gz",
+  "n_prs_variants_on_chroms": 109252,
+  "baseline_peak_rss_gb": 11.514167296,
+  "variants": {
+    "max_predictors_none": {
+      "max_predictors": null,
+      "outcome": "completed",
+      "ok": true,
+      "wall_seconds": 359.76376283401623,
+      "peak_rss_gb": 8.901738496,
+      "peak_rss_authoritative": true,
+      "n_regions": 4,
+      "mean_n_predictors": 7673.5,
+      "calibration_r2": 0.6167005036361055,
+      "error": null
+    },
+    "max_predictors_500": {
+      "max_predictors": 500,
+      "outcome": "completed",
+      "ok": true,
+      "wall_seconds": 290.77357958396897,
+      "peak_rss_gb": 2.37723648,
+      "peak_rss_authoritative": true,
+      "n_regions": 4,
+      "mean_n_predictors": 500.0,
+      "calibration_r2": 0.6250205736784985,
+      "error": null
+    }
+  },
+  "drop_vs_baseline": {
+    "none": 1.2934739996208489,
+    "max_predictors_500": 4.843509424859574
+  }
+}

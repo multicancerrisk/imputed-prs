@@ -95,6 +95,7 @@ class LinearProjectionPRS:
         exclude_ambiguous: bool = False,
         ambiguous_maf_threshold: float = 0.4,
         backend: Literal["auto", "dense", "streaming"] = "auto",
+        device: Literal["auto", "cpu", "mps", "cuda"] = "auto",
         verbose: int = 1,
     ):
         """Initialize the projection PRS model.
@@ -119,6 +120,10 @@ class LinearProjectionPRS:
             max_tuning_regions: Cap on the number of regions sampled for
                 tuning_scope="global". None tunes on all regions. Must be positive
                 when set. Default: 50.
+            device: Compute device for the streaming backend's Gram kernels
+                ("auto"/"cpu"/"mps"/"cuda"). "auto" uses the GPU via ``torch`` (the
+                ``gpu`` extra) when available, else CPU; with no ``torch`` it resolves
+                to "cpu". Only the streaming path is device-aware. Default: "auto".
             verbose: Verbosity level (0=silent, 1=progress, 2=debug).
                 Default: 1.
         """
@@ -135,7 +140,12 @@ class LinearProjectionPRS:
             raise ValidationError(
                 f"backend must be 'auto', 'dense', or 'streaming', got {backend!r}"
             )
+        if device not in ("auto", "cpu", "mps", "cuda"):
+            raise ValidationError(
+                f"device must be 'auto', 'cpu', 'mps', or 'cuda', got {device!r}"
+            )
         self.backend = backend
+        self.device = device
         self.window_size = window_size
         self.tuning_scope = tuning_scope
         self.l1_ratio = l1_ratio
@@ -974,7 +984,7 @@ class LinearProjectionPRS:
             )
 
         # Single streaming pass: region models + observed fallbacks + calibration.
-        result = StreamingProjectionFitter(plan).run(source)
+        result = StreamingProjectionFitter(plan, device=self.device).run(source)
 
         calibration_params = None
         if result.has_calibration_terms:

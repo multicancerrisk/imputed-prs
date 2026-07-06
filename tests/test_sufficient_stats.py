@@ -15,10 +15,12 @@ import pandas as pd
 import pytest
 
 from imputed_prs.compute.sufficient_stats import (
+    GlobalFolds,
     ObservedVar,
     StreamPlan,
     StreamingImputationFitter,
     TargetVar,
+    _ChipGramBuffer,
 )
 from imputed_prs.core.harmonizer import filter_to_local_window
 from imputed_prs.models.elastic_net import fit_single_variant_model
@@ -160,6 +162,53 @@ def dense_oracle(info, dosage, plan, platform_info, chip_ids, prs_specs, chip_ro
             s_true += beta * x_eff
             s_cv += beta * cv_preds[vid]
     return dense_models, s_true, s_cv
+
+
+def _fill_buffer(cols, afs, folds, lazy, cap=8):
+    buf = _ChipGramBuffer(cols[0].shape[0], folds, capacity=cap, lazy_fold_gram=lazy)
+    for j, c in enumerate(cols):
+        buf.add(c, platform_idx=j, position=j * 10, af=afs[j])
+    return buf
+
+
+def test_lazy_fold_gram_matches_incremental():
+    """Phase-3E band-limited per-fold Gram: the projection ``lazy_fold_gram`` buffer
+    recomputes the full + per-fold Gram on-demand at ``gather`` and must return blocks
+    identical to the incrementally-maintained buffer — across add / grow / evict — while
+    never allocating the (K, cap, cap) per-fold tensor."""
+    rng = np.random.RandomState(3)
+    n, ncols, K = 160, 40, 5
+    folds = GlobalFolds(n, K, random_state=11)
+    cols, afs = [], []
+    for j in range(ncols):
+        raw = rng.randint(0, 3, size=n).astype(float)
+        if j % 4 == 0:  # inject missingness → non-integer mean-imputed entries (float path)
+            raw[rng.rand(n) < 0.1] = np.nan
+            mask = np.isnan(raw)
+            raw[mask] = np.nanmean(raw)
+        cols.append(folds.permute(raw))
+        afs.append(float(raw.mean() / 2))
+
+    eager = _fill_buffer(cols, afs, folds, lazy=False)
+    lazy = _fill_buffer(cols, afs, folds, lazy=True)
+
+    # The lazy buffer must NOT hold the O(cap²)/O(K·cap²) Grams — that is the whole fix.
+    assert lazy.Gfull is None and lazy.Ghold is None
+    assert eager.Gfull is not None and eager.Ghold is not None
+
+    def assert_gather_matches(pred):
+        ie, ge = eager.gather(pred)
+        il, gl = lazy.gather(pred)
+        assert np.array_equal(ie, il)
+        for key in ("G", "fold_G", "zsum", "zsqsum", "fold_zsum", "fold_zsqsum", "af"):
+            np.testing.assert_allclose(gl[key], ge[key], atol=1e-9, rtol=1e-9)
+        # G == Σ_k fold_G[k] exactly (same Zsub slice) ⇒ G − fold_G[k] is an exact train Gram.
+        np.testing.assert_allclose(gl["G"], np.asarray(gl["fold_G"]).sum(0), atol=1e-9)
+
+    assert_gather_matches([3, 17, 5, 28, 11, 0, 39])  # scattered order, spans grows
+    eager.evict_below(150)
+    lazy.evict_below(150)
+    assert_gather_matches([20, 35, 16, 39])  # after a front eviction
 
 
 def test_grow_and_underdetermined():

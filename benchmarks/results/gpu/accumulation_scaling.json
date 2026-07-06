@@ -1,0 +1,99 @@
+{
+  "gpu_device": "mps",
+  "m_cols": 256,
+  "t_targets": 64,
+  "k_folds": 5,
+  "seam_b_band_gram_add": {
+    "points": [
+      {
+        "n_samples": 3202,
+        "cpu_seconds": 0.014093916863203049,
+        "gpu_seconds": 0.006310208002105355,
+        "cpu_over_gpu_speedup": 2.233510663753194
+      },
+      {
+        "n_samples": 25000,
+        "cpu_seconds": 0.17437154101207852,
+        "gpu_seconds": 0.03220954188145697,
+        "cpu_over_gpu_speedup": 5.413661009331654
+      },
+      {
+        "n_samples": 100000,
+        "cpu_seconds": 0.7189865838736296,
+        "gpu_seconds": 0.17317116679623723,
+        "cpu_over_gpu_speedup": 4.151883926032727
+      },
+      {
+        "n_samples": 500000,
+        "cpu_seconds": 3.595848125172779,
+        "gpu_seconds": 0.893873583059758,
+        "cpu_over_gpu_speedup": 4.0227703260499945
+      }
+    ],
+    "extrapolation_500k": {
+      "model": "seconds = a + b*n_samples",
+      "cpu_fit": {
+        "a": -0.005671308453812474,
+        "b_per_sample": 7.204665697875747e-06,
+        "r2": 0.999996532785203
+      },
+      "gpu_fit": {
+        "a": -0.0061964439582138375,
+        "b_per_sample": 1.7993420517165065e-06,
+        "r2": 0.9998298560083585
+      },
+      "predicted_500k": {
+        "cpu_seconds": 3.596661540484061,
+        "gpu_seconds": 0.8934745819000394,
+        "cpu_over_gpu_speedup": 4.025477180151556
+      }
+    }
+  },
+  "seam_a_cross_product": {
+    "points": [
+      {
+        "n_samples": 3202,
+        "cpu_seconds": 0.00021650013513863087,
+        "gpu_seconds": 0.0010867919772863388,
+        "cpu_over_gpu_speedup": 0.1992102809584775
+      },
+      {
+        "n_samples": 25000,
+        "cpu_seconds": 0.0027418748941272497,
+        "gpu_seconds": 0.0010757080744951963,
+        "cpu_over_gpu_speedup": 2.548902401252259
+      },
+      {
+        "n_samples": 100000,
+        "cpu_seconds": 0.011133749969303608,
+        "gpu_seconds": 0.0023238330613821745,
+        "cpu_over_gpu_speedup": 4.7911143680353065
+      },
+      {
+        "n_samples": 500000,
+        "cpu_seconds": 0.055055500008165836,
+        "gpu_seconds": 0.0029209579806774855,
+        "cpu_over_gpu_speedup": 18.848439577825182
+      }
+    ],
+    "extrapolation_500k": {
+      "model": "seconds = a + b*n_samples",
+      "cpu_fit": {
+        "a": -2.0990875131781522e-05,
+        "b_per_sample": 1.1020593456764298e-07,
+        "r2": 0.999983698058212
+      },
+      "gpu_fit": {
+        "a": 0.0013089324081163845,
+        "b_per_sample": 3.4567885192591833e-09,
+        "r2": 0.7579927357628645
+      },
+      "predicted_500k": {
+        "cpu_seconds": 0.05508197640868971,
+        "gpu_seconds": 0.003037326667745976,
+        "cpu_over_gpu_speedup": 18.13501886169079
+      }
+    }
+  },
+  "note": "Isolated accumulation kernels (synthetic 0/1/2 dosages). Seam B = incremental band-Gram maintenance (add_batch GEMM vs numpy per-column add); Seam A = the chunk cross-product C=Z\u1d40Y. Both O(n) with a fixed band, so the per-sample slope extrapolates cleanly; 500K is where the accumulation dominates the fit."
+}

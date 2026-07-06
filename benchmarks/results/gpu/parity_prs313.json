@@ -1,0 +1,350 @@
+{
+  "pgs_id": "PGS000004",
+  "gpu_device": "mps",
+  "n_samples": 3202,
+  "n_positions": 109089,
+  "n_prs_variants": 313,
+  "tolerance": {
+    "rtol": 0.005,
+    "atol": 0.001
+  },
+  "small_n_finding": "A dense chr22 PGS000027 fit (~24,600 units) is launch-bound on MPS and does not complete in budget (de-risk n=500: peak 5.2 GB bounded, wall > 900 s timeout); the per-unit solve is n-independent, so this is a unit-count/launch-overhead effect, not memory. device='auto' routes fits below GPU_AUTO_MIN_SAMPLES (25,000) to CPU for exactly this reason.",
+  "methods": {
+    "imputation": {
+      "cpu": {
+        "label": "gpu_parity_imputation_cpu",
+        "outcome": "completed",
+        "ok": true,
+        "reference": "/Users/jeya/Documents/projects/imputed-prs/benchmarks/data/work_streaming/pos/1+2+3+4+5+6+7+8+9+10+11+12+13+14+15+16+17+18+19+20+21+22.vcf.gz",
+        "n_prs_variants_on_chroms": 313,
+        "wall_seconds": 121.5188810408581,
+        "peak_rss_bytes": 3433447424,
+        "peak_rss_gb": 3.433447424,
+        "peak_rss_authoritative": true,
+        "n_units": 227,
+        "summary": {
+          "n_total_variants": 313,
+          "n_definition_variants": 313,
+          "n_observed": 75,
+          "n_observed_with_fallback": 73,
+          "n_imputed": 227,
+          "n_intercept_only": 1,
+          "n_dropped": 11,
+          "dropped_by_reason": {
+            "not_in_reference": 7,
+            "allele_mismatch": 4
+          },
+          "n_training_failed": 0,
+          "training_failures_by_type": {},
+          "coverage": 0.9648562300319489,
+          "mean_imputation_r2": 0.7843750253889682,
+          "prs_id": null,
+          "platform_name": "custom",
+          "genome_build": "GRCh38",
+          "model_name": null,
+          "window_size": 1000000,
+          "cv_folds": 5
+        },
+        "calibration": {
+          "scaling_factor": 0.9993037240024334,
+          "scaling_factor_se": 0.006266231646448988,
+          "calibration_intercept": 0.001051268009823192,
+          "calibration_r2": 0.8882373047080189,
+          "sd_cv_predicted": 0.5407478320843389,
+          "sd_true": 0.5733605239758304,
+          "sd_scaled": 0.5403713223481224,
+          "attenuation_factor": 0.943120095423824,
+          "n_calibration": 3202,
+          "raw_empirical_residual_sd": 0.19168011424548426,
+          "calibrated_empirical_residual_sd": 0.19167974446346808,
+          "diagonal_model_se_lower_bound": 0.19250686804335107
+        },
+        "r2_summary": {
+          "n": 226,
+          "mean": 0.7843750253889682,
+          "median": 0.8531883753389047,
+          "std": 0.20422718011446506,
+          "min": -0.0034302296529660214,
+          "max": 0.9979873597324898
+        },
+        "phases": [
+          {
+            "name": "fit",
+            "wall_seconds": 120.7843516250141,
+            "tm_current_bytes": null,
+            "tm_delta_bytes": null
+          }
+        ],
+        "error": null
+      },
+      "gpu": {
+        "label": "gpu_parity_imputation_mps",
+        "outcome": "completed",
+        "ok": true,
+        "reference": "/Users/jeya/Documents/projects/imputed-prs/benchmarks/data/work_streaming/pos/1+2+3+4+5+6+7+8+9+10+11+12+13+14+15+16+17+18+19+20+21+22.vcf.gz",
+        "n_prs_variants_on_chroms": 313,
+        "wall_seconds": 101.66384583315812,
+        "peak_rss_bytes": 4224335872,
+        "peak_rss_gb": 4.224335872,
+        "peak_rss_authoritative": true,
+        "n_units": 227,
+        "summary": {
+          "n_total_variants": 313,
+          "n_definition_variants": 313,
+          "n_observed": 75,
+          "n_observed_with_fallback": 73,
+          "n_imputed": 227,
+          "n_intercept_only": 1,
+          "n_dropped": 11,
+          "dropped_by_reason": {
+            "not_in_reference": 7,
+            "allele_mismatch": 4
+          },
+          "n_training_failed": 0,
+          "training_failures_by_type": {},
+          "coverage": 0.9648562300319489,
+          "mean_imputation_r2": 0.7843765107403814,
+          "prs_id": null,
+          "platform_name": "custom",
+          "genome_build": "GRCh38",
+          "model_name": null,
+          "window_size": 1000000,
+          "cv_folds": 5
+        },
+        "calibration": {
+          "scaling_factor": 0.9993082214984932,
+          "scaling_factor_se": 0.006266215597455967,
+          "calibration_intercept": 0.0010518759544682066,
+          "calibration_r2": 0.8882387067774851,
+          "sd_cv_predicted": 0.5407458251686608,
+          "sd_true": 0.5733605239758304,
+          "sd_scaled": 0.5403717488320295,
+          "attenuation_factor": 0.9431165951555038,
+          "n_calibration": 3202,
+          "raw_empirical_residual_sd": 0.19167890716288585,
+          "calibrated_empirical_residual_sd": 0.19167854214296548,
+          "diagonal_model_se_lower_bound": 0.19250637365225617
+        },
+        "r2_summary": {
+          "n": 226,
+          "mean": 0.7843765107403814,
+          "median": 0.8531874120235443,
+          "std": 0.20422740725572092,
+          "min": -0.0034475326538085938,
+          "max": 0.9979854822158813
+        },
+        "phases": [
+          {
+            "name": "fit",
+            "wall_seconds": 100.90623679198325,
+            "tm_current_bytes": null,
+            "tm_delta_bytes": null
+          }
+        ],
+        "error": null
+      },
+      "status": "ok",
+      "n_fields_compared": 40,
+      "n_mismatch": 0,
+      "mismatches": {},
+      "cpu_wall_seconds": 121.5188810408581,
+      "gpu_wall_seconds": 101.66384583315812,
+      "cpu_over_gpu_speedup": 1.1953008470708884,
+      "cpu_peak_rss_gb": 3.433447424,
+      "gpu_peak_rss_gb": 4.224335872
+    },
+    "projection": {
+      "cpu": {
+        "label": "gpu_parity_projection_cpu",
+        "outcome": "completed",
+        "ok": true,
+        "reference": "/Users/jeya/Documents/projects/imputed-prs/benchmarks/data/work_streaming/pos/1+2+3+4+5+6+7+8+9+10+11+12+13+14+15+16+17+18+19+20+21+22.vcf.gz",
+        "n_prs_variants_on_chroms": 313,
+        "wall_seconds": 120.95033991709352,
+        "peak_rss_bytes": 3568402432,
+        "peak_rss_gb": 3.568402432,
+        "peak_rss_authoritative": true,
+        "n_units": 161,
+        "summary": {
+          "n_observed_variants": 75,
+          "n_observed_with_fallback": 73,
+          "n_missing_variants": 227,
+          "n_definition_variants": 313,
+          "n_dropped": 11,
+          "dropped_by_reason": {
+            "not_in_reference": 7,
+            "allele_mismatch": 4
+          },
+          "n_training_failed": 0,
+          "training_failures_by_type": {},
+          "coverage": 0.9648562300319489,
+          "n_regions": 161,
+          "n_intercept_only_regions": 6,
+          "training_summary": {
+            "mean_r2": 0.6255978597468084,
+            "median_r2": 0.6913737048846531,
+            "std_r2": 0.25983111192507535,
+            "min_r2": -0.000937768017529983,
+            "max_r2": 0.9652839769192864,
+            "n_high_quality": 47,
+            "n_medium_quality": 83,
+            "n_low_quality": 31,
+            "mean_n_predictors": 518.5776397515529,
+            "mean_n_prs_variants_per_region": 1.4099378881987579
+          },
+          "calibration": {
+            "scaling_factor": 1.1024306638373507,
+            "scaling_factor_se": 0.008807267459110982,
+            "calibration_intercept": -0.04686357974438626,
+            "calibration_r2": 0.8304028302726637,
+            "sd_cv_predicted": 0.4739373262010431,
+            "sd_true": 0.5733605238255345,
+            "sd_scaled": 0.522483041141115,
+            "attenuation_factor": 0.8265956697522057,
+            "n_calibration": 3202,
+            "raw_empirical_residual_sd": 0.2410610886071535,
+            "calibrated_empirical_residual_sd": 0.23612234540894936,
+            "diagonal_model_se_lower_bound": 0.2494446756390158
+          },
+          "prs_id": null,
+          "platform_name": "custom",
+          "genome_build": "GRCh38",
+          "model_name": null,
+          "window_size": 1000000,
+          "cv_folds": 5
+        },
+        "calibration": {
+          "scaling_factor": 1.1024306638373507,
+          "scaling_factor_se": 0.008807267459110982,
+          "calibration_intercept": -0.04686357974438626,
+          "calibration_r2": 0.8304028302726637,
+          "sd_cv_predicted": 0.4739373262010431,
+          "sd_true": 0.5733605238255345,
+          "sd_scaled": 0.522483041141115,
+          "attenuation_factor": 0.8265956697522057,
+          "n_calibration": 3202,
+          "raw_empirical_residual_sd": 0.2410610886071535,
+          "calibrated_empirical_residual_sd": 0.23612234540894936,
+          "diagonal_model_se_lower_bound": 0.2494446756390158
+        },
+        "r2_summary": {
+          "n": 155,
+          "mean": 0.649830665000234,
+          "median": 0.6992748897134393,
+          "std": 0.23392586976354046,
+          "min": 0.011163651524233487,
+          "max": 0.9652839769192864
+        },
+        "phases": [
+          {
+            "name": "fit",
+            "wall_seconds": 120.17266987496987,
+            "tm_current_bytes": null,
+            "tm_delta_bytes": null
+          }
+        ],
+        "error": null
+      },
+      "gpu": {
+        "label": "gpu_parity_projection_mps",
+        "outcome": "completed",
+        "ok": true,
+        "reference": "/Users/jeya/Documents/projects/imputed-prs/benchmarks/data/work_streaming/pos/1+2+3+4+5+6+7+8+9+10+11+12+13+14+15+16+17+18+19+20+21+22.vcf.gz",
+        "n_prs_variants_on_chroms": 313,
+        "wall_seconds": 98.17111337487586,
+        "peak_rss_bytes": 3858366464,
+        "peak_rss_gb": 3.858366464,
+        "peak_rss_authoritative": true,
+        "n_units": 161,
+        "summary": {
+          "n_observed_variants": 75,
+          "n_observed_with_fallback": 73,
+          "n_missing_variants": 227,
+          "n_definition_variants": 313,
+          "n_dropped": 11,
+          "dropped_by_reason": {
+            "not_in_reference": 7,
+            "allele_mismatch": 4
+          },
+          "n_training_failed": 0,
+          "training_failures_by_type": {},
+          "coverage": 0.9648562300319489,
+          "n_regions": 161,
+          "n_intercept_only_regions": 6,
+          "training_summary": {
+            "mean_r2": 0.6255929688489215,
+            "median_r2": 0.6913777589797974,
+            "std_r2": 0.25984186402089215,
+            "min_r2": -0.0015032291412353516,
+            "max_r2": 0.9652824401855469,
+            "n_high_quality": 47,
+            "n_medium_quality": 83,
+            "n_low_quality": 31,
+            "mean_n_predictors": 518.5776397515529,
+            "mean_n_prs_variants_per_region": 1.4099378881987579
+          },
+          "calibration": {
+            "scaling_factor": 1.1024278784997494,
+            "scaling_factor_se": 0.008807325764641587,
+            "calibration_intercept": -0.04686213666204109,
+            "calibration_r2": 0.8304002539292543,
+            "sd_cv_predicted": 0.473937788423705,
+            "sd_true": 0.5733605238255345,
+            "sd_scaled": 0.5224822306328082,
+            "attenuation_factor": 0.8265964759162903,
+            "n_calibration": 3202,
+            "raw_empirical_residual_sd": 0.24106258901756045,
+            "calibrated_empirical_residual_sd": 0.23612413886440392,
+            "diagonal_model_se_lower_bound": 0.24944533945990893
+          },
+          "prs_id": null,
+          "platform_name": "custom",
+          "genome_build": "GRCh38",
+          "model_name": null,
+          "window_size": 1000000,
+          "cv_folds": 5
+        },
+        "calibration": {
+          "scaling_factor": 1.1024278784997494,
+          "scaling_factor_se": 0.008807325764641587,
+          "calibration_intercept": -0.04686213666204109,
+          "calibration_r2": 0.8304002539292543,
+          "sd_cv_predicted": 0.473937788423705,
+          "sd_true": 0.5733605238255345,
+          "sd_scaled": 0.5224822306328082,
+          "attenuation_factor": 0.8265964759162903,
+          "n_calibration": 3202,
+          "raw_empirical_residual_sd": 0.24106258901756045,
+          "calibrated_empirical_residual_sd": 0.23612413886440392,
+          "diagonal_model_se_lower_bound": 0.24944533945990893
+        },
+        "r2_summary": {
+          "n": 155,
+          "mean": 0.6498294303494115,
+          "median": 0.6992861032485962,
+          "std": 0.23392811409180234,
+          "min": 0.011163711547851562,
+          "max": 0.9652824401855469
+        },
+        "phases": [
+          {
+            "name": "fit",
+            "wall_seconds": 97.39796324982308,
+            "tm_current_bytes": null,
+            "tm_delta_bytes": null
+          }
+        ],
+        "error": null
+      },
+      "status": "ok",
+      "n_fields_compared": 61,
+      "n_mismatch": 0,
+      "mismatches": {},
+      "cpu_wall_seconds": 120.95033991709352,
+      "gpu_wall_seconds": 98.17111337487586,
+      "cpu_over_gpu_speedup": 1.232035939688623,
+      "cpu_peak_rss_gb": 3.568402432,
+      "gpu_peak_rss_gb": 3.858366464
+    }
+  }
+}

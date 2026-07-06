@@ -115,6 +115,7 @@ class LinearImputationPRS:
         exclude_ambiguous: bool = False,
         ambiguous_maf_threshold: float = 0.4,
         backend: Literal["auto", "dense", "streaming"] = "auto",
+        device: Literal["auto", "cpu", "mps", "cuda"] = "auto",
         verbose: int = 1,
     ):
         """Initialize LinearImputationPRS model.
@@ -164,6 +165,15 @@ class LinearImputationPRS:
                 - "auto": pick "streaming" when the estimated dense matrix is large
                   (so test-sized inputs stay on the dense oracle, keeping the golden
                   gate exact), else "dense". Default: "auto".
+            device: Compute device for the streaming backend's Gram kernels.
+                - "cpu": numpy/scipy (always available; the correctness oracle).
+                - "mps"/"cuda": run the batched solves/accumulation on the GPU via
+                  ``torch`` (requires the ``gpu`` extra). Matches the CPU result within
+                  statistical-parity tolerance (float32 on MPS).
+                - "auto": use the GPU if ``torch`` + a device are available, else CPU.
+                  With no ``torch`` installed this resolves to "cpu", so the default is
+                  safe. Only the streaming path is device-aware; the dense path is
+                  always CPU. Default: "auto".
             verbose: Verbosity level. 0=silent, 1=progress bar, 2=debug output.
                 Default: 1.
         """
@@ -176,6 +186,10 @@ class LinearImputationPRS:
         if backend not in ("auto", "dense", "streaming"):
             raise ValidationError(
                 f"backend must be 'auto', 'dense', or 'streaming', got {backend!r}"
+            )
+        if device not in ("auto", "cpu", "mps", "cuda"):
+            raise ValidationError(
+                f"device must be 'auto', 'cpu', 'mps', or 'cuda', got {device!r}"
             )
         if max_tuning_variants is not None and max_tuning_variants <= 0:
             raise ValidationError(
@@ -194,6 +208,7 @@ class LinearImputationPRS:
         self.exclude_ambiguous = exclude_ambiguous
         self.ambiguous_maf_threshold = ambiguous_maf_threshold
         self.backend = backend
+        self.device = device
         self.verbose = verbose
 
         # Fitted state (populated by fit())
@@ -1051,7 +1066,7 @@ class LinearImputationPRS:
             )
 
         # Single streaming pass: imputed models + observed fallbacks + calibration.
-        fitter = StreamingImputationFitter(plan)
+        fitter = StreamingImputationFitter(plan, device=self.device)
         result = fitter.run(source)
 
         calibration_params = finalize_imputation_calibration(

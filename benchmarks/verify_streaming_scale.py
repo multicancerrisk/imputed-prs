@@ -199,6 +199,56 @@ def part_projection(meta: RunMetadata) -> Dict:
     return rec
 
 
+def part_finding1(meta: RunMetadata) -> Dict:
+    """Phase-3E: band-limited per-fold Gram — projection peak RSS on the dense chr20-22
+    score, at the baseline (``max_predictors=None``, apples-to-apples with
+    ``projection_chr20-22.json``) and at a bounded ``max_predictors=500`` (the recommended
+    dense-score setting the lazy Gram now makes memory-cheap)."""
+    ref = WORK / "pos" / "22+21+20.vcf.gz"  # same cached reference as part_projection
+    sub, prs_csv = _restricted_prs_csv(PGS_SCALE, {"20", "21", "22"}, "20-22")
+    baseline_gb = None
+    base_path = RESULTS / "projection_chr20-22.json"
+    if base_path.exists():
+        baseline_gb = json.loads(base_path.read_text()).get("peak_rss_gb")
+
+    variants: Dict[str, Dict] = {}
+    for tag, mp in (("max_predictors_none", None), ("max_predictors_500", 500)):
+        res = _run(_spec(f"finding1_proj_{tag}", "projection", ref, prs_csv,
+                         _config("streaming", max_predictors=mp), 3202, len(sub)), meta, 3600)
+        o = res.result or {}
+        ts = (o.get("summary") or {}).get("training_summary") or {}
+        variants[tag] = {
+            "max_predictors": mp,
+            "outcome": res.outcome,
+            "ok": res.ok,
+            "wall_seconds": res.wall_seconds,
+            "peak_rss_gb": (res.peak_rss_bytes or 0) / 1e9,
+            "peak_rss_authoritative": res.peak_rss_is_authoritative,
+            "n_regions": (o.get("summary") or {}).get("n_regions"),
+            "mean_n_predictors": ts.get("mean_n_predictors"),
+            "calibration_r2": (o.get("calibration") or {}).get("calibration_r2"),
+            "error": res.error_message,
+        }
+
+    none_gb = variants["max_predictors_none"]["peak_rss_gb"]
+    rec = {
+        "finding": "band-limited per-fold Gram (lazy on-demand projection Gram, Phase 3E)",
+        "reference": str(ref),
+        "n_prs_variants_on_chroms": len(sub),
+        "baseline_peak_rss_gb": baseline_gb,  # projection_chr20-22.json (incremental (K,cap,cap))
+        "variants": variants,
+        "drop_vs_baseline": (
+            {"none": baseline_gb / none_gb if (baseline_gb and none_gb) else None,
+             "max_predictors_500": (
+                 baseline_gb / variants["max_predictors_500"]["peak_rss_gb"]
+                 if (baseline_gb and variants["max_predictors_500"]["peak_rss_gb"]) else None)}
+        ),
+    }
+    RESULTS.mkdir(parents=True, exist_ok=True)
+    (RESULTS / "finding1_projection_gram.json").write_text(json.dumps(rec, indent=2, default=str))
+    return rec
+
+
 def part_impute(meta: RunMetadata) -> Dict:
     ref = WORK / "pos" / "22.vcf.gz"  # 34,388 positions, 3,202 samples (cached, complete)
     sub, prs_csv = _restricted_prs_csv(PGS_SCALE, {"22"}, "22")
@@ -328,10 +378,26 @@ def _print_parity(out: Dict) -> None:
             print(f"      Δ {k}: dense={v['dense']} stream={v['stream']}")
 
 
+def _print_finding1(rec: Dict) -> None:
+    base = rec.get("baseline_peak_rss_gb")
+    print("\n=== Phase-3E band-limited per-fold Gram: projection chr20-22 peak RSS ===")
+    print(f"  baseline (incremental (K,cap,cap), projection_chr20-22.json): "
+          f"{base:.2f} GB" if base else "  baseline: (missing)")
+    for tag, v in rec.get("variants", {}).items():
+        drop = (base / v["peak_rss_gb"]) if (base and v.get("peak_rss_gb")) else None
+        print(f"  {tag:20s} mp={str(v['max_predictors']):5s} {v['outcome']:9s} "
+              f"peak={v['peak_rss_gb']:.2f} GB  wall={ (v['wall_seconds'] or 0):.0f}s"
+              f"  n_regions={v.get('n_regions')} mean_pred={v.get('mean_n_predictors')}"
+              + (f"  →  {drop:.1f}× lower than baseline" if drop else ""))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--part", choices=["parity", "projection", "impute", "ram", "ram_impute", "all"],
-                    default="all")
+    ap.add_argument(
+        "--part",
+        choices=["parity", "projection", "finding1", "impute", "ram", "ram_impute", "all"],
+        default="all",
+    )
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     meta = collect_metadata()
@@ -341,6 +407,8 @@ def main() -> None:
         _print_parity(part_parity(meta))
     if args.part in ("projection", "all"):
         part_projection(meta)
+    if args.part in ("finding1", "all"):
+        _print_finding1(part_finding1(meta))
     if args.part in ("impute", "all"):
         part_impute(meta)
     if args.part in ("ram", "all"):

@@ -79,9 +79,13 @@ def panel(tmp_path_factory):
 
 
 def _fit(path, prs_df, platform, backend):
+    # device="cpu" pins the numeric path: this file validates the streaming
+    # sufficient-statistics algorithm vs the dense oracle at float64, independent of
+    # whether torch/MPS is installed. GPU (float32) parity is covered by
+    # tests/test_compute_backend.py.
     model = LinearImputationPRS(
         window_size=WINDOW, tuning_scope="none", alpha=0.01, l1_ratio=0.5,
-        cv_folds=5, random_state=SEED, backend=backend, verbose=0,
+        cv_folds=5, random_state=SEED, backend=backend, device="cpu", verbose=0,
     )
     model.fit(reference_genotypes=path, prs_definition=prs_df,
               platform_variants=platform, genome_build="GRCh38")

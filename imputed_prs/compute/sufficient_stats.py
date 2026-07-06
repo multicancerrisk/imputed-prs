@@ -31,6 +31,7 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import KFold
 
+from imputed_prs.compute.device import resolve_streaming_backend
 from imputed_prs.compute.gram_solve import LocalGramBlock, fit_from_local_gram
 from imputed_prs.core.harmonizer import normalize_chromosome_array
 from imputed_prs.core.types import ImputedVariantModel
@@ -149,15 +150,30 @@ class _ChipGramBuffer:
     sub-block by pure indexing — no sample-axis matmul per target.
     """
 
-    def __init__(self, n_samples: int, folds: GlobalFolds, capacity: int = 256):
+    def __init__(
+        self,
+        n_samples: int,
+        folds: GlobalFolds,
+        capacity: int = 256,
+        lazy_fold_gram: bool = False,
+    ):
         self.n = n_samples
         self.folds = folds
         self.K = folds.n_folds
         self.cap = capacity
         self.m = 0
+        # ``lazy_fold_gram`` (projection): do NOT maintain the O(cap²) full Gram or the
+        # O(K·cap²) per-fold Gram incrementally. Both are recomputed on-demand at ``gather``
+        # from the resident band ``Z`` over each unit's ≤max_predictors fit predictors, so a
+        # chromosome-spanning merged region (cap ~ thousands) never allocates a (K, cap, cap)
+        # tensor. Imputation keeps the incremental path (many small units ⇒ per-unit recompute
+        # would dominate); this is the Finding-#1 band-limited per-fold Gram fix.
+        self.lazy_fold_gram = lazy_fold_gram
         self.Z = np.zeros((n_samples, capacity), dtype=np.float64)
-        self.Gfull = np.zeros((capacity, capacity), dtype=np.float64)
-        self.Ghold = np.zeros((self.K, capacity, capacity), dtype=np.float64)
+        self.Gfull = None if lazy_fold_gram else np.zeros((capacity, capacity), dtype=np.float64)
+        self.Ghold = (
+            None if lazy_fold_gram else np.zeros((self.K, capacity, capacity), dtype=np.float64)
+        )
         self.zsum = np.zeros(capacity, dtype=np.float64)
         self.zsqsum = np.zeros(capacity, dtype=np.float64)
         self.zsum_h = np.zeros((self.K, capacity), dtype=np.float64)
@@ -175,12 +191,13 @@ class _ChipGramBuffer:
         Znew = np.zeros((self.n, new_cap), dtype=np.float64)
         Znew[:, : self.cap] = self.Z
         self.Z = Znew
-        G = np.zeros((new_cap, new_cap))
-        G[: self.cap, : self.cap] = self.Gfull
-        self.Gfull = G
-        Gh = np.zeros((self.K, new_cap, new_cap))
-        Gh[:, : self.cap, : self.cap] = self.Ghold
-        self.Ghold = Gh
+        if not self.lazy_fold_gram:  # else the Grams are recomputed on-demand at gather
+            G = np.zeros((new_cap, new_cap))
+            G[: self.cap, : self.cap] = self.Gfull
+            self.Gfull = G
+            Gh = np.zeros((self.K, new_cap, new_cap))
+            Gh[:, : self.cap, : self.cap] = self.Ghold
+            self.Ghold = Gh
         for name in ("zsum", "zsqsum", "pos", "af", "pidx"):
             arr = getattr(self, name)
             new = np.zeros(new_cap, dtype=arr.dtype)
@@ -199,18 +216,20 @@ class _ChipGramBuffer:
             self._grow()
         s = self.m
         m = self.m
-        Za = self.Z[:, :m]
-        dots = Za.T @ col_perm  # (m,)
-        self.Gfull[:m, s] = dots
-        self.Gfull[s, :m] = dots
-        self.Gfull[s, s] = float(col_perm @ col_perm)
+        if not self.lazy_fold_gram:  # incremental band Gram (imputation); else recomputed at gather
+            Za = self.Z[:, :m]
+            dots = Za.T @ col_perm  # (m,)
+            self.Gfull[:m, s] = dots
+            self.Gfull[s, :m] = dots
+            self.Gfull[s, s] = float(col_perm @ col_perm)
         for k in range(self.K):
             sl = self.folds.fold_slice(k)
             ck = col_perm[sl]
-            dk = self.Z[sl, :m].T @ ck
-            self.Ghold[k, :m, s] = dk
-            self.Ghold[k, s, :m] = dk
-            self.Ghold[k, s, s] = float(ck @ ck)
+            if not self.lazy_fold_gram:
+                dk = self.Z[sl, :m].T @ ck
+                self.Ghold[k, :m, s] = dk
+                self.Ghold[k, s, :m] = dk
+                self.Ghold[k, s, s] = float(ck @ ck)
             self.zsum_h[k, s] = float(ck.sum())
             self.zsqsum_h[k, s] = float(ck @ ck)
         self.Z[:, s] = col_perm
@@ -221,6 +240,17 @@ class _ChipGramBuffer:
         self.pidx[s] = platform_idx
         self.slot_of[platform_idx] = s
         self.m += 1
+
+    def add_batch(self, cols, platform_indices, positions, afs) -> None:
+        """Append a group of chip columns at once (batched-accumulation seam).
+
+        The CPU buffer just loops ``add`` so it stays **bit-for-bit** the per-column path
+        (the golden oracle); the GPU buffer overrides this to fold the whole group's band-Gram
+        update into GEMMs (``Zᵀ·NewCols``), which is where the on-device accumulation actually
+        wins at scale. The streaming driver calls this once per stream block.
+        """
+        for col, pidx, pos, af in zip(cols, platform_indices, positions, afs):
+            self.add(col, pidx, pos, af)
 
     def evict_below(self, min_pos: int) -> None:
         """Drop leading (oldest, lowest-position) columns with ``pos < min_pos``."""
@@ -233,8 +263,9 @@ class _ChipGramBuffer:
         keep = m - c
         # Overlapping in-place shifts: copy RHS first.
         self.Z[:, :keep] = self.Z[:, c:m].copy()
-        self.Gfull[:keep, :keep] = self.Gfull[c:m, c:m].copy()
-        self.Ghold[:, :keep, :keep] = self.Ghold[:, c:m, c:m].copy()
+        if not self.lazy_fold_gram:
+            self.Gfull[:keep, :keep] = self.Gfull[c:m, c:m].copy()
+            self.Ghold[:, :keep, :keep] = self.Ghold[:, c:m, c:m].copy()
         for name in ("zsum", "zsqsum", "pos", "af", "pidx"):
             arr = getattr(self, name)
             arr[:keep] = arr[c:m].copy()
@@ -268,6 +299,26 @@ class _ChipGramBuffer:
             (self.slot_of[int(p)] for p in platform_indices), dtype=np.int64,
             count=len(platform_indices),
         )
+        if self.lazy_fold_gram:
+            # Recompute the (p, p) full + (K, p, p) per-fold Gram on-demand over just this
+            # unit's fit predictors, from the resident band ``Z`` — never a (K, cap, cap)
+            # tensor. Both come from the same ``Zsub`` slice, so ``G == Σ_k fold_G[k]`` and
+            # ``G − fold_G[k]`` is an exact held-in training Gram (Finding-#1 fix).
+            Zsub = self.Z[:, idx]  # (n, p) fresh copy, released after the solve
+            p = idx.shape[0]
+            fold_G = np.empty((self.K, p, p), dtype=np.float64)
+            for k in range(self.K):
+                Zk = Zsub[self.folds.fold_slice(k)]  # (n_k, p) view
+                fold_G[k] = Zk.T @ Zk
+            return idx, {
+                "G": Zsub.T @ Zsub,
+                "fold_G": fold_G,
+                "zsum": self.zsum[idx],
+                "zsqsum": self.zsqsum[idx],
+                "fold_zsum": self.zsum_h[:, idx],
+                "fold_zsqsum": self.zsqsum_h[:, idx],
+                "af": self.af[idx],
+            }
         ix = np.ix_(idx, idx)
         return idx, {
             "G": self.Gfull[ix],
@@ -449,9 +500,11 @@ def _run_fit_chunk(jobs, buf, folds, alpha, l1_ratio, cv_folds, s_true, s_cv):
 class StreamingImputationFitter:
     """Fit all missing-variant models by streaming the panel once per chromosome."""
 
-    def __init__(self, plan: StreamPlan):
+    def __init__(self, plan: StreamPlan, device: str = "cpu"):
         self.plan = plan
         self.folds = GlobalFolds(len(plan.sample_ids), plan.cv_folds, plan.random_state)
+        # device="auto" engages the GPU only when n is large enough to beat CPU (size guard).
+        self.backend = resolve_streaming_backend(device, self.folds.n)
         self.W = plan.window_size
         self.chrom_index = ChromosomeIndex(plan.platform_variant_info)
         pvi = plan.platform_variant_info
@@ -506,7 +559,7 @@ class StreamingImputationFitter:
         self, source, chrom, models, fallback_models, failures
     ) -> int:
         plan = self.plan
-        buf = _ChipGramBuffer(self.folds.n, self.folds)
+        buf = self.backend.make_buffer(self.folds.n, self.folds)
         open_targets: List[_OpenTarget] = []
         n_intercept_only = 0
         frontier = -1
@@ -538,6 +591,7 @@ class StreamingImputationFitter:
             dos = block.dosages  # (n, b) float32, natural sample order, raw ALT
             ids = info["variant_id"].to_numpy()
             positions = info["position"].to_numpy()
+            chip_cols, chip_pidx, chip_pos, chip_af = [], [], [], []
             for j in range(len(ids)):
                 sid = ids[j]
                 is_chip = sid in plan.chip_ids
@@ -550,7 +604,10 @@ class StreamingImputationFitter:
                 pos = int(positions[j])
                 if is_chip:  # raw ALT-counted predictor column
                     col_perm, af, _ = _prepare_column(raw, flip=False, folds=self.folds)
-                    buf.add(col_perm, plan.chip_ids[sid], pos, af)
+                    chip_cols.append(col_perm)
+                    chip_pidx.append(plan.chip_ids[sid])
+                    chip_pos.append(pos)
+                    chip_af.append(af)
                 if obs is not None:  # observed PRS calibration term (effect-oriented)
                     x_eff, _, _ = _prepare_column(raw, flip=obs.effect_flip, folds=self.folds)
                     self.s_true += obs.beta * x_eff
@@ -569,6 +626,11 @@ class StreamingImputationFitter:
                         _OpenTarget(sid, fb, col_perm, af, is_fallback=True)
                     )
                 frontier = max(frontier, pos)
+            # One batched band-Gram update per stream block (GPU: GEMM accumulation; the
+            # band is only read in close_ready, and every column is added before it either
+            # way, so this is exactly the per-column path).
+            if chip_cols:
+                buf.add_batch(chip_cols, chip_pidx, chip_pos, chip_af)
             close_ready(force=False)
             buf.evict_below(frontier - 2 * self.W)
 
@@ -602,7 +664,7 @@ class StreamingImputationFitter:
                 store=self._impute_storer(spec, tgt.af, dest),
                 fail=self._impute_failer(spec.prs_variant_id, fmap),
             ))
-        return _run_fit_batch(
+        return self.backend.run_fit_batch(
             jobs, buf, self.folds, self.plan.alpha, self.plan.l1_ratio,
             self.plan.cv_folds, self.s_true, self.s_cv, self._batch_cap,
         )
@@ -829,6 +891,7 @@ def streaming_fit_imputation(
     l1_ratio: float = 0.5,
     cv_folds: int = 5,
     random_state: Optional[int] = None,
+    device: str = "cpu",
 ):
     """End-to-end streaming imputation: scan metadata, harmonize, fit, accumulate.
 
@@ -847,7 +910,7 @@ def streaming_fit_imputation(
         window_size=window_size, max_predictors=max_predictors, alpha=alpha,
         l1_ratio=l1_ratio, cv_folds=cv_folds, random_state=random_state,
     )
-    fitter = StreamingImputationFitter(plan)
+    fitter = StreamingImputationFitter(plan, device=device)
     result = fitter.run(source)
     return result, plan, drop_reasons
 

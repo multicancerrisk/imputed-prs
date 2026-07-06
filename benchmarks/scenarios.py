@@ -121,6 +121,8 @@ def _make_model(method: str, config: Dict[str, Any]):
     )
     if config.get("backend") is not None:  # Phase-2 dense/streaming/auto selector
         common["backend"] = config["backend"]  # both methods now honor it (M2 + M3)
+    if config.get("device") is not None:  # Phase-3 compute device for the streaming Gram kernels
+        common["device"] = config["device"]  # "cpu"|"mps"|"cuda"|"auto"; auto→cpu without torch
     if method == "projection":
         common["max_tuning_regions"] = config.get("max_tuning_regions", 50)
         return LinearProjectionPRS(**common)

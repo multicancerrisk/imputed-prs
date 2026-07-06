@@ -31,18 +31,17 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from imputed_prs.compute.device import resolve_streaming_backend
 from imputed_prs.compute.gram_solve import fit_from_local_gram  # noqa: F401 (kernel dep)
 from imputed_prs.compute.sufficient_stats import (
     GlobalFolds,
     ObservedVar,
     TargetVar,
-    _ChipGramBuffer,
     _chrom_sort_key,
     _FitJob,
     _OpenTarget,
     _prepare_column,
     _region_for,
-    _run_fit_batch,
 )
 from imputed_prs.core.harmonizer import normalize_chromosome_array
 from imputed_prs.core.regions import merge_variant_windows
@@ -124,9 +123,11 @@ class _OpenRegion:
 class StreamingProjectionFitter:
     """Fit all region projection models by streaming the panel once per chromosome."""
 
-    def __init__(self, plan: ProjectionStreamPlan):
+    def __init__(self, plan: ProjectionStreamPlan, device: str = "cpu"):
         self.plan = plan
         self.folds = GlobalFolds(len(plan.sample_ids), plan.cv_folds, plan.random_state)
+        # device="auto" engages the GPU only when n is large enough to beat CPU (size guard).
+        self.backend = resolve_streaming_backend(device, self.folds.n)
         self.W = plan.window_size
         self.chrom_index = ChromosomeIndex(plan.platform_variant_info)
         pvi = plan.platform_variant_info
@@ -183,7 +184,10 @@ class StreamingProjectionFitter:
         self, source, chrom, region_models, fallback_models, failures
     ) -> int:
         plan = self.plan
-        buf = _ChipGramBuffer(self.folds.n, self.folds)
+        # Projection units are few + wide (merged regions span ≫ 2W), so the per-fold Gram
+        # is materialised on-demand per region (≤max_predictors) rather than kept as a
+        # (K, cap, cap) band tensor — Finding-#1 band-limited per-fold Gram (Phase 3E).
+        buf = self.backend.make_buffer(self.folds.n, self.folds, lazy_fold_gram=True)
         region_ptr = 0  # next region (in start order) not yet closed
         chrom_regions = self._regions_by_chrom.get(str(chrom), [])
         open_sr: Dict[int, np.ndarray] = {}  # region_idx -> accumulating S_R
@@ -221,7 +225,7 @@ class StreamingProjectionFitter:
                     still_open.append(tgt)
             open_fallbacks[:] = still_open
             if jobs:
-                n_intercept_only += _run_fit_batch(
+                n_intercept_only += self.backend.run_fit_batch(
                     jobs, buf, self.folds, plan.alpha, plan.l1_ratio, plan.cv_folds,
                     self.s_true, self.s_cv, self._batch_cap,
                 )
@@ -232,6 +236,7 @@ class StreamingProjectionFitter:
             dos = block.dosages
             ids = info["variant_id"].to_numpy()
             positions = info["position"].to_numpy()
+            chip_cols, chip_pidx, chip_pos, chip_af = [], [], [], []
             for j in range(len(ids)):
                 sid = ids[j]
                 is_chip = sid in plan.chip_ids
@@ -244,7 +249,10 @@ class StreamingProjectionFitter:
                 pos = int(positions[j])
                 if is_chip:  # raw ALT-counted predictor column
                     col_perm, af, _ = _prepare_column(raw, flip=False, folds=self.folds)
-                    buf.add(col_perm, plan.chip_ids[sid], pos, af)
+                    chip_cols.append(col_perm)
+                    chip_pidx.append(plan.chip_ids[sid])
+                    chip_pos.append(pos)
+                    chip_af.append(af)
                 if obs is not None:  # observed PRS calibration term (effect-oriented)
                     x_eff, _, _ = _prepare_column(raw, flip=obs.effect_flip, folds=self.folds)
                     self.s_true += obs.beta * x_eff
@@ -262,6 +270,10 @@ class StreamingProjectionFitter:
                     col_perm, af, _ = _prepare_column(raw, flip=fb.effect_flip, folds=self.folds)
                     open_fallbacks.append(_OpenTarget(sid, fb, col_perm, af, is_fallback=True))
                 frontier = max(frontier, pos)
+            # One batched band-Gram update per stream block (GPU: GEMM accumulation); the band
+            # is only read in close_ready, so this matches the per-column path exactly.
+            if chip_cols:
+                buf.add_batch(chip_cols, chip_pidx, chip_pos, chip_af)
             close_ready(force=False)
             self._evict(buf, chrom_regions, region_ptr, frontier)
 
@@ -590,6 +602,7 @@ def streaming_fit_projection(
     l1_ratio: float = 0.5,
     cv_folds: int = 5,
     random_state: Optional[int] = None,
+    device: str = "cpu",
 ):
     """End-to-end streaming projection: scan metadata, harmonize → regions, fit, accumulate.
 
@@ -609,5 +622,5 @@ def streaming_fit_projection(
         window_size=window_size, max_predictors=max_predictors, alpha=alpha,
         l1_ratio=l1_ratio, cv_folds=cv_folds, random_state=random_state,
     )
-    result = StreamingProjectionFitter(plan).run(source)
+    result = StreamingProjectionFitter(plan, device=device).run(source)
     return result, plan, drop_reasons

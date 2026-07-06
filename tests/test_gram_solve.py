@@ -7,6 +7,8 @@ across shapes/hyperparameters, plus the three intercept-only fallbacks and the
 sklearn-private-API guardrail. Runs in seconds.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 from sklearn.model_selection import KFold
@@ -15,6 +17,8 @@ from imputed_prs.compute.gram_solve import (
     LocalGramBlock,
     _select_solver,
     fit_from_local_gram,
+    ridge_gram_fit,
+    standardize_from_moments,
 )
 from imputed_prs.models.elastic_net import fit_single_variant_model
 
@@ -127,6 +131,57 @@ def test_scale_highreg_kink_parity():
     np.testing.assert_allclose(gram.coefficients, legacy.coefficients, atol=1e-9)
     np.testing.assert_allclose(gram.intercept, legacy.intercept, atol=1e-9)
     # CV metrics + OOF are within a small statistical band (kink sensitivity).
+    assert abs(gram.cv_r2 - legacy.cv_r2) < 5e-3
+    oof = oof_from_fold_models(gram, X, cv_folds, seed)
+    assert np.max(np.abs(oof - legacy.cv_predictions)) < 5e-3
+
+
+@pytest.mark.parametrize("n,p", [(200, 8), (500, 20), (137, 3), (300, 1)])
+@pytest.mark.parametrize("alpha", [0.01, 0.1, 0.001])
+def test_ridge_closed_form_exact(n, p, alpha):
+    """The ridge fast-path solves ``(G_std + alpha*n*I) w = q_std`` exactly.
+
+    Cholesky (``ridge_gram_fit``) must agree with a direct ``np.linalg.solve`` to
+    machine precision — this is a deterministic closed form, not an iteration.
+    """
+    X, y = make_dosage_data(n, p, seed=n + p)
+    block = build_block(X, y, 5, 42)
+    G_std, q_std, _yc2, _mean, _scale, _ybar = standardize_from_moments(
+        block.G, block.c, block.zsum, block.zsqsum, block.ysum, block.ysqsum, n
+    )
+    w = ridge_gram_fit(G_std, q_std, n, alpha)
+    w_ref = np.linalg.solve(G_std + alpha * n * np.eye(p), q_std)
+    np.testing.assert_allclose(w, w_ref, atol=1e-10, rtol=1e-8)
+
+
+@pytest.mark.parametrize("n,p", [(200, 8), (500, 20), (137, 3), (300, 1)])
+@pytest.mark.parametrize("alpha", [0.01, 0.1, 0.001])
+def test_ridge_matches_legacy(n, p, alpha):
+    """``l1_ratio=0`` fast-path agrees with the legacy sklearn ridge (ElasticNet l1=0).
+
+    The fast-path is the *exact* ridge optimum (``test_ridge_closed_form_exact``); the
+    legacy path reaches it only iteratively, and how tightly is **sklearn-version
+    dependent** — its coordinate descent for the degenerate ``l1_ratio=0`` case converges
+    to ~1e-14 under sklearn 1.8 but only ~1e-5 under sklearn 1.9. So the fast-path is if
+    anything *more* accurate than legacy, and the two agree within the sanctioned
+    statistical-parity band (observed worst ~1e-5, checked with generous headroom below
+    the 5e-3 band) rather than bit-for-bit.
+    """
+    seed, cv_folds = 42, 5
+    X, y = make_dosage_data(n, p, seed=n + p)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # sklearn warns on ElasticNet(l1_ratio=0)
+        legacy = fit_single_variant_model(
+            y, X, l1_ratio=0.0, alpha=alpha, cv_folds=cv_folds, random_state=seed
+        )
+    gram = fit_from_local_gram(
+        build_block(X, y, cv_folds, seed), alpha=alpha, l1_ratio=0.0, cv_folds=cv_folds
+    )
+
+    assert gram.is_intercept_only == legacy.is_intercept_only
+    np.testing.assert_allclose(gram.coefficients, legacy.coefficients, atol=1e-3, rtol=1e-3)
+    np.testing.assert_allclose(gram.intercept, legacy.intercept, atol=1e-3, rtol=1e-3)
+    np.testing.assert_allclose(gram.cv_mse, legacy.cv_mse, atol=1e-3, rtol=1e-3)
     assert abs(gram.cv_r2 - legacy.cv_r2) < 5e-3
     oof = oof_from_fold_models(gram, X, cv_folds, seed)
     assert np.max(np.abs(oof - legacy.cv_predictions)) < 5e-3

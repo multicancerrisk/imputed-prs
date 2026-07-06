@@ -43,11 +43,18 @@ scale = [
     # Lazily imported; the CPU/VCF path works without it.
     "pgenlib>=0.94",
 ]
+gpu = [
+    # GPU compute backend (compute/gpu_backend.py) for Apple MPS / NVIDIA CUDA.
+    # Lazily imported; the CPU path is fully functional without it. On Python 3.14
+    # pip resolves the cp314 arm64/CUDA wheel (torch >= 2.9 ship cp314 wheels).
+    "torch>=2.2",
+]
 
 [tool.pytest.ini_options]
 markers = [
     "integration: marks tests as integration tests (may require network access)",
     "slow: marks tests that are slow or memory-heavy (deselect with '-m \"not slow\"')",
+    "gpu: marks tests requiring the optional torch/GPU backend (skipped without torch)",
 ]
 
 [tool.setuptools.packages.find]
