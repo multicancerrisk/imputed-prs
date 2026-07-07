@@ -18,6 +18,7 @@ from imputed_prs.compute.gram_solve import (
     _select_solver,
     fit_from_local_gram,
     ridge_gram_fit,
+    solve_blocks_batched,
     standardize_from_moments,
 )
 from imputed_prs.models.elastic_net import fit_single_variant_model
@@ -235,3 +236,75 @@ def test_private_solver_guardrail():
         "sklearn private enet_coordinate_descent_gram failed the self-test; "
         "the pinned sklearn may have broken the private API."
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 — batched multi-target solve (solve_blocks_batched). Ridge is exact
+# (closed form), so it is the cleanest oracle for the pad/mask/cv-reconstruct
+# scaffolding, independent of the FISTA optimizer (commit 2).
+# ---------------------------------------------------------------------------
+def _assert_result_close(got, exp, atol=1e-8, rtol=1e-6):
+    assert got.is_intercept_only == exp.is_intercept_only
+    assert got.n_predictors == exp.n_predictors
+    np.testing.assert_allclose(got.coefficients, exp.coefficients, atol=atol, rtol=rtol)
+    np.testing.assert_allclose(got.intercept, exp.intercept, atol=atol, rtol=rtol)
+    np.testing.assert_allclose(got.cv_mse, exp.cv_mse, atol=atol, rtol=rtol)
+    np.testing.assert_allclose(got.cv_r2, exp.cv_r2, atol=atol, rtol=rtol)
+    assert len(got.fold_models) == len(exp.fold_models)
+    for fg, fe in zip(got.fold_models, exp.fold_models):
+        np.testing.assert_allclose(fg.coef, fe.coef, atol=atol, rtol=rtol)
+        np.testing.assert_allclose(fg.intercept, fe.intercept, atol=atol, rtol=rtol)
+
+
+def test_solve_blocks_batched_ridge_matches_per_target():
+    """Batched ridge solve == per-target fit_from_local_gram (exact closed form).
+
+    Heterogeneous predictor counts (incl. an underdetermined p>n block) exercise the
+    pad-to-uniform-P + mask path; the sort-by-p sub-batching must not perturb results.
+    """
+    cv_folds, alpha = 5, 0.05
+    specs = [(200, 8), (500, 20), (137, 3), (300, 1), (250, 12), (10, 15)]  # last: p > n
+    blocks = [
+        build_block(*make_dosage_data(n, p, seed=n + p), cv_folds, seed=42)
+        for n, p in specs
+    ]
+    got = solve_blocks_batched(blocks, alpha=alpha, l1_ratio=0.0, cv_folds=cv_folds)
+    for block, g in zip(blocks, got):
+        exp = fit_from_local_gram(block, alpha=alpha, l1_ratio=0.0, cv_folds=cv_folds)
+        _assert_result_close(g, exp)
+
+
+def test_solve_blocks_batched_partitions_fallbacks_and_none():
+    """The 3 intercept-only fallbacks + ``None`` pass-through match the per-target path.
+
+    Fallbacks are partitioned on the host and reuse ``_intercept_only_result``, so they are
+    bit-identical (atol=1e-12); ``None`` inputs stay ``None`` and never enter the solve.
+    """
+    cv_folds, alpha = 5, 0.0
+    X, y = make_dosage_data(200, 6, seed=7)
+    real = build_block(X, y, cv_folds, seed=42)
+
+    no_pred = LocalGramBlock(
+        n=100, G=np.empty((0, 0)), c=np.empty(0),
+        zsum=np.empty(0), zsqsum=np.empty(0),
+        ysum=float(y[:100].sum()), ysqsum=float(y[:100] @ y[:100]),
+    )
+    Xc, _ = make_dosage_data(200, 4, seed=9)
+    zerovar = build_block(Xc, np.full(200, 1.0), cv_folds, seed=42)  # constant target
+
+    blocks = [real, None, no_pred, zerovar]
+    got = solve_blocks_batched(blocks, alpha=alpha, l1_ratio=0.0, cv_folds=cv_folds)
+    assert got[1] is None
+    for b, g in zip(blocks, got):
+        if b is None:
+            continue
+        exp = fit_from_local_gram(b, alpha=alpha, l1_ratio=0.0, cv_folds=cv_folds)
+        atol = 1e-12 if exp.is_intercept_only else 1e-8
+        _assert_result_close(g, exp, atol=atol)
+
+
+def test_solve_blocks_batched_l1_not_yet_wired():
+    """L1 (l1_ratio>0) raises until batched FISTA lands in commit 2 (ridge-only scope)."""
+    block = build_block(*make_dosage_data(200, 8, seed=7), 5, seed=42)
+    with pytest.raises(NotImplementedError):
+        solve_blocks_batched([block], alpha=0.05, l1_ratio=0.5, cv_folds=5)

@@ -590,3 +590,268 @@ def fit_reference_folds(
             )
         )
     return results
+
+
+# ---------------------------------------------------------------------------
+# Batched multi-target solve (Phase 8) — numpy analogue of the GPU
+# GpuBackend._solve_blocks / _solve_padded_core / _standardize_solve_backtransform /
+# _batched_ridge / _batched_fista (compute/gpu_backend.py:492-707). Many co-windowed
+# targets share the chip-predictor band, so their local Gram blocks are solved together:
+# pad heterogeneous predictor sets to a uniform P with a per-target mask (padded rows get
+# an identity so they solve to 0), solve final + K leave-one-fold-out fold models as
+# batched linear algebra, and reconstruct held-out MSE / cv_r2 batched. This amortizes the
+# per-target Python-call overhead that dominates 2M-variant fits on CPU (the streaming
+# _run_fit_chunk loop). CPU stays torch-free, so this is a *parallel* numpy implementation
+# of the torch code rather than a shared array-module seam; the two are kept in lockstep
+# and coupled only by the parity test (batched == per-target fit_from_local_gram within
+# the sanctioned statistical band). Requires alpha > 0: the batched solve is all-or-nothing
+# on a singular block (one degenerate block raises for the whole batch), and alpha > 0 makes
+# every G_std + α·n·I / + l2 SPD, so there is no per-item lstsq fallback here.
+# ---------------------------------------------------------------------------
+
+# FISTA controls — identical to GpuBackend for parity with its proven behavior
+# (compute/gpu_backend.py:323-327). Reused by _batched_fista (Phase 8 commit 2).
+_FISTA_MAX_ITER = 2000
+_FISTA_TOL = 1e-7
+_POWER_ITERS = 12
+# Power-iteration's Rayleigh quotient under-estimates λ_max, so 1/Lip would be a hair too
+# large a step; nudge Lip up for a safe contraction (cheap robustness, numpy float64).
+_LIPSCHITZ_MARGIN = 1.01
+# Cap the padded (B, K, P, P) fold-Gram working set per sub-batch (matches the GPU budget).
+_SOLVE_GRAM_BUDGET = 512 * 1024 * 1024
+
+
+def solve_blocks_batched(
+    blocks: List[Optional[LocalGramBlock]],
+    alpha: float,
+    l1_ratio: float,
+    cv_folds: int = 5,
+) -> List[Optional[GramFitResult]]:
+    """Batched analogue of ``[fit_from_local_gram(b, alpha, l1_ratio, cv_folds) for b in blocks]``.
+
+    Numpy float64 port of ``GpuBackend._solve_blocks`` (compute/gpu_backend.py:492). The
+    three intercept-only fallbacks (``p==0``, ``n<cv_folds``, ``std(y)<1e-10``) are
+    partitioned on the host in the exact order :func:`fit_from_local_gram` applies them, so
+    they reuse :func:`_intercept_only_result` bit-for-bit; only "real" blocks enter the
+    padded solve. ``None`` inputs pass through as ``None`` (mirrors the streaming caller,
+    which drops failed assembles). Ridge (``l1_ratio == 0``) is exact; the L1 case routes
+    through batched FISTA (statistical parity with sklearn CD, same as the GPU).
+    """
+    results: List[Optional[GramFitResult]] = [None] * len(blocks)
+    real: List[LocalGramBlock] = []
+    real_pos: List[int] = []
+    for i, b in enumerate(blocks):
+        if b is None:
+            continue
+        p, n = b.n_predictors, b.n
+        if p == 0 or n < cv_folds:
+            results[i] = _intercept_only_result(b.ysum, b.ysqsum, n, p)
+            continue
+        ybar = b.ysum / n
+        if np.sqrt(max(b.ysqsum / n - ybar * ybar, 0.0)) < 1e-10:
+            results[i] = _intercept_only_result(b.ysum, b.ysqsum, n, p)
+            continue
+        real.append(b)
+        real_pos.append(i)
+    for pos, res in zip(real_pos, _solve_real_padded(real, alpha, l1_ratio, cv_folds)):
+        results[pos] = res
+    return results
+
+
+def _solve_real_padded(
+    blocks: List[LocalGramBlock], alpha: float, l1_ratio: float, cv_folds: int
+) -> List[Optional[GramFitResult]]:
+    """Sort blocks by predictor count, then sub-batch under :data:`_SOLVE_GRAM_BUDGET`.
+
+    Sorting by ``p`` keeps each sub-batch's padding close to its own max predictor count —
+    a free, exact pad-waste cut the GPU path does not do (it only sub-batches by memory,
+    gpu_backend.py:534-547). Results are returned in the caller's original order.
+    """
+    if not blocks:
+        return []
+    order = sorted(range(len(blocks)), key=lambda i: blocks[i].n_predictors)
+    K = len(blocks[0].fold_n)
+    out: List[Optional[GramFitResult]] = [None] * len(blocks)
+    n = len(order)
+    s = 0
+    while s < n:
+        e = s + 1  # always at least one block per sub-batch (guarantees progress)
+        while e < n:
+            p_next = blocks[order[e]].n_predictors  # sorted asc → the new max in [s, e]
+            cnt = e - s + 1
+            if cnt * K * p_next * p_next * 8 > _SOLVE_GRAM_BUDGET:
+                break
+            e += 1
+        sub = [blocks[order[i]] for i in range(s, e)]
+        for i, res in zip(range(s, e), _solve_padded_core(sub, alpha, l1_ratio)):
+            out[order[i]] = res
+        s = e
+    return out
+
+
+def _solve_padded_core(
+    blks: List[LocalGramBlock], alpha: float, l1_ratio: float
+) -> List[GramFitResult]:
+    """Pad a list of real Gram blocks to a uniform ``P`` and solve final + K fold models.
+
+    Numpy port of ``GpuBackend._solve_padded_core`` (gpu_backend.py:549-624). Fold sizes /
+    moments are carried **per block** (shape ``(B, K)``) rather than the GPU's shared
+    ``(K,)`` — identical under the streaming global-fold partition (every target sees the
+    same fold sizes), but also correct for arbitrary blocks (the block-level parity test).
+    Held-out MSE / cv_r2 are reconstructed with the same quadratic as
+    :func:`_fold_mse_from_block`.
+    """
+    B = len(blks)
+    P = max(b.n_predictors for b in blks)
+    K = len(blks[0].fold_n)
+    zeros = lambda *shp: np.zeros(shp, dtype=np.float64)  # noqa: E731
+
+    Gp = zeros(B, P, P); cp = zeros(B, P); zsp = zeros(B, P); zsqp = zeros(B, P)
+    mask = zeros(B, P)
+    fGp = zeros(B, K, P, P); fcp = zeros(B, K, P); fzsp = zeros(B, K, P); fzsqp = zeros(B, K, P)
+    fysum_m = zeros(B, K); fysqsum_m = zeros(B, K); fn_m = zeros(B, K)
+    ysum_v = zeros(B); ysqsum_v = zeros(B); n_v = zeros(B)
+    for i, b in enumerate(blks):
+        p = b.n_predictors
+        mask[i, :p] = 1.0
+        Gp[i, :p, :p] = b.G; cp[i, :p] = b.c
+        zsp[i, :p] = b.zsum; zsqp[i, :p] = b.zsqsum
+        fGp[i, :, :p, :p] = np.stack(b.fold_G)
+        fcp[i, :, :p] = np.stack(b.fold_c)
+        fzsp[i, :, :p] = np.stack(b.fold_zsum)
+        fzsqp[i, :, :p] = np.stack(b.fold_zsqsum)
+        fysum_m[i] = np.asarray(b.fold_ysum, dtype=np.float64)
+        fysqsum_m[i] = np.asarray(b.fold_ysqsum, dtype=np.float64)
+        fn_m[i] = np.asarray(b.fold_n, dtype=np.float64)
+        ysum_v[i] = b.ysum; ysqsum_v[i] = b.ysqsum; n_v[i] = float(b.n)
+
+    # Final model on the full valid subset.
+    coef_raw, intercept_raw, is_io = _batched_standardize_solve(
+        Gp, cp, zsp, zsqp, ysum_v, ysqsum_v, n_v, mask, alpha, l1_ratio
+    )
+    # K fold models (train-fold = full − held-out-k). Penalty scales with n_tr (invariant R1).
+    fcoef = zeros(B, K, P); fint = zeros(B, K)
+    for k in range(K):
+        n_tr = n_v - fn_m[:, k]
+        ck, ik, _ = _batched_standardize_solve(
+            Gp - fGp[:, k], cp - fcp[:, k], zsp - fzsp[:, k], zsqp - fzsqp[:, k],
+            ysum_v - fysum_m[:, k], ysqsum_v - fysqsum_m[:, k], n_tr, mask, alpha, l1_ratio,
+        )
+        fcoef[:, k] = ck; fint[:, k] = ik
+
+    # Held-out MSE + cv metrics, batched. Per fold, over that fold's held-out stats:
+    #   sse = Σy² + aᵀG_val a + n·b² − 2aᵀc_val − 2b·Σy + 2b·aᵀΣz    (a=fold coef, b=fold int).
+    a = fcoef
+    Ga = np.einsum("bkij,bkj->bki", fGp, a)
+    aGa = (a * Ga).sum(-1); ac = (a * fcp).sum(-1); az = (a * fzsp).sum(-1)
+    bt = fint
+    sse = fysqsum_m + aGa + fn_m * bt * bt - 2.0 * ac - 2.0 * bt * fysum_m + 2.0 * bt * az
+    with np.errstate(divide="ignore", invalid="ignore"):
+        per_fold_mse = np.where(fn_m > 0, sse / fn_m, 0.0)
+    cv_mse = per_fold_mse.mean(axis=1)
+    ss_res = sse.sum(axis=1)  # pooled SS_res over all held-out samples
+    ss_tot = ysqsum_v - ysum_v * ysum_v / n_v  # = Σ(y − ȳ)² over the full valid subset
+    cv_r2 = np.where(ss_tot >= 1e-10, 1.0 - ss_res / ss_tot, 0.0)
+
+    out: List[GramFitResult] = []
+    for i, b in enumerate(blks):
+        p = b.n_predictors
+        fold_models = [
+            FoldModel(coef=fcoef[i, k, :p].copy(), intercept=float(fint[i, k]))
+            for k in range(K)
+        ]
+        out.append(
+            GramFitResult(
+                coefficients=coef_raw[i, :p].copy(),
+                intercept=float(intercept_raw[i]),
+                cv_mse=float(cv_mse[i]),
+                cv_r2=float(cv_r2[i]),
+                is_intercept_only=bool(is_io[i]),
+                n_predictors=p,
+                n_samples=int(b.n),
+                fold_models=fold_models,
+            )
+        )
+    return out
+
+
+def _batched_standardize_solve(
+    G: np.ndarray,
+    c: np.ndarray,
+    zsum: np.ndarray,
+    zsqsum: np.ndarray,
+    ysum: np.ndarray,
+    ysqsum: np.ndarray,
+    n: np.ndarray,
+    mask: np.ndarray,
+    alpha: float,
+    l1_ratio: float,
+):
+    """Batched :func:`standardize_from_moments` + :func:`enet_gram_fit` + back-transform.
+
+    Numpy port of ``GpuBackend._standardize_solve_backtransform`` (gpu_backend.py:627). All
+    inputs carry a leading batch axis ``B``; ``mask`` (B, P) marks real predictor slots.
+    Padded coordinates are forced to zero: their Gram cross-terms are masked out and an
+    identity is placed on the padded diagonal, so they solve to ``w_std=0`` and decouple
+    from the real block (making padding exactly parity-preserving). Returns
+    ``(coef_raw (B,P), intercept_raw (B,), is_intercept_only (B,))``.
+    """
+    B, P, _ = G.shape
+    ninv = 1.0 / n
+    mean = zsum * ninv[:, None]
+    var = zsqsum * ninv[:, None] - mean * mean
+    std = np.sqrt(np.maximum(var, 0.0))
+    scale = np.where(std < _STD_EPS, 1.0, std)
+    ybar = ysum * ninv
+    inv_scale = 1.0 / scale
+    ms = mean * inv_scale
+    G_std = G * inv_scale[:, :, None] * inv_scale[:, None, :]
+    G_std = G_std - n[:, None, None] * ms[:, :, None] * ms[:, None, :]
+    outer = mask[:, :, None] * mask[:, None, :]
+    G_std = G_std * outer
+    diag = np.arange(P)
+    G_std[:, diag, diag] += 1.0 - mask  # padded rows → identity (real rows: mask=1 → +0)
+    q_std = (c - n[:, None] * mean * ybar[:, None]) * inv_scale
+    q_std = q_std * mask
+
+    if l1_ratio == 0.0:
+        w_std = _batched_ridge(G_std, q_std, n, alpha)
+    else:
+        w_std = _batched_fista(G_std, q_std, n, alpha, l1_ratio, mask)
+    w_std = w_std * mask
+
+    coef_raw = (w_std * inv_scale) * mask
+    intercept_raw = ybar - (w_std * (mean * inv_scale)).sum(axis=1)
+    is_io = np.abs(w_std).max(axis=1) <= _INTERCEPT_ONLY_ATOL
+    return coef_raw, intercept_raw, is_io
+
+
+def _batched_ridge(
+    G_std: np.ndarray, q_std: np.ndarray, n: np.ndarray, alpha: float
+) -> np.ndarray:
+    """Batched closed-form ridge ``w = (G_std + α·n·I)⁻¹ q_std`` per batch element.
+
+    Numpy analogue of :func:`ridge_gram_fit` / ``GpuBackend._batched_ridge``. Uses a batched
+    LU solve — numpy has no batched ``cholesky_solve``, and ``G_std + α·n·I`` is SPD for
+    ``α>0`` so LU is exact. The RHS is passed as ``(B, P, 1)`` (numpy≥2.0 rejects a ``(B, P)``
+    stack-of-vectors RHS).
+    """
+    B, P, _ = G_std.shape
+    A = G_std.copy()
+    diag = np.arange(P)
+    A[:, diag, diag] += alpha * n[:, None]
+    return np.linalg.solve(A, q_std[:, :, None])[:, :, 0]
+
+
+def _batched_fista(
+    G_std: np.ndarray,
+    q_std: np.ndarray,
+    n: np.ndarray,
+    alpha: float,
+    l1_ratio: float,
+    mask: np.ndarray,
+) -> np.ndarray:
+    """Batched masked FISTA for the L1 case — added in Phase 8 commit 2."""
+    raise NotImplementedError(
+        "batched FISTA (l1_ratio > 0) lands in Phase 8 commit 2; use l1_ratio=0 for now"
+    )
