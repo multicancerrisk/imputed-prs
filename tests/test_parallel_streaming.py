@@ -56,6 +56,28 @@ def panel():
     return _build_panel()
 
 
+def _write_panel_vcf(gd, path):
+    """Serialize a panel's integer dosages to a multi-contig VCF (0/0, 0/1, 1/1)."""
+    contigs = sorted({str(c) for c in gd.variant_info["chromosome"]}, key=int)
+    lines = [
+        "##fileformat=VCFv4.2",
+        *[f"##contig=<ID={c},length=300000000>" for c in contigs],
+        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t" + "\t".join(gd.sample_ids),
+    ]
+    gt = {0: "0/0", 1: "0/1", 2: "1/1"}
+    vi = gd.variant_info
+    for j in range(len(vi)):
+        row = vi.iloc[j]
+        calls = "\t".join(gt[int(round(v))] for v in gd.dosage_matrix[:, j])
+        lines.append(
+            f"{row['chromosome']}\t{row['position']}\t{row['variant_id']}\t"
+            f"{row['ref_allele']}\t{row['alt_allele']}\t.\t.\t.\tGT\t{calls}"
+        )
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
 def _fit_imputation(panel, n_workers):
     gd, prs, plat = panel
     m = LinearImputationPRS(
@@ -197,24 +219,7 @@ def test_vcf_path_source_fan_out_bit_identical(panel, tmp_path):
     """Path-based VcfGenotypeSource: picklable + region-pushdown across worker procs."""
     pytest.importorskip("cyvcf2")
     gd, prs, plat = panel
-    lines = [
-        "##fileformat=VCFv4.2",
-        *[f"##contig=<ID={c},length=300000000>" for c in range(1, N_CHROM + 1)],
-        '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
-        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
-        + "\t".join(gd.sample_ids),
-    ]
-    gt = {0: "0/0", 1: "0/1", 2: "1/1"}
-    vi = gd.variant_info
-    for j in range(len(vi)):
-        row = vi.iloc[j]
-        calls = "\t".join(gt[int(round(v))] for v in gd.dosage_matrix[:, j])
-        lines.append(
-            f"{row['chromosome']}\t{row['position']}\t{row['variant_id']}\t"
-            f"{row['ref_allele']}\t{row['alt_allele']}\t.\t.\t.\tGT\t{calls}"
-        )
-    vcf_path = tmp_path / "multichrom.vcf"
-    vcf_path.write_text("\n".join(lines) + "\n")
+    vcf_path = _write_panel_vcf(gd, tmp_path / "multichrom.vcf")
 
     def run(nw):
         m = LinearImputationPRS(
@@ -228,6 +233,46 @@ def test_vcf_path_source_fan_out_bit_identical(panel, tmp_path):
     with threadpool_limits(limits=1):
         base, got = run(1), run(2)
     _assert_imputation_identical(base, got)
+
+
+def test_sensitivity_reproducible_across_workers(panel, tmp_path):
+    """sensitivity_analysis fans out independent combos; result must be worker-invariant."""
+    pytest.importorskip("cyvcf2")
+    from imputed_prs.evaluation.evaluator import ImputationEvaluator
+
+    gd, prs, plat = panel
+    vcf_path = _write_panel_vcf(gd, tmp_path / "sens.vcf")
+    grid = {"l1_ratio": [0.1, 0.5], "alpha": [0.01, 0.1]}  # 4 combos, kept small
+
+    def run(nw):
+        # The outer evaluator needs a fitted model; its n_workers drives the combo fan-out.
+        model = LinearImputationPRS(
+            n_workers=nw, tuning_scope="none", cv_folds=3, random_state=17, verbose=0
+        )
+        model.fit(reference_genotypes=gd, prs_definition=prs, platform_variants=plat,
+                  genome_build="GRCh37")
+        ev = ImputationEvaluator(model, verbose=0)
+        return ev.sensitivity_analysis(
+            reference_genotypes=vcf_path, prs_definition=prs, platform_variants=plat,
+            parameter_grid=grid, cv_folds=3, random_state=17,
+        )
+
+    with threadpool_limits(limits=1):
+        r1, r2 = run(1), run(2)
+    # The fan-out guarantees a deterministic winner + canonical combo order. Per-combo
+    # metrics carry the pre-existing dense-path PYTHONHASHSEED set/dict-ordering jitter
+    # (~1e-7; the benchmark harness pins PYTHONHASHSEED=0 to remove it), exposed here only
+    # because a spawned worker gets a different hash seed than the bare-pytest parent — so
+    # metrics are compared within tolerance, structure + decision exactly.
+    assert r1.best_params == r2.best_params
+    assert [pr["params"] for pr in r1.parameter_results] == [
+        pr["params"] for pr in r2.parameter_results
+    ]
+    for a, b in zip(r1.parameter_results, r2.parameter_results):
+        ma, mb = a.get("metrics"), b.get("metrics")
+        assert (ma is None) == (mb is None)
+        if ma is not None:
+            assert ma.r2 == pytest.approx(mb.r2, abs=1e-4)
 
 
 def test_resolve_worker_count(monkeypatch):

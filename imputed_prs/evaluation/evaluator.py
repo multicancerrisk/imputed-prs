@@ -86,6 +86,49 @@ class SensitivityResult:
     quality_summaries: List[Dict[str, Any]]
 
 
+def _run_sensitivity_combo(payload):
+    """Fit + evaluate ONE hyperparameter combo (picklable worker for ``parallel_map``).
+
+    Returns the ``parameter_results`` dict — ``{"params", "metrics", "quality_summary"}``
+    on success, ``{"params", "metrics": None, "error"}`` on failure — so the parent can
+    collect in canonical combo order and pick the best deterministically. The inner fit
+    runs single-process (``n_workers=1``); the outer combo pool owns the cores.
+    """
+    from imputed_prs.core.linear_imputation_prs import LinearImputationPRS
+
+    (params, base, prs_definition, platform_name, platform_manifest,
+     platform_variants, cv_folds, random_state, inner_n_jobs, genotype_data) = payload
+    try:
+        test_model = LinearImputationPRS(
+            window_size=params.get("window_size", base["window_size"]),
+            tuning_scope="none",  # use the specified params directly
+            l1_ratio=params.get("l1_ratio", base["l1_ratio"]),
+            alpha=params.get("alpha", base["alpha"]),
+            cv_folds=cv_folds,
+            n_jobs=inner_n_jobs,
+            n_workers=1,
+            random_state=random_state,
+            verbose=0,
+        )
+        test_model.fit(
+            reference_genotypes=genotype_data,
+            prs_definition=prs_definition,
+            platform_name=platform_name,
+            platform_manifest=platform_manifest,
+            platform_variants=platform_variants,
+        )
+        if test_model._imputed_models:
+            models_dict = {m.variant_id: m for m in test_model._imputed_models}
+            quality_summary = summarize_imputation_quality(models_dict)
+        else:
+            quality_summary = {"mean_r2": None, "n_total": 0}
+        evaluator = ImputationEvaluator(test_model, verbose=0)
+        metrics = evaluator.evaluate(genotype_data)
+        return {"params": params, "metrics": metrics, "quality_summary": quality_summary}
+    except Exception as e:  # noqa: BLE001 — mirror the serial path: record, don't crash
+        return {"params": params, "metrics": None, "error": str(e)}
+
+
 class ImputationEvaluator:
     """Evaluator for fitted LinearImputationPRS models.
 
@@ -423,9 +466,6 @@ class ImputationEvaluator:
         Raises:
             ValidationError: If inputs are invalid.
         """
-        # Import here to avoid circular import
-        from imputed_prs.core.linear_imputation_prs import LinearImputationPRS
-
         # Validate inputs
         platform_sources = [
             platform_name is not None,
@@ -451,81 +491,52 @@ class ImputationEvaluator:
         param_values = list(parameter_grid.values())
         param_combinations = list(product(*param_values))
 
-        if self.verbose >= 1:
-            print(f"Testing {len(param_combinations)} parameter combinations...")
-
         # Load reference genotypes once, then fit each combo in-memory — Phase 4:
-        # no temp-VCF round-trip (fit accepts a GenotypeData directly).
+        # no temp-VCF round-trip (fit accepts a GenotypeData directly). Phase 7:
+        # combos are independent, so fan them out across a process pool when n_workers>1
+        # (each combo's inner fit stays single-process to avoid oversubscription).
         genotype_data = load_genotypes(path=reference_genotypes)
 
-        # Test each parameter combination
+        from imputed_prs.compute.parallel import parallel_map, resolve_n_workers
+
+        resolved = resolve_n_workers(self.model.n_workers)
+        inner_n_jobs = self.model.n_jobs if resolved <= 1 else 1
+        base_config = {
+            "window_size": self.model.window_size,
+            "l1_ratio": self.model.l1_ratio,
+            "alpha": self.model.alpha,
+        }
+        payloads = [
+            (dict(zip(param_names, combo)), base_config, prs_definition, platform_name,
+             platform_manifest, platform_variants, cv_folds, random_state, inner_n_jobs,
+             genotype_data)
+            for combo in param_combinations
+        ]
+        if self.verbose >= 1:
+            how = "serial" if resolved <= 1 else f"{resolved} workers"
+            print(f"Testing {len(param_combinations)} parameter combinations ({how})...")
+
+        results = parallel_map(
+            _run_sensitivity_combo, payloads, n_workers=self.model.n_workers
+        )
+
+        # Collect in canonical combo order → deterministic best (first max wins ties,
+        # matching the pre-Phase-7 serial loop's strict '>' scan over combos in order).
         parameter_results: List[Dict[str, Any]] = []
         quality_summaries: List[Dict[str, Any]] = []
         best_r2 = -np.inf
         best_params: Dict[str, float] = {}
         best_metrics: Optional[EvaluationMetrics] = None
-
-        for idx, combo in enumerate(param_combinations):
-            params = dict(zip(param_names, combo))
-
-            if self.verbose >= 1:
-                print(f"  [{idx + 1}/{len(param_combinations)}] Testing {params}")
-
-            try:
-                # Create model with these parameters
-                test_model = LinearImputationPRS(
-                    window_size=params.get("window_size", self.model.window_size),
-                    tuning_scope="none",  # Use specified params directly
-                    l1_ratio=params.get("l1_ratio", self.model.l1_ratio),
-                    alpha=params.get("alpha", self.model.alpha),
-                    cv_folds=cv_folds,
-                    n_jobs=self.model.n_jobs,
-                    random_state=random_state,
-                    verbose=0,
-                )
-
-                test_model.fit(
-                    reference_genotypes=genotype_data,
-                    prs_definition=prs_definition,
-                    platform_name=platform_name,
-                    platform_manifest=platform_manifest,
-                    platform_variants=platform_variants,
-                )
-
-                # Get quality summary
-                if test_model._imputed_models:
-                    models_dict = {
-                        m.variant_id: m for m in test_model._imputed_models
-                    }
-                    quality_summary = summarize_imputation_quality(models_dict)
-                else:
-                    quality_summary = {"mean_r2": None, "n_total": 0}
-
-                # Evaluate using internal CV metrics
-                evaluator = ImputationEvaluator(test_model, verbose=0)
-                metrics = evaluator.evaluate(genotype_data)
-
-                parameter_results.append({
-                    "params": params,
-                    "metrics": metrics,
-                    "quality_summary": quality_summary,
-                })
-                quality_summaries.append(quality_summary)
-
-                # Track best
-                if metrics.r2 > best_r2:
-                    best_r2 = metrics.r2
-                    best_params = params
-                    best_metrics = metrics
-
-            except Exception as e:
-                if self.verbose >= 1:
-                    print(f"    Warning: Failed for {params}: {e}")
-                parameter_results.append({
-                    "params": params,
-                    "metrics": None,
-                    "error": str(e),
-                })
+        for res in results:
+            parameter_results.append(res)
+            if res.get("metrics") is not None:
+                quality_summaries.append(res["quality_summary"])
+                if res["metrics"].r2 > best_r2:
+                    best_r2 = res["metrics"].r2
+                    best_params = res["params"]
+                    best_metrics = res["metrics"]
+            elif self.verbose >= 1:
+                print(f"    Warning: Failed for {res['params']}: {res.get('error')}")
 
         if best_metrics is None:
             raise ValidationError("All parameter combinations failed")

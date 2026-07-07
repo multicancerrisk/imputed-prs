@@ -124,3 +124,25 @@ def fan_out_chromosomes(
         return Parallel(n_jobs=workers, return_as="list")(
             delayed(task)(c) for c in chroms
         )
+
+
+def parallel_map(worker_fn, items: Sequence[object], *, n_workers: int = 1) -> List[object]:
+    """Map a **picklable module-level** ``worker_fn`` over ``items`` → list in input order.
+
+    For independent fit+evaluate units that are *not* chromosome shards — e.g. the
+    ``sensitivity_analysis`` hyperparameter combos. ``n_workers <= 1`` runs serially
+    in-process (unpinned); ``n_workers > 1`` runs a loky pool with BLAS pinned to one
+    thread per worker (each unit's inner fit should itself use ``n_jobs=1``/``n_workers=1``
+    so an outer pool never oversubscribes). ``joblib`` preserves input order, so the
+    caller can pick a deterministic winner.
+    """
+    items = list(items)
+    workers = min(resolve_n_workers(n_workers), max(1, len(items)))
+    if workers <= 1:
+        return [worker_fn(it) for it in items]
+    from joblib import Parallel, delayed, parallel_config
+
+    with parallel_config(backend="loky", inner_max_num_threads=1):
+        return Parallel(n_jobs=workers, return_as="list")(
+            delayed(worker_fn)(it) for it in items
+        )
