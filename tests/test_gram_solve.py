@@ -19,8 +19,10 @@ from imputed_prs.compute.gram_solve import (
     _batched_fista,
     _select_solver,
     fit_from_local_gram,
+    fit_reference_folds,
     ridge_gram_fit,
     solve_blocks_batched,
+    solve_reference_folds_batched,
     standardize_from_moments,
 )
 from imputed_prs.models.elastic_net import fit_single_variant_model
@@ -369,6 +371,55 @@ def test_batched_fista_warm_start_same_optimum_fewer_iters():
 
     np.testing.assert_allclose(w_warm, w_cold, atol=1e-5)  # same optimum (convex)
     assert i_warm < i_cold  # warm start converges in fewer iterations
+
+
+@pytest.mark.parametrize(
+    "alpha,l1_ratio",
+    [(0.05, 0.0), (0.01, 0.5), (0.1, 0.9)],  # ridge (exact) + elastic net (batched FISTA)
+)
+def test_solve_reference_folds_batched_matches_per_target(alpha, l1_ratio):
+    """Batched reference CV == per-target ``fit_reference_folds`` within statistical parity.
+
+    Each block's K leave-one-fold-out train systems (``S_full − S_fold(k)``, whose inner-CV
+    fold lists are empty → K=0 for the padded solve) are flattened, batch-solved, and
+    regrouped. Ridge is exact; the FISTA L1 path matches the sklearn-CD oracle to the same
+    ~1e-3 coef / ~5e-3 CV band as the main fit. Includes a no-predictor block (per-fold
+    intercept-only) to exercise the empty-Gram train branch.
+    """
+    cv = 5
+    specs = [(400, 6), (350, 10), (500, 4), (420, 8)]
+    blocks = [
+        build_block(*make_dosage_data(n, p, seed=100 + i), cv, seed=7)
+        for i, (n, p) in enumerate(specs)
+    ]
+    # A no-predictor block: fit_reference_folds returns K intercept-only fold models.
+    _, y0 = make_dosage_data(300, 1, seed=3)
+    no_pred = build_block(np.empty((300, 0)), y0, cv, seed=7)
+    blocks.append(no_pred)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # sklearn warns on ElasticNet(l1_ratio=0)
+        exp = [
+            fit_reference_folds(b, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv)
+            for b in blocks
+        ]
+    got = solve_reference_folds_batched(blocks, alpha, l1_ratio, cv_folds=cv)
+    assert len(got) == len(exp)
+    for pt, bt in zip(exp, got):
+        assert len(pt) == len(bt) == cv  # K per-outer-fold models
+        for fe, fg in zip(pt, bt):
+            assert fe.is_intercept_only == fg.is_intercept_only
+            np.testing.assert_allclose(fg.coefficients, fe.coefficients, atol=1e-3, rtol=1e-3)
+            assert abs(fe.intercept - fg.intercept) < 5e-3
+
+
+def test_solve_reference_folds_batched_none_passthrough():
+    """A ``None`` input block yields a ``None`` group (mirrors the streaming drop-failed rule)."""
+    cv = 5
+    b = build_block(*make_dosage_data(300, 5, seed=11), cv, seed=7)
+    got = solve_reference_folds_batched([b, None], 0.05, 0.0, cv_folds=cv)
+    assert got[1] is None
+    assert got[0] is not None and len(got[0]) == cv
 
 
 def test_solve_blocks_batched_p_gate_falls_back_large_p():

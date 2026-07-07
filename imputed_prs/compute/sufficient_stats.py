@@ -38,6 +38,7 @@ from imputed_prs.compute.gram_solve import (
     fit_from_local_gram,
     fit_reference_folds,
     solve_blocks_batched,
+    solve_reference_folds_batched,
 )
 from imputed_prs.core.harmonizer import normalize_chromosome_array
 from imputed_prs.core.types import ImputedVariantModel
@@ -736,37 +737,74 @@ def _run_cv_batch(jobs, buf, folds, alpha, l1_ratio, cv_folds, batch_cap):
         _run_cv_chunk(jobs[s : s + batch_cap], buf, folds, alpha, l1_ratio, cv_folds)
 
 
+def _cv_pred_af_per_fold(block, K):
+    """Per-outer-fold predictor AF for reference CV: ``(zsum − fold_zsum[k]) / (2·n_train)``.
+
+    One predictor slot yields one AF across every target in a fold (satisfies
+    ``build_chip_axis``'s consistency guard, R6). Empty for a no-predictor unit.
+    """
+    if block.n_predictors == 0:
+        return [np.empty(0) for _ in range(K)]
+    out = []
+    for k in range(K):
+        n_tr = block.n - int(block.fold_n[k])
+        denom = 2.0 * n_tr if n_tr > 0 else 1.0
+        out.append((block.zsum - block.fold_zsum[k]) / denom)
+    return out
+
+
 def _run_cv_chunk(jobs, buf, folds, alpha, l1_ratio, cv_folds):
     """Leave-one-fold-out reference-CV fit of one chunk (host/CPU only).
 
     Shares :func:`_batch_cross_products`/:func:`_assemble_block` with the single-model
     path, but ``folds`` here are the **reference-CV outer folds**, so each unit's
-    per-fold slabs are the outer-fold statistics. Per unit it calls
-    :func:`fit_reference_folds` (the additive ``S_full − S_fold(k)`` per-fold solve) and
-    hands the ``K`` per-fold results + per-fold predictor AF to the CV ``store``. No
-    OOF / ``s_cv`` reduction — reference CV scores raw.
-
-    Per-fold predictor AF is derived from the shared per-slot moments
-    ``(zsum − fold_zsum[k]) / (2·n_train)`` so one predictor slot has one AF across every
-    target in a fold (satisfies ``build_chip_axis``'s consistency guard, R6).
+    per-fold slabs are the outer-fold statistics. It solves the ``K`` additive
+    ``S_full − S_fold(k)`` per-fold models — batched (``solve_reference_folds_batched``)
+    at scale, else the per-target :func:`fit_reference_folds` oracle — and hands the
+    ``K`` per-fold results + per-fold predictor AF to the CV ``store``. No OOF / ``s_cv``
+    reduction — reference CV scores raw.
     """
     cross = _batch_cross_products(jobs, buf, folds)
-    K = cross["K"]
+    n, K = cross["n"], cross["K"]
+
+    # Assemble each unit's Gram block (record-don't-crash on a missing-slot gather).
+    assembled = []  # (job, block)
     for j, job in enumerate(jobs):
         try:
             block, _idx, _pred_af = _assemble_block(job, j, buf, cross)
-            fold_results = fit_reference_folds(
-                block, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv_folds
+        except Exception as exc:  # noqa: BLE001 - mirror legacy: record, don't crash
+            job.fail(exc)
+            continue
+        assembled.append((job, block))
+
+    # Solve — batched at scale (all-or-nothing → degrade to the resilient per-target path
+    # on a rare failure), else the per-target sklearn oracle (records per-unit failures).
+    results = None
+    if _use_batched_solve(n, len(assembled), alpha):
+        try:
+            results = solve_reference_folds_batched(
+                [b for _job, b in assembled], alpha, l1_ratio, cv_folds
             )
-            if block.n_predictors > 0:
-                pred_af_per_fold = []
-                for k in range(K):
-                    n_tr = block.n - int(block.fold_n[k])
-                    denom = 2.0 * n_tr if n_tr > 0 else 1.0
-                    pred_af_per_fold.append((block.zsum - block.fold_zsum[k]) / denom)
-            else:
-                pred_af_per_fold = [np.empty(0) for _ in range(K)]
-            job.store(fold_results, job.pred_idx, pred_af_per_fold)
+        except Exception:  # noqa: BLE001 - degrade to the per-target path
+            results = None
+    if results is None:
+        results = []
+        for job, block in assembled:
+            try:
+                results.append(
+                    fit_reference_folds(
+                        block, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv_folds
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - record, don't crash
+                job.fail(exc)
+                results.append(None)
+
+    for (job, block), fold_results in zip(assembled, results):
+        if fold_results is None:
+            continue
+        try:
+            job.store(fold_results, job.pred_idx, _cv_pred_af_per_fold(block, K))
         except Exception as exc:  # noqa: BLE001 - mirror legacy: record, don't crash
             job.fail(exc)
 

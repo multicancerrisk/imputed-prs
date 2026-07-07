@@ -153,3 +153,80 @@ def test_batched_bit_identical_across_workers(monkeypatch, n_workers):
         got = _fit(n_workers)
     assert len(base._imputed_models) > 3  # multiple targets per chromosome trained
     _assert_imputation_identical(base, got)
+
+
+# --- Reference CV (leave-one-fold-out, additive S_full − S_fold(k)) -------------------
+# The batched solve routes through the same _run_cv_chunk for imputation and projection.
+
+
+def _cv_fold_indices(n_samples, n_folds, seed):
+    rng = np.random.default_rng(seed)
+    return [np.asarray(idx) for idx in np.array_split(rng.permutation(n_samples), n_folds)]
+
+
+def test_batched_reference_cv_matches_per_target(monkeypatch):
+    """Forced-batched reference CV == per-target ``fit_reference_folds`` (statistical parity).
+
+    Every outer fold's per-target model (``solve_reference_folds_batched`` under the hood)
+    must match the sklearn-CD oracle within the FISTA band, so the CV metric it feeds is
+    unchanged. Small panel + forced batched path so it runs in seconds.
+    """
+    gd, prs, plat = _multichrom_panel(n_samples=90)
+    fi = _cv_fold_indices(90, 3, seed=5)
+
+    def _run(mode):
+        monkeypatch.setenv("IMPUTED_PRS_SOLVE", mode)
+        d = LinearImputationPRS(
+            backend="streaming", tuning_scope="none", cv_folds=3, alpha=0.01, l1_ratio=0.5,
+            random_state=17, n_workers=1, device="cpu", verbose=0,
+        )
+        return d._reference_cv_fold_models(gd, prs, platform_variants=plat,
+                                           fold_indices=fi, genome_build="GRCh37")
+
+    with threadpool_limits(limits=1):
+        ref = _run("per_target")
+        bat = _run("batched")
+    assert ref is not None and bat is not None
+    checked = 0
+    for k in ref.fold_imputed_models:
+        rm = {m.variant_id: m for m in ref.fold_imputed_models[k]}
+        bm = {m.variant_id: m for m in bat.fold_imputed_models[k]}
+        assert set(rm) == set(bm) and rm, (k, set(rm), set(bm))
+        for vid, r in rm.items():
+            b = bm[vid]
+            assert list(b.predictor_variant_ids) == list(r.predictor_variant_ids), (k, vid)
+            np.testing.assert_allclose(
+                np.asarray(b.coefficients), np.asarray(r.coefficients), atol=2e-3, rtol=2e-3
+            )
+            assert abs(b.intercept - r.intercept) < 5e-3
+            checked += 1
+    assert checked > 5  # multiple targets across folds actually compared
+
+
+@pytest.mark.parametrize("n_workers", [2])
+def test_batched_reference_cv_bit_identical_across_workers(monkeypatch, n_workers):
+    """Forced-batched reference CV is bit-identical across worker counts (Phase-7 compose)."""
+    monkeypatch.setenv("IMPUTED_PRS_SOLVE", "batched")
+    gd, prs, plat = _multichrom_panel(n_samples=90)
+    fi = _cv_fold_indices(90, 3, seed=5)
+
+    def _run(nw):
+        d = LinearImputationPRS(
+            backend="streaming", tuning_scope="none", cv_folds=3, alpha=0.01, l1_ratio=0.5,
+            random_state=17, n_workers=nw, device="cpu", verbose=0,
+        )
+        return d._reference_cv_fold_models(gd, prs, platform_variants=plat,
+                                           fold_indices=fi, genome_build="GRCh37")
+
+    with threadpool_limits(limits=1):
+        base, got = _run(1), _run(n_workers)
+    assert base is not None and got is not None
+    for k in base.fold_imputed_models:
+        ba = {m.variant_id: m for m in base.fold_imputed_models[k]}
+        gb = {m.variant_id: m for m in got.fold_imputed_models[k]}
+        assert set(ba) == set(gb) and ba, (k, set(ba), set(gb))
+        for vid in ba:
+            assert np.array_equal(
+                np.asarray(ba[vid].coefficients), np.asarray(gb[vid].coefficients)
+            ), (k, vid)
+            assert ba[vid].intercept == gb[vid].intercept, (k, vid)

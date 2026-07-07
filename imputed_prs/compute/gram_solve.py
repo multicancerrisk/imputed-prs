@@ -552,44 +552,44 @@ def fit_reference_folds(
       nested CV loop in :func:`fit_from_local_gram` is a no-op (its ``cv_mse``/``cv_r2``
       are 0 and unused — reference CV scores raw).
     """
-    n_folds = len(full_block.fold_n)
-    has_predictors = full_block.n_predictors > 0
-    results: List[GramFitResult] = []
-    for k in range(n_folds):
-        n_tr = int(full_block.n - full_block.fold_n[k])
-        ysum_tr = float(full_block.ysum - full_block.fold_ysum[k])
-        ysqsum_tr = float(full_block.ysqsum - full_block.fold_ysqsum[k])
-        if has_predictors:
-            train_block = LocalGramBlock(
-                n=n_tr,
-                G=full_block.G - full_block.fold_G[k],
-                c=full_block.c - full_block.fold_c[k],
-                zsum=full_block.zsum - full_block.fold_zsum[k],
-                zsqsum=full_block.zsqsum - full_block.fold_zsqsum[k],
-                ysum=ysum_tr,
-                ysqsum=ysqsum_tr,
-            )
-        else:
-            train_block = LocalGramBlock(
-                n=n_tr,
-                G=np.empty((0, 0)),
-                c=np.empty(0),
-                zsum=np.empty(0),
-                zsqsum=np.empty(0),
-                ysum=ysum_tr,
-                ysqsum=ysqsum_tr,
-            )
-        results.append(
-            fit_from_local_gram(
-                train_block,
-                alpha=alpha,
-                l1_ratio=l1_ratio,
-                cv_folds=cv_folds,
-                max_iter=max_iter,
-                tol=tol,
-            )
+    return [
+        fit_from_local_gram(
+            _train_fold_block(full_block, k),
+            alpha=alpha,
+            l1_ratio=l1_ratio,
+            cv_folds=cv_folds,
+            max_iter=max_iter,
+            tol=tol,
         )
-    return results
+        for k in range(len(full_block.fold_n))
+    ]
+
+
+def _train_fold_block(full_block: LocalGramBlock, k: int) -> LocalGramBlock:
+    """The leave-one-fold-out training block ``S_full − S_fold(k)`` for reference CV.
+
+    Its own per-fold (inner-CV) lists are left **empty**, so a downstream
+    :func:`fit_from_local_gram` runs an intercept-only nested CV (``cv_mse``/``cv_r2`` unused —
+    reference CV scores raw) and the penalty ``l1_reg = α·l1_ratio·n`` scales with the
+    training-fold ``n = n_full − fold_n[k]`` (invariant R1).
+    """
+    n_tr = int(full_block.n - full_block.fold_n[k])
+    ysum_tr = float(full_block.ysum - full_block.fold_ysum[k])
+    ysqsum_tr = float(full_block.ysqsum - full_block.fold_ysqsum[k])
+    if full_block.n_predictors > 0:
+        return LocalGramBlock(
+            n=n_tr,
+            G=full_block.G - full_block.fold_G[k],
+            c=full_block.c - full_block.fold_c[k],
+            zsum=full_block.zsum - full_block.fold_zsum[k],
+            zsqsum=full_block.zsqsum - full_block.fold_zsqsum[k],
+            ysum=ysum_tr,
+            ysqsum=ysqsum_tr,
+        )
+    return LocalGramBlock(
+        n=n_tr, G=np.empty((0, 0)), c=np.empty(0), zsum=np.empty(0),
+        zsqsum=np.empty(0), ysum=ysum_tr, ysqsum=ysqsum_tr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +668,38 @@ def solve_blocks_batched(
     return results
 
 
+def solve_reference_folds_batched(
+    blocks: List[Optional[LocalGramBlock]],
+    alpha: float,
+    l1_ratio: float,
+    cv_folds: int = 5,
+) -> List[Optional[List[GramFitResult]]]:
+    """Batched analogue of ``[fit_reference_folds(b, …) for b in blocks]``.
+
+    Each block's K leave-one-fold-out training systems (``S_full − S_fold(k)``,
+    :func:`_train_fold_block`) are flattened into one big list and solved together by
+    :func:`solve_blocks_batched` (so all ``n_targets × K`` reference-CV models across the whole
+    chunk share the batched pad/mask/solve), then regrouped per block. Returns, per input
+    block, a list of K per-outer-fold :class:`GramFitResult` (``None`` for a ``None`` input).
+    Matches ``fit_reference_folds`` within the same statistical-parity band as the main fit.
+    """
+    flat: List[LocalGramBlock] = []
+    owners: List[tuple] = []  # (block_index, outer_fold_k)
+    for i, b in enumerate(blocks):
+        if b is None:
+            continue
+        for k in range(len(b.fold_n)):
+            flat.append(_train_fold_block(b, k))
+            owners.append((i, k))
+    solved = solve_blocks_batched(flat, alpha, l1_ratio, cv_folds)
+    out: List[Optional[List[GramFitResult]]] = [
+        None if b is None else [None] * len(b.fold_n) for b in blocks
+    ]
+    for (i, k), res in zip(owners, solved):
+        out[i][k] = res
+    return out
+
+
 def _solve_real_padded(
     blocks: List[LocalGramBlock], alpha: float, l1_ratio: float, cv_folds: int
 ) -> List[Optional[GramFitResult]]:
@@ -701,7 +733,9 @@ def _solve_real_padded(
             if p_next > max_p:
                 break  # large-p blocks handled by the per-target tail above
             cnt = e - s + 1
-            if cnt * K * p_next * p_next * 8 > _SOLVE_GRAM_BUDGET:
+            # (K+1) padded (P×P) Grams per block (final + K folds); K+1 also bounds the
+            # K==0 reference-CV case (final Gram only) instead of a zero, unbounded budget.
+            if cnt * (K + 1) * p_next * p_next * 8 > _SOLVE_GRAM_BUDGET:
                 break
             e += 1
         sub = [blocks[order[i]] for i in range(s, e)]
@@ -738,13 +772,14 @@ def _solve_padded_core(
         mask[i, :p] = 1.0
         Gp[i, :p, :p] = b.G; cp[i, :p] = b.c
         zsp[i, :p] = b.zsum; zsqp[i, :p] = b.zsqsum
-        fGp[i, :, :p, :p] = np.stack(b.fold_G)
-        fcp[i, :, :p] = np.stack(b.fold_c)
-        fzsp[i, :, :p] = np.stack(b.fold_zsum)
-        fzsqp[i, :, :p] = np.stack(b.fold_zsqsum)
-        fysum_m[i] = np.asarray(b.fold_ysum, dtype=np.float64)
-        fysqsum_m[i] = np.asarray(b.fold_ysqsum, dtype=np.float64)
-        fn_m[i] = np.asarray(b.fold_n, dtype=np.float64)
+        if K > 0:  # reference-CV train blocks carry no inner folds (K==0) → skip fold stack
+            fGp[i, :, :p, :p] = np.stack(b.fold_G)
+            fcp[i, :, :p] = np.stack(b.fold_c)
+            fzsp[i, :, :p] = np.stack(b.fold_zsum)
+            fzsqp[i, :, :p] = np.stack(b.fold_zsqsum)
+            fysum_m[i] = np.asarray(b.fold_ysum, dtype=np.float64)
+            fysqsum_m[i] = np.asarray(b.fold_ysqsum, dtype=np.float64)
+            fn_m[i] = np.asarray(b.fold_n, dtype=np.float64)
         ysum_v[i] = b.ysum; ysqsum_v[i] = b.ysqsum; n_v[i] = float(b.n)
 
     # Final model on the full valid subset.
@@ -774,7 +809,9 @@ def _solve_padded_core(
     sse = fysqsum_m + aGa + fn_m * bt * bt - 2.0 * ac - 2.0 * bt * fysum_m + 2.0 * bt * az
     with np.errstate(divide="ignore", invalid="ignore"):
         per_fold_mse = np.where(fn_m > 0, sse / fn_m, 0.0)
-    cv_mse = per_fold_mse.mean(axis=1)
+    # K == 0 (reference-CV train blocks carry no inner folds): no CV loop, cv_mse = 0,
+    # ss_res = 0 → cv_r2 = 1 for a block with variance — matches fit_from_local_gram.
+    cv_mse = per_fold_mse.mean(axis=1) if K > 0 else np.zeros(B)
     ss_res = sse.sum(axis=1)  # pooled SS_res over all held-out samples
     ss_tot = ysqsum_v - ysum_v * ysum_v / n_v  # = Σ(y − ȳ)² over the full valid subset
     cv_r2 = np.where(ss_tot >= 1e-10, 1.0 - ss_res / ss_tot, 0.0)
