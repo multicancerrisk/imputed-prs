@@ -42,7 +42,9 @@ from imputed_prs.compute.sufficient_stats import (
     _OpenTarget,
     _prepare_column,
     _region_for,
+    _resolve_solve_mode,
     _run_cv_batch,
+    _set_active_solve_mode,
     reduce_cv_collectors,
 )
 from imputed_prs.core.harmonizer import normalize_chromosome_array
@@ -206,6 +208,9 @@ class StreamingProjectionFitter:
         # Set by run_reference_cv: {fold_k -> {region_id -> ProjectionRegionModel}}.
         # When non-None the fitter is in leave-one-fold-out reference-CV mode.
         self._cv_collector = None
+        # Solver-selection override, resolved once in the parent (pickled to workers); see
+        # sufficient_stats._use_batched_solve. Projection shares that solve seam.
+        self._solve_mode = _resolve_solve_mode()
         # Regions grouped by chromosome, each sorted by start (== sorted by end, since
         # merged regions are non-overlapping), for the in-order close sweep.
         self._regions_by_chrom: Dict[str, List[int]] = {}
@@ -286,6 +291,7 @@ class StreamingProjectionFitter:
         throwaway worker ``self`` and are discarded — ``diag_var`` is re-derived (``Σ cv_mse``)
         and ``has_calibration_terms`` OR-ed in ``ProjectionStreamResult.reduce``.
         """
+        _set_active_solve_mode(self._solve_mode)  # per-fit, deterministic across the pool
         plan = self.plan
         # Projection units are few + wide (merged regions span ≫ 2W), so the per-fold Gram
         # is materialised on-demand per region (≤max_predictors) rather than kept as a

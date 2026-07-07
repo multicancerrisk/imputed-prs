@@ -620,6 +620,16 @@ _LIPSCHITZ_MARGIN = 1.01
 # Cap the padded (B, K, P, P) fold-Gram working set per sub-batch (matches the GPU budget).
 _SOLVE_GRAM_BUDGET = 512 * 1024 * 1024
 
+# Empirical CPU crossover (measured by benchmarks/verify_batched_solve.py): batching amortizes
+# the per-target Python-call overhead only while the per-block linear algebra is small. Above
+# these predictor counts the per-target scipy path wins — the compiled Cholesky / coordinate
+# descent already saturates, and FISTA in particular needs many more iterations than sklearn's
+# CD at large p — so large-p blocks fall back to the per-target solve (never a regression). The
+# ridge closed form tolerates a larger p than FISTA. Warm starts + screening (later Phase-8
+# commits) attack FISTA's iteration count and effective p, widening the batched range.
+_BATCH_MAX_P_RIDGE = 64
+_BATCH_MAX_P_ENET = 32
+
 
 def solve_blocks_batched(
     blocks: List[Optional[LocalGramBlock]],
@@ -669,15 +679,27 @@ def _solve_real_padded(
     """
     if not blocks:
         return []
+    max_p = _BATCH_MAX_P_RIDGE if l1_ratio == 0.0 else _BATCH_MAX_P_ENET
     order = sorted(range(len(blocks)), key=lambda i: blocks[i].n_predictors)
     K = len(blocks[0].fold_n)
     out: List[Optional[GramFitResult]] = [None] * len(blocks)
     n = len(order)
     s = 0
     while s < n:
+        # Blocks are sorted ascending by p, so once one exceeds max_p, so do all that follow:
+        # solve the whole large-p tail per-target (batching overhead would exceed the win).
+        if blocks[order[s]].n_predictors > max_p:
+            for i in range(s, n):
+                bi = order[i]
+                out[bi] = fit_from_local_gram(
+                    blocks[bi], alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv_folds
+                )
+            break
         e = s + 1  # always at least one block per sub-batch (guarantees progress)
         while e < n:
             p_next = blocks[order[e]].n_predictors  # sorted asc → the new max in [s, e]
+            if p_next > max_p:
+                break  # large-p blocks handled by the per-target tail above
             cnt = e - s + 1
             if cnt * K * p_next * p_next * 8 > _SOLVE_GRAM_BUDGET:
                 break

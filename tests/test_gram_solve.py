@@ -14,6 +14,7 @@ import pytest
 from sklearn.model_selection import KFold
 
 from imputed_prs.compute.gram_solve import (
+    _BATCH_MAX_P_ENET,
     LocalGramBlock,
     _select_solver,
     fit_from_local_gram,
@@ -345,25 +346,24 @@ def test_solve_blocks_batched_matches_per_target(alpha, l1_ratio):
         assert abs(a.cv_mse - g.cv_mse) < 5e-3
 
 
-def test_solve_blocks_batched_underdetermined():
-    """Batched FISTA handles a p>n (underdetermined) block, batched with well-determined ones.
+def test_solve_blocks_batched_p_gate_falls_back_large_p():
+    """The predictor-count crossover gate routes large-p blocks to the exact per-target path.
 
-    Strong L1 (sparse solution → small active set) keeps batched FISTA and sklearn CD in
-    agreement even when p>n; the tolerance is the statistical band (the underdetermined
-    flat directions and the L1 kink make weak-L1 p>n fits genuinely solver-dependent — the
-    exact pad/mask correctness for p>n is asserted by the ridge test, which is closed-form).
+    Batching amortizes per-target overhead only for small p; above ``_BATCH_MAX_P_ENET`` the
+    per-target solve wins, so those blocks must return the *exact* ``fit_from_local_gram``
+    result (not a FISTA approximation), while small-p blocks in the same call still batch.
     """
-    cv, alpha, l1_ratio = 5, 0.05, 0.9
-    blocks = [
-        build_block(*make_dosage_data(500, 12, seed=1), cv, seed=7),  # well-determined
-        build_block(*make_dosage_data(60, 70, seed=2), cv, seed=7),   # p > n
-    ]
+    cv, alpha, l1 = 5, 0.01, 0.5  # l1_ratio>0 → _BATCH_MAX_P_ENET gate
+    small = build_block(*make_dosage_data(500, 10, seed=1), cv, seed=7)  # batched
+    big_p = _BATCH_MAX_P_ENET + 40
+    large = build_block(*make_dosage_data(500, big_p, seed=2), cv, seed=7)  # per-target
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        exp = [fit_from_local_gram(b, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv) for b in blocks]
-    got = solve_blocks_batched(blocks, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv)
-    for a, g in zip(exp, got):
-        assert a.is_intercept_only == g.is_intercept_only
-        assert g.n_predictors == a.n_predictors
-        np.testing.assert_allclose(g.coefficients, a.coefficients, atol=5e-3, rtol=5e-3)
-        assert abs(a.intercept - g.intercept) < 5e-3
+        exp = [fit_from_local_gram(b, alpha=alpha, l1_ratio=l1, cv_folds=cv) for b in (small, large)]
+    got = solve_blocks_batched([small, large], alpha, l1, cv)
+    # Small p: batched FISTA within statistical parity.
+    np.testing.assert_allclose(got[0].coefficients, exp[0].coefficients, atol=1e-3, rtol=1e-3)
+    # Large p: routed to the per-target path → exact (bit-for-bit, not a parity band).
+    np.testing.assert_allclose(got[1].coefficients, exp[1].coefficients, atol=1e-12)
+    assert abs(got[1].intercept - exp[1].intercept) < 1e-12
+    np.testing.assert_allclose(got[1].cv_r2, exp[1].cv_r2, atol=1e-12)

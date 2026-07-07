@@ -24,6 +24,7 @@ missing panels that is a documented, quality-validated deviation, not bit-parity
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
@@ -36,6 +37,7 @@ from imputed_prs.compute.gram_solve import (
     LocalGramBlock,
     fit_from_local_gram,
     fit_reference_folds,
+    solve_blocks_batched,
 )
 from imputed_prs.core.harmonizer import normalize_chromosome_array
 from imputed_prs.core.types import ImputedVariantModel
@@ -500,6 +502,55 @@ class _FitJob:
     fail: object  # callable(exc) -> None
 
 
+# --- Batched-solve selection (Phase 8) ------------------------------------------------
+# The streaming ElasticNet solve switches from the per-target sklearn coordinate descent
+# (the exact oracle) to the batched FISTA/ridge solve (gram_solve.solve_blocks_batched)
+# once the panel is large enough that per-target Python-call overhead (millions of fits)
+# dominates. The batched path is a *different optimizer* (statistical parity ~1e-3 coef /
+# ~5e-3 CV metrics), so it is gated by **sample count** rather than chunk width: at 500K
+# samples the (n×T) cross-product bound shrinks a chunk to ~64 targets, so a target-count
+# threshold would never fire, whereas every test / verification panel (n ≤ 2504, incl.
+# 1000G) stays comfortably on the per-target oracle. IMPUTED_PRS_SOLVE=per_target|batched
+# forces one path (tests pin the exact oracle, or force the batched path independent of n).
+_BATCH_MIN_SAMPLES = 10_000
+
+# The override is resolved once in the parent (``_resolve_solve_mode``) and carried on the
+# fitter, then re-published into this module global at each chromosome task's entry
+# (``_set_active_solve_mode`` in ``_run_one_chromosome``) so the choice is per-fit and
+# deterministic across the process pool. Reading the env *inside* a worker would be wrong: a
+# loky pool is reused across fits, so a worker could see a stale prior override (auto is
+# env-free — ``n_samples ≥ _BATCH_MIN_SAMPLES`` — so only the test/debug overrides could leak).
+_ACTIVE_SOLVE_MODE = "auto"
+
+
+def _resolve_solve_mode() -> str:
+    """Read the solver-selection override from the env. Call in the PARENT at fit setup."""
+    return os.environ.get("IMPUTED_PRS_SOLVE", "auto")
+
+
+def _set_active_solve_mode(mode: str) -> None:
+    """Publish the fitter's resolved mode into the module global (call at task entry)."""
+    global _ACTIVE_SOLVE_MODE
+    _ACTIVE_SOLVE_MODE = mode
+
+
+def _use_batched_solve(n_samples: int, n_units: int, alpha: float) -> bool:
+    """Whether a chunk of ``n_units`` co-located units should use the batched solve.
+
+    Requires ``alpha > 0`` (the batched solve is all-or-nothing on a singular Gram and has
+    no per-item lstsq fallback; ``alpha > 0`` makes every ``G_std + …·I`` SPD). In ``auto``
+    mode the batched path engages for large panels (``n_samples ≥ _BATCH_MIN_SAMPLES``);
+    ``IMPUTED_PRS_SOLVE`` overrides for pinning.
+    """
+    if alpha <= 0.0 or n_units == 0:
+        return False
+    if _ACTIVE_SOLVE_MODE == "batched":
+        return True
+    if _ACTIVE_SOLVE_MODE == "per_target":
+        return False
+    return n_samples >= _BATCH_MIN_SAMPLES
+
+
 def _run_fit_batch(jobs, buf, folds, alpha, l1_ratio, cv_folds, s_true, s_cv, batch_cap):
     """Fit a group of co-located units, chunked to bound the (n×T) working arrays."""
     n_io = 0
@@ -605,18 +656,51 @@ def _run_fit_chunk(jobs, buf, folds, alpha, l1_ratio, cv_folds, s_true, s_cv):
         cross["n"], cross["K"], cross["T"], cross["m"], cross["Zband"], cross["Y"],
     )
 
-    # Per-unit solve; scatter each fold model's raw coefficients into the band slots
+    # Solve each unit, then scatter each fold model's raw coefficients into the band slots
     # so the OOF becomes a single GEMM per fold below.
     Wk = [np.zeros((m, T), dtype=np.float64) for _ in range(K)]
     bk = np.zeros((K, T), dtype=np.float64)
     coef_vec = np.zeros(T, dtype=np.float64)  # nonzero ⇒ contributes to calibration
     n_io = 0
+
+    # Assemble each unit's Gram block (record-don't-crash on a missing-slot gather).
+    assembled = []  # (j, job, block, idx, pred_af)
     for j, job in enumerate(jobs):
         try:
             block, idx, pred_af = _assemble_block(job, j, buf, cross)
-            result = fit_from_local_gram(
-                block, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv_folds
+        except Exception as exc:  # noqa: BLE001 - mirror legacy: record, don't crash
+            job.fail(exc)
+            continue
+        assembled.append((j, job, block, idx, pred_af))
+
+    # Solve — batched (many targets against the shared band) at scale, else the per-target
+    # sklearn oracle. The batched solve is all-or-nothing, so a rare failure falls back to
+    # the resilient per-target path (which records per-unit failures without crashing).
+    results = None
+    if _use_batched_solve(n, len(assembled), alpha):
+        try:
+            results = solve_blocks_batched(
+                [a[2] for a in assembled], alpha, l1_ratio, cv_folds
             )
+        except Exception:  # noqa: BLE001 - degrade to the per-target path
+            results = None
+    if results is None:
+        results = []
+        for a in assembled:
+            try:
+                results.append(
+                    fit_from_local_gram(
+                        a[2], alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv_folds
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - record, don't crash
+                a[1].fail(exc)
+                results.append(None)
+
+    for (j, job, block, idx, pred_af), result in zip(assembled, results):
+        if result is None:
+            continue
+        try:
             job.store(result, job.pred_idx, pred_af)
             if job.is_calibrating:
                 if result.fold_models:
@@ -713,6 +797,8 @@ class StreamingImputationFitter:
         # Set by run_reference_cv: {fold_k -> {prs_id -> ImputedVariantModel}}. When
         # non-None the fitter is in leave-one-fold-out reference-CV mode (see _fit_batch).
         self._cv_collector: Optional[Dict[int, Dict[str, ImputedVariantModel]]] = None
+        # Solver-selection override, resolved once here in the parent (pickled to workers).
+        self._solve_mode = _resolve_solve_mode()
 
     def run(self, source, *, n_workers: int = 1) -> StreamingFitResult:
         """Stream the panel and fit every unit, optionally sharding by chromosome.
@@ -750,6 +836,7 @@ class StreamingImputationFitter:
         per-chromosome band buffer + within-chromosome windows make it bit-identical
         regardless of sharding. ``self._cv_collector`` is read only as a **mode marker**.
         """
+        _set_active_solve_mode(self._solve_mode)  # per-fit, deterministic across the pool
         plan = self.plan
         buf = self.backend.make_buffer(self.folds.n, self.folds)
         models: Dict[str, ImputedVariantModel] = {}
