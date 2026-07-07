@@ -17,7 +17,10 @@ from imputed_prs.compute.gram_solve import (
     _BATCH_MAX_P_ENET,
     LocalGramBlock,
     _batched_fista,
+    _batched_fista_screened,
+    _screening_kkt_violations,
     _select_solver,
+    _strong_rule_active_mask,
     fit_from_local_gram,
     fit_reference_folds,
     ridge_gram_fit,
@@ -443,3 +446,116 @@ def test_solve_blocks_batched_p_gate_falls_back_large_p():
     np.testing.assert_allclose(got[1].coefficients, exp[1].coefficients, atol=1e-12)
     assert abs(got[1].intercept - exp[1].intercept) < 1e-12
     np.testing.assert_allclose(got[1].cv_r2, exp[1].cv_r2, atol=1e-12)
+
+
+# --- Exact strong-rule screening scaffold (Phase 8, commit 6) --------------------------
+
+
+def _standardized_batch(B, n, p, n_signal, seed):
+    """A batch of standardized Gram blocks ``(G_std, q_std, n, mask)`` from dosage data where
+    only ``n_signal`` of ``p`` predictors carry signal — a strong-L1-friendly sparse setup."""
+    rng = np.random.RandomState(seed)
+    Gs, qs = [], []
+    for _ in range(B):
+        freqs = rng.uniform(0.1, 0.9, size=p)
+        X = rng.binomial(2, freqs, size=(n, p)).astype(np.float64)
+        w = np.zeros(p)
+        w[rng.choice(p, n_signal, replace=False)] = rng.randn(n_signal) * 0.6
+        y = X @ w + rng.randn(n) * 0.5
+        y = np.clip(y - y.min(), 0.0, 2.0)
+        blk = build_block(X, y, 5, seed=7)
+        G_std, q_std, *_ = standardize_from_moments(
+            blk.G, blk.c, blk.zsum, blk.zsqsum, blk.ysum, blk.ysqsum, blk.n
+        )
+        Gs.append(G_std)
+        qs.append(q_std)
+    return np.stack(Gs), np.stack(qs), np.full(B, float(n)), np.ones((B, p))
+
+
+def _all_zero_kkt_violations(G_std, q_std, w, l1_reg):
+    """Every zero coordinate of ``w`` must satisfy the inactive-KKT bound ``|grad_j| ≤ l1``."""
+    zero = (np.abs(w) < 1e-9).astype(np.float64)
+    return _screening_kkt_violations(G_std, q_std, w, l1_reg, zero)
+
+
+def test_screening_matches_unscreened_bit_identical_strong_l1():
+    """Strong-rule screening returns the unscreened optimum bit-for-bit on a strong-L1 panel.
+
+    Screening removes a real fraction of coords, yet (i) all sub-solves share the full-mask
+    Lipschitz/step and (ii) the screened-out coords stay 0 in the unscreened solve too, so the
+    active coords trace the *identical* FISTA path — the results are bit-identical (atol=1e-12),
+    the KKT re-check is violation-free (``rounds == 1``), and the final solution satisfies the
+    full unscreened KKT system. This is the exactness guarantee: screening changes FLOPs, not
+    the answer.
+    """
+    G, q, n, mask = _standardized_batch(8, 500, 40, n_signal=5, seed=101)
+    alpha, l1 = 0.05, 0.9
+    l1_reg = alpha * l1 * n
+
+    active0 = _strong_rule_active_mask(q, l1_reg, mask)
+    assert active0.mean() < 0.95  # screening actually removes coords (not a no-op)
+    assert np.all(active0 <= mask)  # candidate set ⊆ real coords
+
+    w_u, _ = _batched_fista(G, q, n, alpha, l1, mask)
+    w_s, _iters, rounds = _batched_fista_screened(G, q, n, alpha, l1, mask)
+
+    assert rounds == 1  # strong rule is violation-free here → single solve
+    np.testing.assert_allclose(w_s, w_u, atol=1e-12)  # bit-identical to the unscreened solve
+    assert not _all_zero_kkt_violations(G, q, w_s, l1_reg).any()  # full KKT holds (exact)
+
+
+def test_screening_no_op_weak_l1():
+    """Weak regularization (``2·l1 − max|q_std| ≤ 0``) screens nothing → identical solve."""
+    G, q, n, mask = _standardized_batch(6, 500, 30, n_signal=20, seed=202)
+    alpha, l1 = 0.001, 0.1
+    active0 = _strong_rule_active_mask(q, alpha * l1 * n, mask)
+    np.testing.assert_array_equal(active0, mask)  # nothing screened
+
+    w_u, _ = _batched_fista(G, q, n, alpha, l1, mask)
+    w_s, _iters, rounds = _batched_fista_screened(G, q, n, alpha, l1, mask)
+    assert rounds == 1
+    np.testing.assert_allclose(w_s, w_u, atol=1e-12)
+
+
+def test_screening_kkt_violation_detector():
+    """``_screening_kkt_violations`` flags a wrongly-screened active coord, not an inactive one."""
+    G, q, n, mask = _standardized_batch(4, 500, 30, n_signal=4, seed=303)
+    alpha, l1 = 0.05, 0.9
+    l1_reg = alpha * l1 * n
+    w_u, _ = _batched_fista(G, q, n, alpha, l1, mask)
+
+    active_coord = np.abs(w_u).argmax(axis=1)  # a genuinely nonzero coord per row
+    screened_out = np.zeros_like(mask)
+    for b, j in enumerate(active_coord):
+        screened_out[b, j] = 1.0  # pretend this active coord was screened out
+    # Evaluate KKT at w with that coord forced to 0 (as a screened-out coord would be).
+    w0 = w_u.copy()
+    for b, j in enumerate(active_coord):
+        w0[b, j] = 0.0
+    viol = _screening_kkt_violations(G, q, w0, l1_reg, screened_out)
+    assert viol.sum() == mask.shape[0]  # exactly the one flagged coord per row violates
+
+
+def test_screening_monotone_addback_recovers_optimum():
+    """An over-aggressive initial active set is corrected by monotone KKT add-back.
+
+    Forcing out a genuinely-active coord (via ``active_init``) makes the strong-rule-free path
+    take ≥ 2 rounds, but the add-only re-solve restores it and converges to the same optimum as
+    the unscreened solve (to FISTA tolerance — a dropped-then-re-added coord traces a different
+    path, so this is convergence-tol agreement, not bit-identity). ``rounds`` stays ≤ P.
+    """
+    G, q, n, mask = _standardized_batch(8, 500, 40, n_signal=5, seed=101)
+    alpha, l1 = 0.05, 0.9
+    P = mask.shape[1]
+
+    w_u, _ = _batched_fista(G, q, n, alpha, l1, mask)
+    active = _strong_rule_active_mask(q, alpha * l1 * n, mask).copy()
+    drop = np.abs(w_u).argmax(axis=1)  # remove the largest active coord per row
+    active[np.arange(active.shape[0]), drop] = 0.0
+
+    w_s, _iters, rounds = _batched_fista_screened(
+        G, q, n, alpha, l1, mask, active_init=active
+    )
+    assert 2 <= rounds <= P  # add-back fired, and terminated within the monotone bound
+    np.testing.assert_allclose(w_s, w_u, atol=1e-6)  # exact optimum recovered (convergence tol)
+    assert not _all_zero_kkt_violations(G, q, w_s, alpha * l1 * n).any()

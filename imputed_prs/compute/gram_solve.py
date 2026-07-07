@@ -917,6 +917,7 @@ def _batched_fista(
     l1_ratio: float,
     mask: np.ndarray,
     w_init: Optional[np.ndarray] = None,
+    lip: Optional[np.ndarray] = None,
 ):
     """Batched masked FISTA (accelerated proximal gradient) for the ElasticNet L1 case.
 
@@ -941,7 +942,13 @@ def _batched_fista(
     ``w_init`` (B, P), if given, warm-starts the iterate (masked): the K leave-one-fold-out
     fold models are ~1/K perturbations of the full-data solution, so seeding each from the
     final model's coefficients cuts iterations sharply. FISTA is convex, so the converged
-    optimum is unchanged; only the iteration count differs. Returns ``(w, n_iters)``.
+    optimum is unchanged; only the iteration count differs.
+
+    ``lip`` (B,), if given, is the precomputed Lipschitz constant (largest eigenvalue of
+    ``H``) — pass it to reuse one estimate across sub-solves. :func:`_batched_fista_screened`
+    passes the **full-mask** ``lip`` so a screened solve (restricted ``mask``) takes the exact
+    same step as the unscreened solve, making the two bit-identical when screening is
+    violation-free (the screened-out coords stay 0 in both). Returns ``(w, n_iters)``.
     """
     B, P = q_std.shape
     l1_reg = alpha * l1_ratio * n            # (B,)
@@ -949,8 +956,9 @@ def _batched_fista(
     H = G_std.copy()
     diag = np.arange(P)
     H[:, diag, diag] += l2_reg[:, None]
-    lip = _power_lipschitz(H, mask) * _LIPSCHITZ_MARGIN  # (B,)
-    step = 1.0 / np.maximum(lip, 1e-12)                   # (B,)
+    if lip is None:
+        lip = _power_lipschitz(H, mask) * _LIPSCHITZ_MARGIN  # (B,)
+    step = 1.0 / np.maximum(lip, 1e-12)                       # (B,)
     thr = (l1_reg * step)[:, None]                        # (B, 1) soft-threshold level
     w = np.zeros((B, P), dtype=np.float64) if w_init is None else (w_init * mask)
     w_prev = w.copy()
@@ -987,3 +995,125 @@ def _power_lipschitz(H: np.ndarray, mask: np.ndarray) -> np.ndarray:
         v = hv / (np.linalg.norm(hv, axis=1, keepdims=True) + 1e-12)
     hv = np.einsum("bij,bj->bi", H, v) * mask
     return (v * hv).sum(axis=1)
+
+
+# ---------------------------------------------------------------------------
+# Exact strong-rule screening for the batched L1 solve (Phase 8, commit 6).
+#
+# Screening predicts which coordinates are inactive (zero) at the optimum and solves only
+# over the rest — for lasso/enet the active set is usually far smaller than P. The basic
+# (global) strong rule discards coord j when |q_std_j| < 2·l1 − max_k|q_std_k| (the w=0
+# gradient is −q_std, so max|q_std| is the smallest l1 that zeroes everything). The strong
+# rule is a HEURISTIC — it can wrongly discard a truly-active coord — so it is paired with a
+# batched KKT re-check on the screened-out coords and an ADD-ONLY (monotone) re-solve: any
+# coord whose stationarity |grad_j| ≤ l1 is violated is added back and the batch re-solved,
+# never dropping a coord. Monotone growth bounds the loop to ≤ P rounds (no cycling) and
+# guarantees the returned w satisfies the full KKT system of the *unscreened* problem — i.e.
+# screening changes the FLOPs, not the answer (it is exact, not approximate).
+#
+# NOTE: with the dense batched FISTA (a (B,P,P) matvec cannot skip masked columns) screening
+# alone yields NO speedup — masking a coordinate to 0 still spends its FLOPs. The FLOP win
+# needs the active-set *compaction* of commit 7 (physically shrink (B,K,P,P) to the surviving
+# coords), which is benchmark-gated. This commit lands the exact scaffold + its correctness
+# proof so compaction can build on a verified active set; it is intentionally unwired.
+# ---------------------------------------------------------------------------
+
+# KKT slack for the screened-out re-check: a coord counts as violated only if |grad_j| exceeds
+# l1 by more than this, so FISTA's convergence wobble (~_FISTA_TOL on the iterate) never
+# spuriously re-adds a boundary coord. Scaled by l1 (+ a small absolute floor) so it tracks
+# the penalty magnitude across hyperparameters.
+_SCREEN_KKT_ATOL = 1e-9
+_SCREEN_KKT_RTOL = 1e-6
+
+
+def _strong_rule_active_mask(
+    q_std: np.ndarray, l1_reg: np.ndarray, mask: np.ndarray
+) -> np.ndarray:
+    """Basic (global) strong-rule candidate-active set from the ``w=0`` gradient.
+
+    ``lam_max = max_j |q_std_j|`` (over real coords) is the smallest ``l1`` that zeroes every
+    coord (at ``w=0`` the smooth gradient is ``−q_std``, so coord ``j`` first activates when
+    ``|q_std_j| ≥ l1``). The strong rule keeps coord ``j`` iff ``|q_std_j| ≥ 2·l1 − lam_max``;
+    ``2·l1 − lam_max ≤ 0`` (weak regularization, ``l1 ≤ lam_max/2``) keeps everything. This is
+    a heuristic screen and MUST be paired with :func:`_screening_kkt_violations` — the KKT
+    re-check is what makes it exact. Returns a ``(B, P)`` 0/1 mask ``⊆ mask``.
+    """
+    absq = np.abs(q_std) * mask
+    lam_max = absq.max(axis=1, keepdims=True)          # (B, 1)
+    tau = 2.0 * l1_reg[:, None] - lam_max              # (B, 1) strong-rule threshold
+    return mask * (absq >= tau).astype(np.float64)
+
+
+def _screening_kkt_violations(
+    G_std: np.ndarray,
+    q_std: np.ndarray,
+    w: np.ndarray,
+    l1_reg: np.ndarray,
+    screened_out: np.ndarray,
+) -> np.ndarray:
+    """Screened-out coords whose inactive-KKT ``|grad_j| ≤ l1`` is violated at ``w``.
+
+    A screened-out coord has ``w_j = 0``, so its smooth gradient ``(H·w − q_std)_j`` reduces to
+    ``(G_std·w − q_std)_j`` (the ``l2·w_j`` term vanishes) — no need for ``H``. Optimality of a
+    zero coord requires ``|grad_j| ≤ l1``; a coord exceeding ``l1`` (by more than the KKT slack)
+    wants to be active and must be added back. Returns a ``(B, P)`` 0/1 mask of violators
+    (``⊆ screened_out``).
+    """
+    grad = np.einsum("bij,bj->bi", G_std, w) - q_std   # valid on screened-out coords (w_j=0)
+    tol = _SCREEN_KKT_ATOL + _SCREEN_KKT_RTOL * l1_reg[:, None]
+    return screened_out * (np.abs(grad) > (l1_reg[:, None] + tol)).astype(np.float64)
+
+
+def _batched_fista_screened(
+    G_std: np.ndarray,
+    q_std: np.ndarray,
+    n: np.ndarray,
+    alpha: float,
+    l1_ratio: float,
+    mask: np.ndarray,
+    w_init: Optional[np.ndarray] = None,
+    active_init: Optional[np.ndarray] = None,
+):
+    """Exact strong-rule-screened batched FISTA: same optimum as :func:`_batched_fista`.
+
+    Solves restricted to the strong-rule active set, then KKT-re-checks the screened-out
+    coords and adds back any violator (monotone, ≤ P rounds), so the returned ``w`` satisfies
+    the full unscreened KKT system. All sub-solves share the **full-mask** Lipschitz/step, so
+    when screening is violation-free (screened-out coords stay 0 in the unscreened solve too),
+    the active coords trace the *identical* FISTA path and the result is bit-identical to the
+    unscreened solve. Returns ``(w, n_iters, n_rounds)``.
+
+    ``active_init`` (B, P) ⊆ ``mask`` overrides the initial active set (default: the strong
+    rule). The monotone KKT re-check still corrects any wrongly-screened coord, so an
+    over-aggressive ``active_init`` yields the same exact optimum via extra rounds — the hook
+    commit 7's active-set compaction uses to seed a precomputed set (and the test uses to
+    exercise the add-back path, which the safe strong rule rarely triggers on its own).
+    """
+    B, P = q_std.shape
+    l1_reg = alpha * l1_ratio * n            # (B,)
+    l2_reg = alpha * (1.0 - l1_ratio) * n    # (B,)
+    H = G_std.copy()
+    diag = np.arange(P)
+    H[:, diag, diag] += l2_reg[:, None]
+    lip = _power_lipschitz(H, mask) * _LIPSCHITZ_MARGIN  # full-mask step, shared by all rounds
+
+    if active_init is None:
+        active = _strong_rule_active_mask(q_std, l1_reg, mask)
+    else:
+        active = mask * active_init  # honor mask (never activate a padded coord)
+    w, total_iters = _batched_fista(
+        G_std, q_std, n, alpha, l1_ratio, active, w_init=w_init, lip=lip
+    )
+    n_rounds = 1
+    for _ in range(P):  # monotone add-only ⇒ at most P growth rounds, no cycling
+        screened_out = mask * (1.0 - active)
+        viol = _screening_kkt_violations(G_std, q_std, w, l1_reg, screened_out)
+        if not viol.any():
+            break
+        active = np.minimum(active + viol, mask)  # add violators back (never drop)
+        w, iters = _batched_fista(
+            G_std, q_std, n, alpha, l1_ratio, active, w_init=w, lip=lip
+        )
+        total_iters += iters
+        n_rounds += 1
+    return w, total_iters, n_rounds
