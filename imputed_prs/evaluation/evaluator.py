@@ -99,7 +99,7 @@ def _run_sensitivity_combo(payload):
 
     (params, base, prs_definition, platform_name, platform_manifest,
      platform_variants, cv_folds, random_state, inner_n_jobs, genotype_data,
-     platform_variant_set, platform_info) = payload
+     platform_variant_set, platform_info, cache_dir) = payload
     try:
         test_model = LinearImputationPRS(
             window_size=params.get("window_size", base["window_size"]),
@@ -121,6 +121,7 @@ def _run_sensitivity_combo(payload):
             platform_variants=platform_variants,
             _platform_variant_set=platform_variant_set,
             _platform_info=platform_info,
+            _cache_dir=cache_dir,
         )
         if test_model._imputed_models:
             models_dict = {m.variant_id: m for m in test_model._imputed_models}
@@ -148,7 +149,7 @@ def _run_sensitivity_group(payload):
 
     (group, base, prs_definition, platform_name, platform_manifest, platform_variants,
      cv_folds, random_state, inner_n_jobs, genotype_data, platform_variant_set,
-     platform_info) = payload
+     platform_info, cache_dir) = payload
     memo: Dict[str, Any] = {}  # shared across the group: {ref_info, collected}
     out: List[Dict[str, Any]] = []
     for params in group:
@@ -174,6 +175,7 @@ def _run_sensitivity_group(payload):
                 _platform_variant_set=platform_variant_set,
                 _platform_info=platform_info,
                 _block_memo=memo,
+                _cache_dir=cache_dir,
             )
             if test_model._imputed_models:
                 models_dict = {m.variant_id: m for m in test_model._imputed_models}
@@ -511,6 +513,7 @@ class ImputationEvaluator:
         parameter_grid: Optional[Dict[str, List[Any]]] = None,
         cv_folds: int = 5,
         random_state: Optional[int] = None,
+        cache_dir: Optional[Union[str, Path]] = None,
     ) -> SensitivityResult:
         """Analyze model sensitivity to hyperparameters.
 
@@ -530,6 +533,14 @@ class ImputationEvaluator:
                  'alpha': [0.001, 0.01, 0.1]}
             cv_folds: Number of CV folds for evaluation. Default: 5.
             random_state: Random seed for reproducibility.
+            cache_dir: Optional directory for the opt-in persisted sufficient-statistics
+                cache (Phase 9). When set and the fit streams, the collected Gram blocks
+                are keyed on (reference, chip+target set, window params) — NOT on
+                (alpha, l1) — so the first run writes them through and a later
+                sensitivity / re-tune on the same panel skips the accumulation pass
+                entirely, re-solving cached blocks per combo. Default None → no disk I/O.
+                Serves raw-model reuse (coefficients + CV-R²); grid models are scored
+                uncalibrated, so no calibration re-stream is needed.
 
         Returns:
             SensitivityResult with results for each parameter combination.
@@ -589,7 +600,7 @@ class ImputationEvaluator:
         common = (
             base_config, prs_definition, platform_name, platform_manifest,
             platform_variants, cv_folds, random_state, inner_n_jobs, genotype_data,
-            platform_variant_set, platform_info,
+            platform_variant_set, platform_info, cache_dir,
         )
 
         # Phase 9: when the fit will stream, combos sharing a window_size share the

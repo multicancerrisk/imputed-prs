@@ -826,3 +826,87 @@ class TestSensitivityStreamingReuse:
             np.testing.assert_allclose(
                 pr["metrics"].r2, oracle[(p["window_size"], p["alpha"])], atol=1e-9
             )
+
+
+class TestSensitivityStatsCache:
+    """Phase 9 commit 6: sensitivity_analysis(cache_dir=...) writes the collected Gram
+    blocks through on the cold run and warm-hits them on a second run — skipping the
+    accumulation pass entirely (run_collect is never called) while producing bit-identical
+    results. The blocks are alpha/l1-independent, so one accumulation per window_size
+    serves the whole grid across invocations."""
+
+    GRID = {"window_size": [500_000, 1_000_000], "l1_ratio": [0.5], "alpha": [0.01, 0.1]}
+
+    def _evaluator(self, vcf, prs_df, platform):
+        model = LinearImputationPRS(backend="streaming", n_workers=1, random_state=0)
+        model.fit(
+            reference_genotypes=vcf, prs_definition=prs_df, platform_variants=platform
+        )
+        return ImputationEvaluator(model, verbose=0)
+
+    def _run(self, evaluator, vcf, prs_df, platform, cache_dir):
+        return evaluator.sensitivity_analysis(
+            reference_genotypes=vcf,
+            prs_definition=prs_df,
+            platform_variants=platform,
+            parameter_grid=self.GRID,
+            cv_folds=2,
+            random_state=0,
+            cache_dir=cache_dir,
+        )
+
+    def test_warm_run_skips_accumulation_and_matches(
+        self, tmp_path, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        import imputed_prs.compute.sufficient_stats as ss
+        from imputed_prs.io.stats_cache import get_stats_cache_info
+
+        ev = self._evaluator(
+            synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+        )
+        args = (synthetic_vcf_file, synthetic_prs_df, platform_variants_partial)
+
+        real = ss.StreamingImputationFitter.run_collect
+
+        def counting(inner, *a, **k):
+            counting.n += 1
+            return real(inner, *a, **k)
+
+        # COLD: streams once per window_size (2), writes both entries through.
+        counting.n = 0
+        with mock.patch.object(ss.StreamingImputationFitter, "run_collect", counting):
+            cold = self._run(ev, *args, tmp_path)
+        assert counting.n == 2, f"cold accumulation ran {counting.n}x; expected 2"
+        assert get_stats_cache_info(cache_dir=tmp_path)["n_entries"] == 2
+
+        # WARM: every group disk-hits → the accumulation pass never runs.
+        counting.n = 0
+        with mock.patch.object(ss.StreamingImputationFitter, "run_collect", counting):
+            warm = self._run(ev, *args, tmp_path)
+        assert counting.n == 0, f"warm accumulation ran {counting.n}x; expected 0 (cache)"
+
+        # Warm results are bit-identical to cold (solve_collected is deterministic).
+        assert warm.best_params == cold.best_params
+        cold_by = {tuple(sorted(r["params"].items())): r for r in cold.parameter_results}
+        for wr in warm.parameter_results:
+            cr = cold_by[tuple(sorted(wr["params"].items()))]
+            assert wr["metrics"] is not None
+            np.testing.assert_array_equal(wr["metrics"].r2, cr["metrics"].r2)
+
+    def test_cache_is_correctness_inert(
+        self, tmp_path, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        # cache_dir must not change the answer: warm-cache == no-cache, exactly.
+        ev = self._evaluator(
+            synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+        )
+        args = (synthetic_vcf_file, synthetic_prs_df, platform_variants_partial)
+        no_cache = self._run(ev, *args, None)
+        self._run(ev, *args, tmp_path)          # populate
+        warm = self._run(ev, *args, tmp_path)   # serve from cache
+
+        assert warm.best_params == no_cache.best_params
+        nc_by = {tuple(sorted(r["params"].items())): r for r in no_cache.parameter_results}
+        for wr in warm.parameter_results:
+            nr = nc_by[tuple(sorted(wr["params"].items()))]
+            np.testing.assert_array_equal(wr["metrics"].r2, nr["metrics"].r2)

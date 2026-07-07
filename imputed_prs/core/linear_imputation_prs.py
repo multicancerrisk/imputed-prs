@@ -264,6 +264,7 @@ class LinearImputationPRS:
         _platform_variant_set: Optional[Set[str]] = None,
         _platform_info: Optional[Any] = None,
         _block_memo: Optional[Dict] = None,
+        _cache_dir: Optional[Union[str, Path]] = None,
     ) -> "LinearImputationPRS":
         """Train imputation models on reference genotype data.
 
@@ -306,6 +307,12 @@ class LinearImputationPRS:
         # blocks into it on the first combo and re-solves them for the rest — one
         # accumulation per key, not per combo. None (the default) → the normal fit.
         self._block_memo = _block_memo
+        # Phase 9 opt-in disk cache: when set (and running in collect mode), the streaming
+        # fit loads/stores the collected Gram blocks under a (reference, chip+target set,
+        # window params) key so a later sensitivity / re-tune skips the accumulation pass.
+        # None (the default) → no disk I/O. Consumed only on the collect seam (calibration
+        # is never cached — it needs the resident dosage band; see _fit_streaming).
+        self._cache_dir = _cache_dir
 
         # Step 1: Input validation - exactly one platform source must be provided
         platform_sources = [
@@ -1040,6 +1047,53 @@ class LinearImputationPRS:
             )
         return stream
 
+    def _stats_cache_key(self, plan, source, ref_info):
+        """Build the :class:`StatsKey` identifying this collect pass's Gram blocks.
+
+        The blocks depend on the reference panel, the chip predictors AND the target /
+        fallback set (with their effect orientation), and the window params — but NOT on
+        ``(alpha, l1_ratio)``, so a single cached collection serves the whole grid. The
+        target/predictor identities go into the (order-independent) chip-set component;
+        positions and allele resolution are implied by the reference identity + ids.
+        """
+        from imputed_prs.io.stats_cache import make_stats_key
+
+        tokens = [f"c:{cid}" for cid in plan.chip_ids]
+        tokens += [f"t:{tid}:{int(tv.effect_flip)}" for tid, tv in plan.targets.items()]
+        tokens += [
+            f"b:{tid}:{int(tv.effect_flip)}"
+            for tid, tv in plan.fallback_targets.items()
+        ]
+        source_file = getattr(source, "path", None) or getattr(source, "_pgen_path", None)
+        return make_stats_key(
+            sample_ids=source.sample_ids,
+            chip_ids=tokens,
+            window_size=self.window_size,
+            max_predictors=self.max_predictors,
+            cv_folds=self.cv_folds,
+            random_state=self.random_state,
+            source_file=source_file,
+            n_variants=len(ref_info),
+        )
+
+    def _load_cached_blocks(self, key, cache_dir):
+        """Load collected blocks for ``key`` (or ``None`` on a miss); best-effort."""
+        from imputed_prs.io.stats_cache import load_collected
+
+        collected = load_collected(key, cache_dir=cache_dir)
+        if self.verbose >= 1:
+            hit = "hit" if collected is not None else "miss"
+            print(f"Stats cache {hit}: {key.digest} ({cache_dir})")
+        return collected
+
+    def _store_cached_blocks(self, key, collected, cache_dir):
+        """Write collected blocks through to the disk cache; never raises."""
+        from imputed_prs.io.stats_cache import store_collected
+
+        entry = store_collected(key, collected, cache_dir=cache_dir)
+        if self.verbose >= 1 and entry is not None:
+            print(f"Stats cache store: {key.digest} ({len(collected)} blocks)")
+
     def _fit_streaming(
         self,
         source,
@@ -1155,7 +1209,19 @@ class LinearImputationPRS:
             # band the OOF needs is gone after the collect pass).
             collected = _memo.get("collected")
             if collected is None:
-                collected = fitter.run_collect(source, n_workers=self.n_workers)
+                # In-process miss. Consult the opt-in disk cache (Phase 9 commit 6): a
+                # prior invocation's blocks let us skip the whole accumulation pass. The
+                # blocks are alpha/l1-independent, so one cached collection serves the
+                # entire grid. A miss streams once and writes through.
+                cache_dir = getattr(self, "_cache_dir", None)
+                cache_key = None
+                if cache_dir is not None:
+                    cache_key = self._stats_cache_key(plan, source, ref_info)
+                    collected = self._load_cached_blocks(cache_key, cache_dir)
+                if collected is None:
+                    collected = fitter.run_collect(source, n_workers=self.n_workers)
+                    if cache_key is not None:
+                        self._store_cached_blocks(cache_key, collected, cache_dir)
                 _memo["collected"] = collected
             result = fitter.solve_collected(
                 collected, effective_alpha, effective_l1_ratio
