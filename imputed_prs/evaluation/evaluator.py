@@ -110,6 +110,7 @@ def _run_sensitivity_combo(payload):
             n_jobs=inner_n_jobs,
             n_workers=1,
             random_state=random_state,
+            backend=base.get("backend", "auto"),
             verbose=0,
         )
         test_model.fit(
@@ -131,6 +132,62 @@ def _run_sensitivity_combo(payload):
         return {"params": params, "metrics": metrics, "quality_summary": quality_summary}
     except Exception as e:  # noqa: BLE001 — mirror the serial path: record, don't crash
         return {"params": params, "metrics": None, "error": str(e)}
+
+
+def _run_sensitivity_group(payload):
+    """Fit + evaluate a GROUP of combos that share an accumulation key (Phase 9).
+
+    The combos run serially in this one process sharing a block memo: the first fit
+    collects the streaming Gram blocks into it, the rest re-solve them for their own
+    ``(l1_ratio, alpha)`` — so the streaming accumulation runs ONCE per group, not once
+    per combo. The evaluator scores raw models, so the re-solved (uncalibrated) grid
+    models give identical metrics to a full fit. Returns the list of per-combo result
+    dicts (same shape as :func:`_run_sensitivity_combo`), one per combo in the group.
+    """
+    from imputed_prs.core.linear_imputation_prs import LinearImputationPRS
+
+    (group, base, prs_definition, platform_name, platform_manifest, platform_variants,
+     cv_folds, random_state, inner_n_jobs, genotype_data, platform_variant_set,
+     platform_info) = payload
+    memo: Dict[str, Any] = {}  # shared across the group: {ref_info, collected}
+    out: List[Dict[str, Any]] = []
+    for params in group:
+        try:
+            test_model = LinearImputationPRS(
+                window_size=params.get("window_size", base["window_size"]),
+                tuning_scope="none",
+                l1_ratio=params.get("l1_ratio", base["l1_ratio"]),
+                alpha=params.get("alpha", base["alpha"]),
+                cv_folds=cv_folds,
+                n_jobs=inner_n_jobs,
+                n_workers=1,
+                random_state=random_state,
+                backend=base.get("backend", "auto"),
+                verbose=0,
+            )
+            test_model.fit(
+                reference_genotypes=genotype_data,
+                prs_definition=prs_definition,
+                platform_name=platform_name,
+                platform_manifest=platform_manifest,
+                platform_variants=platform_variants,
+                _platform_variant_set=platform_variant_set,
+                _platform_info=platform_info,
+                _block_memo=memo,
+            )
+            if test_model._imputed_models:
+                models_dict = {m.variant_id: m for m in test_model._imputed_models}
+                quality_summary = summarize_imputation_quality(models_dict)
+            else:
+                quality_summary = {"mean_r2": None, "n_total": 0}
+            evaluator = ImputationEvaluator(test_model, verbose=0)
+            metrics = evaluator.evaluate(genotype_data)
+            out.append(
+                {"params": params, "metrics": metrics, "quality_summary": quality_summary}
+            )
+        except Exception as e:  # noqa: BLE001 — mirror the serial path: record, don't crash
+            out.append({"params": params, "metrics": None, "error": str(e)})
+    return out
 
 
 class ImputationEvaluator:
@@ -526,20 +583,57 @@ class ImputationEvaluator:
             "window_size": self.model.window_size,
             "l1_ratio": self.model.l1_ratio,
             "alpha": self.model.alpha,
+            "backend": self.model.backend,
         }
-        payloads = [
-            (dict(zip(param_names, combo)), base_config, prs_definition, platform_name,
-             platform_manifest, platform_variants, cv_folds, random_state, inner_n_jobs,
-             genotype_data, platform_variant_set, platform_info)
-            for combo in param_combinations
-        ]
-        if self.verbose >= 1:
-            how = "serial" if resolved <= 1 else f"{resolved} workers"
-            print(f"Testing {len(param_combinations)} parameter combinations ({how})...")
-
-        results = parallel_map(
-            _run_sensitivity_combo, payloads, n_workers=self.model.n_workers
+        combo_dicts = [dict(zip(param_names, combo)) for combo in param_combinations]
+        common = (
+            base_config, prs_definition, platform_name, platform_manifest,
+            platform_variants, cv_folds, random_state, inner_n_jobs, genotype_data,
+            platform_variant_set, platform_info,
         )
+
+        # Phase 9: when the fit will stream, combos sharing a window_size share the
+        # streaming accumulation — group them so it runs ONCE per window_size and the
+        # collected Gram blocks are re-solved per (l1_ratio, alpha). Dense/small inputs
+        # keep the flat per-combo fan-out (each dense fit is cheap and independently
+        # parallel; grouping would only cost parallelism there). The heuristic mirrors
+        # fit's auto size-gate (n_variants over-estimates |needed| → conservative).
+        from imputed_prs.core.linear_imputation_prs import _AUTO_STREAMING_BYTES_THRESHOLD
+
+        est_bytes = genotype_data.n_samples * max(genotype_data.n_variants, 1) * 4
+        will_stream = self.model.backend == "streaming" or (
+            self.model.backend == "auto" and est_bytes > _AUTO_STREAMING_BYTES_THRESHOLD
+        )
+
+        if will_stream:
+            groups: Dict[Any, List[Dict[str, Any]]] = {}
+            for cd in combo_dicts:
+                groups.setdefault(
+                    cd.get("window_size", base_config["window_size"]), []
+                ).append(cd)
+            group_payloads = [(group, *common) for group in groups.values()]
+            if self.verbose >= 1:
+                print(
+                    f"Testing {len(param_combinations)} combinations in "
+                    f"{len(group_payloads)} accumulation group(s) (streaming reuse)..."
+                )
+            nested = parallel_map(
+                _run_sensitivity_group, group_payloads, n_workers=self.model.n_workers
+            )
+            results = [r for group_res in nested for r in group_res]
+        else:
+            payloads = [(cd, *common) for cd in combo_dicts]
+            if self.verbose >= 1:
+                how = "serial" if resolved <= 1 else f"{resolved} workers"
+                print(f"Testing {len(param_combinations)} parameter combinations ({how})...")
+            results = parallel_map(
+                _run_sensitivity_combo, payloads, n_workers=self.model.n_workers
+            )
+
+        # Restore canonical combo order (grouping reorders results) so the best-scan's
+        # first-max-wins tie-break stays deterministic regardless of grouping/fan-out.
+        _pos = {combo: i for i, combo in enumerate(param_combinations)}
+        results.sort(key=lambda r: _pos[tuple(r["params"][k] for k in param_names)])
 
         # Collect in canonical combo order → deterministic best (first max wins ties,
         # matching the pre-Phase-7 serial loop's strict '>' scan over combos in order).

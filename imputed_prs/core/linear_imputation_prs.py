@@ -263,6 +263,7 @@ class LinearImputationPRS:
         allow_alt_as_effect: bool = False,
         _platform_variant_set: Optional[Set[str]] = None,
         _platform_info: Optional[Any] = None,
+        _block_memo: Optional[Dict] = None,
     ) -> "LinearImputationPRS":
         """Train imputation models on reference genotype data.
 
@@ -300,6 +301,12 @@ class LinearImputationPRS:
             ValidationError: If inputs are invalid or incompatible.
             DataLoadError: If files cannot be loaded.
         """
+        # Phase 9 grid re-solve (sensitivity): a shared, mutable memo across combos that
+        # share an accumulation key (window params). The streaming path collects the Gram
+        # blocks into it on the first combo and re-solves them for the rest — one
+        # accumulation per key, not per combo. None (the default) → the normal fit.
+        self._block_memo = _block_memo
+
         # Step 1: Input validation - exactly one platform source must be provided
         platform_sources = [
             platform_name is not None,
@@ -1111,7 +1118,13 @@ class LinearImputationPRS:
             {_normalize_chromosome(str(c)) for c in prs_df["chromosome"].unique()},
             key=_chrom_sort_key,
         )
-        ref_info = collect_reference_variant_info(source, chroms)
+        _memo = getattr(self, "_block_memo", None)
+        if _memo is not None and "ref_info" in _memo:
+            ref_info = _memo["ref_info"]  # grid re-solve: reuse the metadata scan
+        else:
+            ref_info = collect_reference_variant_info(source, chroms)
+            if _memo is not None:
+                _memo["ref_info"] = ref_info
         plan, missing_drop_reason = build_stream_plan(
             ref_info,
             prs_df,
@@ -1135,11 +1148,24 @@ class LinearImputationPRS:
         # Single streaming pass: imputed models + observed fallbacks + calibration.
         # n_workers>1 shards the pass by chromosome across processes (CPU-only).
         fitter = StreamingImputationFitter(plan, device=self.device)
-        result = fitter.run(source, n_workers=self.n_workers)
-
-        calibration_params = finalize_imputation_calibration(
-            result.s_true, result.s_cv, result.models
-        )
+        if _memo is not None:
+            # Phase 9 grid re-solve (sensitivity): collect the Gram blocks ONCE per
+            # accumulation key, then re-solve for this combo's (alpha, l1). The evaluator
+            # scores raw models, so grid models carry no calibration (the resident dosage
+            # band the OOF needs is gone after the collect pass).
+            collected = _memo.get("collected")
+            if collected is None:
+                collected = fitter.run_collect(source, n_workers=self.n_workers)
+                _memo["collected"] = collected
+            result = fitter.solve_collected(
+                collected, effective_alpha, effective_l1_ratio
+            )
+            calibration_params = None
+        else:
+            result = fitter.run(source, n_workers=self.n_workers)
+            calibration_params = finalize_imputation_calibration(
+                result.s_true, result.s_cv, result.models
+            )
 
         # TrainingResult with cv_predictions=None — the calibration blocker never
         # materializes; s_true/s_cv were accumulated during the streaming pass.

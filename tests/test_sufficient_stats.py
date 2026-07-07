@@ -291,3 +291,40 @@ def test_streaming_matches_dense(W, max_pred, alpha, l1):
     perm = fitter.folds.perm
     np.testing.assert_allclose(result.s_true, dense_s_true[perm], atol=1e-7, rtol=1e-6)
     np.testing.assert_allclose(result.s_cv, dense_s_cv[perm], atol=1e-6, rtol=1e-5)
+
+
+def test_run_collect_then_solve_matches_run():
+    """Phase 9 grid solve: collect the Gram blocks ONCE, then ``solve_collected(alpha, l1)``
+    reproduces a single ``run()`` at that ``(alpha, l1)`` — for two different combos from
+    the *same* collected blocks (the blocks are alpha/l1-independent). n=300 (<10K) keeps
+    both on the per-target oracle, so coefficients / intercept / CV-R² match exactly.
+    """
+    info, dosage, sample_ids = build_panel(seed=7)
+    W = 300_000
+    combos = [(0.01, 0.5), (0.05, 0.9)]
+
+    def src():
+        return FakeSource(info, dosage, sample_ids, block_size=5)
+
+    # Collect once (blocks depend on the window structure, not on alpha/l1). Any combo's
+    # plan yields the same structure; use the first for the collecting fitter.
+    plan0 = build_plan_and_prs(info, dosage, sample_ids, W, None, *combos[0], 7)[0]
+    fitter = StreamingImputationFitter(plan0)
+    collected = fitter.run_collect(src())
+    assert collected  # non-empty
+
+    for alpha, l1 in combos:
+        plan = build_plan_and_prs(info, dosage, sample_ids, W, None, alpha, l1, 7)[0]
+        single = StreamingImputationFitter(plan).run(src())
+        grid = fitter.solve_collected(collected, alpha, l1)
+
+        assert set(grid.models) == set(single.models)
+        assert set(grid.fallback_models) == set(single.fallback_models)
+        assert grid.n_intercept_only == single.n_intercept_only
+        for vid, sm in single.models.items():
+            gm = grid.models[vid]
+            assert gm.predictor_variant_ids == sm.predictor_variant_ids
+            np.testing.assert_allclose(gm.coefficients, sm.coefficients, atol=1e-9)
+            np.testing.assert_allclose(gm.intercept, sm.intercept, atol=1e-9)
+            np.testing.assert_allclose(gm.imputation_r2, sm.imputation_r2, atol=1e-9)
+            assert gm.is_intercept_only == sm.is_intercept_only

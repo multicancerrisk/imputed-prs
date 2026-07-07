@@ -478,6 +478,27 @@ class _OpenTarget:
     is_fallback: bool = False  # observed-variant fallback (no calibration reduction)
 
 
+@dataclass
+class _CollectedTarget:
+    """A target's assembled :class:`LocalGramBlock` retained (unsolved) so a
+    hyperparameter grid can re-solve it without re-streaming (Phase 9 grid solve).
+
+    ``block`` is the raw local Gram; ``pred_idx`` the predictor platform indices
+    (for ``_to_model``'s predictor metadata) and ``pred_af`` their training AFs. The
+    block is identical to what the single fit would assemble for this target, so
+    solving it at ``(alpha, l1)`` reproduces that fit's coefficients / CV metrics.
+    Calibration is *not* recoverable from a collected block (the resident dosage band
+    is gone) — the grid consumer scores raw, uncalibrated models.
+    """
+
+    spec: TargetVar
+    af: float
+    block: LocalGramBlock
+    pred_idx: np.ndarray
+    pred_af: np.ndarray
+    is_fallback: bool
+
+
 # ---------------------------------------------------------------------------
 # Shared batched-Gram fit kernel (imputation targets AND projection regions).
 # ---------------------------------------------------------------------------
@@ -835,6 +856,9 @@ class StreamingImputationFitter:
         # Set by run_reference_cv: {fold_k -> {prs_id -> ImputedVariantModel}}. When
         # non-None the fitter is in leave-one-fold-out reference-CV mode (see _fit_batch).
         self._cv_collector: Optional[Dict[int, Dict[str, ImputedVariantModel]]] = None
+        # Set to a list by run_collect: when non-None the fitter is in *collect* mode —
+        # _fit_batch assembles each target's LocalGramBlock into it and does not solve.
+        self._collect: Optional[List["_CollectedTarget"]] = None
         # Solver-selection override, resolved once here in the parent (pickled to workers).
         self._solve_mode = _resolve_solve_mode()
 
@@ -853,6 +877,97 @@ class StreamingImputationFitter:
             self, source, self._stream_chromosomes(), n_workers=n_workers, device=device
         )
         return StreamingFitResult.reduce(partials, self.folds.n)
+
+    def run_collect(self, source, *, n_workers: int = 1) -> List["_CollectedTarget"]:
+        """Stream once and return every target's assembled Gram block, WITHOUT solving.
+
+        The O(n) streaming + band accumulation runs once; a hyperparameter grid then
+        re-solves the returned blocks for each ``(alpha, l1)`` (see
+        :meth:`solve_collected`), so the accumulation happens once per *accumulation key*
+        (window params), not once per combo. Single-process by design — the collect list
+        is shared across the serial chromosome loop — so it does not fan out (sensitivity
+        parallelizes *across* accumulation keys instead). Memory is O(#targets ×
+        predictors²): intended for hyperparameter selection on a manageable score, not a
+        full-2M fit. ``n_workers`` is accepted for signature symmetry and ignored.
+        """
+        _set_active_solve_mode(self._solve_mode)
+        self._collect = []
+        try:
+            for chrom in self._stream_chromosomes():
+                self._run_one_chromosome(source, chrom)
+            return self._collect
+        finally:
+            self._collect = None
+
+    def solve_collected(
+        self, collected: Sequence["_CollectedTarget"], alpha: float, l1_ratio: float
+    ) -> StreamingFitResult:
+        """Solve every collected block at ``(alpha, l1_ratio)`` → a ``StreamingFitResult``.
+
+        No calibration: ``s_true``/``s_cv`` are zero placeholders (the grid consumer
+        scores raw, uncalibrated models — the resident dosage band needed for the OOF is
+        gone). The solve dispatch mirrors :func:`_run_fit_chunk` — the batched solve at
+        scale (same :func:`_use_batched_solve` gate, chunked by ``_batch_cap``), else the
+        per-target sklearn oracle — so at a given ``n`` the coefficients match the single
+        fit's for the same ``(alpha, l1)``.
+        """
+        from imputed_prs.compute.gram_solve import fit_from_local_gram, solve_blocks_batched
+
+        _set_active_solve_mode(self._solve_mode)
+        models: Dict[str, ImputedVariantModel] = {}
+        fallback_models: Dict[str, ImputedVariantModel] = {}
+        failures: Dict[str, str] = {}
+        n_io = 0
+        n = self.folds.n
+        blocks = [c.block for c in collected]
+
+        solved: Optional[List] = None
+        if _use_batched_solve(n, len(blocks), alpha):
+            try:
+                solved = []
+                for s in range(0, len(blocks), self._batch_cap):
+                    solved.extend(
+                        solve_blocks_batched(
+                            blocks[s : s + self._batch_cap], alpha, l1_ratio,
+                            self.plan.cv_folds,
+                        )
+                    )
+            except Exception:  # noqa: BLE001 - degrade to the resilient per-target oracle
+                solved = None
+        if solved is None:
+            solved = []
+            for c in collected:
+                try:
+                    solved.append(
+                        fit_from_local_gram(
+                            c.block, alpha=alpha, l1_ratio=l1_ratio,
+                            cv_folds=self.plan.cv_folds,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - record, don't crash
+                    failures[c.spec.prs_variant_id] = f"{type(exc).__name__}: {exc}"
+                    solved.append(None)
+
+        for c, result in zip(collected, solved):
+            if result is None:
+                continue
+            model = self._to_model(c.spec, c.af, result, c.pred_idx, c.pred_af)
+            if c.is_fallback:
+                fallback_models[c.spec.prs_variant_id] = model
+            else:
+                models[c.spec.prs_variant_id] = model
+                if result.is_intercept_only:
+                    n_io += 1
+        return StreamingFitResult(
+            models=models,
+            s_true=np.zeros(n, dtype=np.float64),
+            s_cv=np.zeros(n, dtype=np.float64),
+            n_trained=len(models),
+            n_intercept_only=n_io,
+            n_failed=len(failures),
+            failures=failures,
+            fallback_models=fallback_models,
+        )
 
     def _stream_chromosomes(self) -> List[str]:
         chset = set()
@@ -989,7 +1104,13 @@ class StreamingImputationFitter:
         store that collects per-outer-fold models via :func:`_run_cv_chunk`; observed-
         variant fallbacks are skipped entirely (the evaluator scores observed terms
         directly, so they are never trained during CV).
+
+        In *collect* mode (``self._collect`` set) each closing target's assembled Gram
+        block is retained (unsolved) for a later grid re-solve; no models are produced
+        here.
         """
+        if self._collect is not None:
+            return self._collect_batch(batch, buf)
         cv = cv_collector is not None
         jobs: List[_FitJob] = []
         for tgt in batch:
@@ -1027,6 +1148,48 @@ class StreamingImputationFitter:
             jobs, buf, self.folds, self.plan.alpha, self.plan.l1_ratio,
             self.plan.cv_folds, s_true, s_cv, self._batch_cap,
         )
+
+    def _collect_batch(self, batch, buf) -> int:
+        """Collect mode: assemble each closing target's ``LocalGramBlock`` (+ predictor
+        metadata) into ``self._collect`` WITHOUT solving.
+
+        Reuses the exact window query, banded cross-products, and block assembly of the
+        fit path (``chrom_index.window`` → :func:`_batch_cross_products` →
+        :func:`_assemble_block`), so a collected block is identical to the one the single
+        fit would solve. Targets *and* observed-variant fallbacks are collected (tagged
+        via ``is_fallback``); a windowing / gather failure drops that target (the grid
+        consumer tolerates it, mirroring the fit path's record-don't-crash). Returns 0
+        (no intercept-only count in collect mode).
+        """
+        jobs: List[_FitJob] = []
+        meta: List[tuple] = []
+        for tgt in batch:
+            spec = tgt.spec
+            try:
+                win = self.chrom_index.window(
+                    spec.chromosome, spec.position, window_size=self.W,
+                    exclude_target=True, max_variants=self.plan.max_predictors,
+                )
+            except Exception:  # noqa: BLE001 - drop this target (mirror the fit path)
+                continue
+            jobs.append(_FitJob(
+                col=tgt.col, pred_idx=win.variant_indices, calib_coef=float(spec.beta),
+                is_calibrating=not tgt.is_fallback, store=None, fail=None,
+            ))
+            meta.append((spec, tgt.af, tgt.is_fallback))
+        if not jobs:
+            return 0
+        cross = _batch_cross_products(jobs, buf, self.folds)
+        for j, (job, (spec, af, is_fb)) in enumerate(zip(jobs, meta)):
+            try:
+                block, _idx, pred_af = _assemble_block(job, j, buf, cross)
+            except Exception:  # noqa: BLE001 - record-don't-crash, mirror the fit path
+                continue
+            self._collect.append(_CollectedTarget(
+                spec=spec, af=af, block=block, pred_idx=job.pred_idx,
+                pred_af=pred_af, is_fallback=is_fb,
+            ))
+        return 0
 
     def run_reference_cv(self, source, outer_folds: "GlobalFolds", *, n_workers: int = 1):
         """Single-pass leave-one-fold-out reference CV over the panel.

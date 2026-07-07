@@ -739,3 +739,90 @@ class TestPlatformResolvedOnce:
         assert spy.call_count == 1, (
             f"platform resolved {spy.call_count}x; expected once (threaded to combos)"
         )
+
+
+class TestSensitivityStreamingReuse:
+    """Phase 9: streaming sensitivity_analysis accumulates the Gram blocks ONCE per
+    window_size (re-solving them per (l1_ratio, alpha)), and the grouped result matches
+    independent streaming fits. Uses backend='streaming' so the small fixture streams."""
+
+    GRID = {"window_size": [500_000, 1_000_000], "l1_ratio": [0.5], "alpha": [0.01, 0.1]}
+
+    def _streaming_evaluator(self, vcf, prs_df, platform):
+        # The evaluator requires a fitted model; sensitivity reads self.model for config
+        # (backend='streaming' → will_stream → the grouped accumulation path).
+        model = LinearImputationPRS(backend="streaming", n_workers=1, random_state=0)
+        model.fit(
+            reference_genotypes=vcf, prs_definition=prs_df, platform_variants=platform
+        )
+        return ImputationEvaluator(model, verbose=0)
+
+    def test_accumulation_runs_once_per_window_size(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        import imputed_prs.compute.sufficient_stats as ss
+
+        evaluator = self._streaming_evaluator(
+            synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+        )
+        real = ss.StreamingImputationFitter.run_collect
+        calls = {"n": 0}
+
+        def counting(self, *a, **k):
+            calls["n"] += 1
+            return real(self, *a, **k)
+
+        with mock.patch.object(ss.StreamingImputationFitter, "run_collect", counting):
+            evaluator.sensitivity_analysis(
+                reference_genotypes=synthetic_vcf_file,
+                prs_definition=synthetic_prs_df,
+                platform_variants=platform_variants_partial,
+                parameter_grid=self.GRID,
+                cv_folds=2,
+                random_state=0,
+            )
+        # 4 combos (2 window_sizes × 2 alpha) → one accumulation per window_size, not 4.
+        assert calls["n"] == 2, f"streaming accumulation ran {calls['n']}x; expected 2"
+
+    def test_streaming_sensitivity_matches_independent_fits(
+        self, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        from imputed_prs.io.genotype_loader import load_genotypes
+
+        evaluator = self._streaming_evaluator(
+            synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+        )
+        result = evaluator.sensitivity_analysis(
+            reference_genotypes=synthetic_vcf_file,
+            prs_definition=synthetic_prs_df,
+            platform_variants=platform_variants_partial,
+            parameter_grid=self.GRID,
+            cv_folds=2,
+            random_state=0,
+        )
+
+        # Oracle: fit each combo independently via streaming (normal run(), calibrated),
+        # evaluate. The grouped path re-solves shared blocks (uncalibrated), but evaluate
+        # scores raw models, so the R² must match to solver tolerance.
+        gd = load_genotypes(path=synthetic_vcf_file)
+        oracle = {}
+        for ws in self.GRID["window_size"]:
+            for a in self.GRID["alpha"]:
+                m = LinearImputationPRS(
+                    backend="streaming", window_size=ws, l1_ratio=0.5, alpha=a,
+                    cv_folds=2, n_workers=1, random_state=0,
+                )
+                m.fit(
+                    reference_genotypes=synthetic_vcf_file,
+                    prs_definition=synthetic_prs_df,
+                    platform_variants=platform_variants_partial,
+                )
+                oracle[(ws, a)] = ImputationEvaluator(m, verbose=0).evaluate(gd).r2
+
+        assert len(result.parameter_results) == 4
+        for pr in result.parameter_results:
+            assert pr.get("metrics") is not None, pr.get("error")
+            p = pr["params"]
+            np.testing.assert_allclose(
+                pr["metrics"].r2, oracle[(p["window_size"], p["alpha"])], atol=1e-9
+            )
