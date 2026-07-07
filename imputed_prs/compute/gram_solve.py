@@ -851,7 +851,65 @@ def _batched_fista(
     l1_ratio: float,
     mask: np.ndarray,
 ) -> np.ndarray:
-    """Batched masked FISTA for the L1 case — added in Phase 8 commit 2."""
-    raise NotImplementedError(
-        "batched FISTA (l1_ratio > 0) lands in Phase 8 commit 2; use l1_ratio=0 for now"
-    )
+    """Batched masked FISTA (accelerated proximal gradient) for the ElasticNet L1 case.
+
+    Numpy float64 port of ``GpuBackend._batched_fista`` (gpu_backend.py:666). Minimizes, per
+    batch element, the standardized ElasticNet objective (same convention as the sklearn Gram
+    CD that :func:`enet_gram_fit` calls)::
+
+        ½·wᵀG_std·w − q_stdᵀw + l1·‖w‖₁ + ½·l2·‖w‖²,
+        l1 = α·l1_ratio·n,   l2 = α·(1−l1_ratio)·n
+
+    The smooth part has gradient ``H·w − q_std`` with ``H = G_std + l2·I``; the L1 prox is a
+    soft-threshold at ``l1·step``. FISTA (not coordinate descent) is used because it is pure
+    matmul/elementwise and so vectorizes across the target batch — coordinate descent's
+    sequential coordinate sweep does not. This is a *different optimizer* than the per-target
+    sklearn CD, so it matches within statistical parity (~1e-3 coef / ~5e-3 CV metrics), which
+    is exactly what the GPU FISTA already satisfies against the same oracle.
+
+    ``mask`` (B, P) zeroes padded coordinates every step so they stay 0 and decouple from the
+    real block. Convergence is checked every iteration (numpy has no device→host sync to
+    amortize, unlike the GPU's ``check_every``), so it early-stops as tightly as possible.
+    """
+    B, P = q_std.shape
+    l1_reg = alpha * l1_ratio * n            # (B,)
+    l2_reg = alpha * (1.0 - l1_ratio) * n    # (B,)
+    H = G_std.copy()
+    diag = np.arange(P)
+    H[:, diag, diag] += l2_reg[:, None]
+    lip = _power_lipschitz(H, mask) * _LIPSCHITZ_MARGIN  # (B,)
+    step = 1.0 / np.maximum(lip, 1e-12)                   # (B,)
+    thr = (l1_reg * step)[:, None]                        # (B, 1) soft-threshold level
+    w = np.zeros((B, P), dtype=np.float64)
+    w_prev = w.copy()
+    tk = 1.0
+    for _ in range(_FISTA_MAX_ITER):
+        tk_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * tk * tk))
+        mom = (tk - 1.0) / tk_new
+        v = (w + mom * (w - w_prev)) * mask
+        grad = np.einsum("bij,bj->bi", H, v) - q_std
+        zt = v - step[:, None] * grad
+        w_new = np.sign(zt) * np.maximum(np.abs(zt) - thr, 0.0)
+        w_new = w_new * mask
+        converged = np.max(np.abs(w_new - w)) < _FISTA_TOL
+        w_prev, w, tk = w, w_new, tk_new
+        if converged:
+            break
+    return w
+
+
+def _power_lipschitz(H: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Per-batch largest-eigenvalue (Lipschitz) estimate of ``H`` via power iteration.
+
+    Numpy port of ``GpuBackend._power_lipschitz`` (gpu_backend.py:698). ``mask`` restricts the
+    iterate to real coordinates so the padded rows (identity) never dominate the estimate.
+    Returns a (B,) Rayleigh-quotient value — an *under*-estimate of ``λ_max`` in general, which
+    is why callers scale it up by :data:`_LIPSCHITZ_MARGIN` before taking ``step = 1/Lip``.
+    """
+    v = mask.copy()
+    v = v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-12)
+    for _ in range(_POWER_ITERS):
+        hv = np.einsum("bij,bj->bi", H, v) * mask
+        v = hv / (np.linalg.norm(hv, axis=1, keepdims=True) + 1e-12)
+    hv = np.einsum("bij,bj->bi", H, v) * mask
+    return (v * hv).sum(axis=1)

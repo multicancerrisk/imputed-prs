@@ -80,6 +80,25 @@ def test_solve_blocks_matches_cpu(alpha, l1_ratio, device):
         assert abs(a.cv_mse - b.cv_mse) < 5e-3
 
 
+@pytest.mark.parametrize("alpha,l1_ratio", [(0.1, 0.0), (0.01, 0.5), (0.1, 0.9)])
+def test_gpu_and_numpy_batched_solve_agree(alpha, l1_ratio):
+    """The numpy batched solve (Phase 8, gram_solve.solve_blocks_batched) and the torch
+    GpuBackend._solve_blocks are ports of one algorithm and must stay in lockstep — agree
+    within float32/optimizer tolerance on the same blocks (ridge exact; FISTA statistical).
+    """
+    from imputed_prs.compute.gram_solve import solve_blocks_batched  # noqa: PLC0415
+
+    cv = 5
+    blocks = _blocks(cv=cv)
+    npy = solve_blocks_batched(blocks, alpha, l1_ratio, cv)
+    gpu = GpuBackend(_gpu_device())._solve_blocks(blocks, alpha, l1_ratio, cv)
+    for a, b in zip(npy, gpu):
+        assert a.is_intercept_only == b.is_intercept_only
+        np.testing.assert_allclose(b.coefficients, a.coefficients, atol=2e-3, rtol=2e-3)
+        assert abs(a.intercept - b.intercept) < 2e-3
+        assert abs(a.cv_r2 - b.cv_r2) < 5e-3
+
+
 # --------------------------------------------------------------- end-to-end parity
 @pytest.fixture(scope="module")
 def panel(tmp_path_factory):

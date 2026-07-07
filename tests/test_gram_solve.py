@@ -303,8 +303,67 @@ def test_solve_blocks_batched_partitions_fallbacks_and_none():
         _assert_result_close(g, exp, atol=atol)
 
 
-def test_solve_blocks_batched_l1_not_yet_wired():
-    """L1 (l1_ratio>0) raises until batched FISTA lands in commit 2 (ridge-only scope)."""
-    block = build_block(*make_dosage_data(200, 8, seed=7), 5, seed=42)
-    with pytest.raises(NotImplementedError):
-        solve_blocks_batched([block], alpha=0.05, l1_ratio=0.5, cv_folds=5)
+def _blocks_batched_fixture(cv=5):
+    """Well-determined heterogeneous predictor counts — the GPU parity fixture's set.
+
+    The batched pad/mask handling of an underdetermined p>n block is covered exactly by the
+    ridge test above and (for FISTA) by ``test_solve_blocks_batched_underdetermined`` below.
+    """
+    specs = [(500, 8), (500, 20), (500, 3), (500, 1), (500, 12), (500, 40)]
+    return [build_block(*make_dosage_data(n, p, seed=100 + p), cv, seed=7) for n, p in specs]
+
+
+@pytest.mark.parametrize(
+    "alpha,l1_ratio",
+    [
+        (0.01, 0.0), (0.1, 0.0),  # ridge fast-path (exact)
+        (0.01, 0.5), (0.1, 0.9), (0.01, 0.1),  # elastic net (batched FISTA)
+    ],
+)
+def test_solve_blocks_batched_matches_per_target(alpha, l1_ratio):
+    """Batched solve == per-target ``fit_from_local_gram`` within statistical parity.
+
+    Torch-free CPU analogue of ``test_compute_backend.py::test_solve_blocks_matches_cpu``,
+    at the same tolerances: ridge is exact; the batched-FISTA L1 path matches sklearn
+    coordinate descent to ~1e-3 on coefficients / ~5e-3 on CV metrics — the sanctioned band
+    the GPU FISTA already satisfies against the same oracle.
+    """
+    cv = 5
+    blocks = _blocks_batched_fixture(cv=cv)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # sklearn warns on ElasticNet(l1_ratio=0)
+        exp = [
+            fit_from_local_gram(b, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv)
+            for b in blocks
+        ]
+    got = solve_blocks_batched(blocks, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv)
+    for a, g in zip(exp, got):
+        assert a.is_intercept_only == g.is_intercept_only
+        np.testing.assert_allclose(g.coefficients, a.coefficients, atol=1e-3, rtol=1e-3)
+        assert abs(a.intercept - g.intercept) < 1e-3
+        assert abs(a.cv_r2 - g.cv_r2) < 5e-3
+        assert abs(a.cv_mse - g.cv_mse) < 5e-3
+
+
+def test_solve_blocks_batched_underdetermined():
+    """Batched FISTA handles a p>n (underdetermined) block, batched with well-determined ones.
+
+    Strong L1 (sparse solution → small active set) keeps batched FISTA and sklearn CD in
+    agreement even when p>n; the tolerance is the statistical band (the underdetermined
+    flat directions and the L1 kink make weak-L1 p>n fits genuinely solver-dependent — the
+    exact pad/mask correctness for p>n is asserted by the ridge test, which is closed-form).
+    """
+    cv, alpha, l1_ratio = 5, 0.05, 0.9
+    blocks = [
+        build_block(*make_dosage_data(500, 12, seed=1), cv, seed=7),  # well-determined
+        build_block(*make_dosage_data(60, 70, seed=2), cv, seed=7),   # p > n
+    ]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        exp = [fit_from_local_gram(b, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv) for b in blocks]
+    got = solve_blocks_batched(blocks, alpha=alpha, l1_ratio=l1_ratio, cv_folds=cv)
+    for a, g in zip(exp, got):
+        assert a.is_intercept_only == g.is_intercept_only
+        assert g.n_predictors == a.n_predictors
+        np.testing.assert_allclose(g.coefficients, a.coefficients, atol=5e-3, rtol=5e-3)
+        assert abs(a.intercept - g.intercept) < 5e-3
