@@ -619,3 +619,32 @@ def get_platform_info(platform_name: str) -> PlatformInfo:
         return _platform_cache[normalized_name][1]
 
     return _load_platform_metadata(normalized_name)
+
+
+def resolve_platform_variant_set(
+    platform_name: Optional[str] = None,
+    platform_manifest: Optional[str] = None,
+    platform_variants: Optional[List[str]] = None,
+) -> Tuple[Set[str], Optional[PlatformInfo], str]:
+    """Resolve ``(variant_set, platform_info, effective_name)`` from one platform source.
+
+    Centralizes the three-way ``platform_name`` / ``platform_manifest`` /
+    ``platform_variants`` branch that ``fit``, ``cross_validate``,
+    ``sensitivity_analysis`` and the reference-CV path each repeated. Callers resolve
+    the reference **once** and thread the returned ``variant_set`` through every fold /
+    combo / fit (via the internal ``_platform_variant_set`` hook) so the platform file
+    is read once, not once per fold or per combo.
+
+    Exactly one source is expected (callers validate). ``effective_name`` is the
+    metadata label the callers derive today (``platform_name`` / the manifest stem /
+    the sentinel ``"custom"``); ``platform_info`` is populated only for the by-name
+    source (``None`` for manifest / list), matching the current ``fit`` behaviour.
+    """
+    if platform_name is not None:
+        variant_set, info = load_platform_from_name(platform_name)
+        return variant_set, info, platform_name
+    if platform_manifest is not None:
+        variant_set, _ = load_platform_from_manifest(str(platform_manifest))
+        return variant_set, None, Path(platform_manifest).stem
+    variant_set = load_platform_variants_from_list(platform_variants)
+    return variant_set, None, "custom"

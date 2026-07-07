@@ -19,6 +19,7 @@ from imputed_prs.core.types import (
 from imputed_prs.evaluation.metrics import compute_prs_metrics, compute_percentile_concordance
 from imputed_prs.evaluation.quality import summarize_imputation_quality
 from imputed_prs.io.genotype_loader import load_genotypes
+from imputed_prs.io.platform_loader import resolve_platform_variant_set
 from imputed_prs.core.harmonizer import ReferenceAlleleResolver
 from imputed_prs.evaluation._scoring import (
     NeededVariant,
@@ -97,7 +98,8 @@ def _run_sensitivity_combo(payload):
     from imputed_prs.core.linear_imputation_prs import LinearImputationPRS
 
     (params, base, prs_definition, platform_name, platform_manifest,
-     platform_variants, cv_folds, random_state, inner_n_jobs, genotype_data) = payload
+     platform_variants, cv_folds, random_state, inner_n_jobs, genotype_data,
+     platform_variant_set, platform_info) = payload
     try:
         test_model = LinearImputationPRS(
             window_size=params.get("window_size", base["window_size"]),
@@ -116,6 +118,8 @@ def _run_sensitivity_combo(payload):
             platform_name=platform_name,
             platform_manifest=platform_manifest,
             platform_variants=platform_variants,
+            _platform_variant_set=platform_variant_set,
+            _platform_info=platform_info,
         )
         if test_model._imputed_models:
             models_dict = {m.variant_id: m for m in test_model._imputed_models}
@@ -287,6 +291,13 @@ class ImputationEvaluator:
         # Load full reference genotypes
         genotype_data = load_genotypes(path=reference_genotypes)
 
+        # Phase 9: resolve the platform set ONCE here and thread it through the
+        # reference-CV pass and every dense fold refit, so the platform file is read
+        # once per cross_validate — not once per fold.
+        platform_variant_set, platform_info, _ = resolve_platform_variant_set(
+            platform_name, platform_manifest, platform_variants
+        )
+
         if self.verbose >= 1:
             print(f"Loaded {genotype_data.n_samples} samples for cross-validation")
 
@@ -332,6 +343,7 @@ class ImputationEvaluator:
             platform_manifest=platform_manifest,
             platform_variants=platform_variants,
             fold_indices=fold_indices,
+            _platform_variant_set=platform_variant_set,
         )
 
         # Run cross-validation
@@ -387,6 +399,8 @@ class ImputationEvaluator:
                     platform_name=platform_name,
                     platform_manifest=platform_manifest,
                     platform_variants=platform_variants,
+                    _platform_variant_set=platform_variant_set,
+                    _platform_info=platform_info,
                 )
 
             # Create evaluator for fold model and evaluate on test data
@@ -497,6 +511,13 @@ class ImputationEvaluator:
         # (each combo's inner fit stays single-process to avoid oversubscription).
         genotype_data = load_genotypes(path=reference_genotypes)
 
+        # Phase 9: resolve the platform set ONCE and thread it into every combo's fit
+        # (via the payload) so the platform file is read once, not once per combo. The
+        # chip set is independent of the grid's window_size/l1_ratio/alpha.
+        platform_variant_set, platform_info, _ = resolve_platform_variant_set(
+            platform_name, platform_manifest, platform_variants
+        )
+
         from imputed_prs.compute.parallel import parallel_map, resolve_n_workers
 
         resolved = resolve_n_workers(self.model.n_workers)
@@ -509,7 +530,7 @@ class ImputationEvaluator:
         payloads = [
             (dict(zip(param_names, combo)), base_config, prs_definition, platform_name,
              platform_manifest, platform_variants, cv_folds, random_state, inner_n_jobs,
-             genotype_data)
+             genotype_data, platform_variant_set, platform_info)
             for combo in param_combinations
         ]
         if self.verbose >= 1:

@@ -21,6 +21,7 @@ from imputed_prs.evaluation._scoring import (
 )
 from imputed_prs.evaluation.metrics import compute_prs_metrics
 from imputed_prs.io.genotype_loader import load_genotypes
+from imputed_prs.io.platform_loader import resolve_platform_variant_set
 from imputed_prs.models.projection_predictor import ProjectionPredictor
 from imputed_prs.models.vectorized_predictor import (
     accumulate_true_prs,
@@ -364,6 +365,12 @@ class ProjectionEvaluator:
 
         genotype_data = load_genotypes(path=reference_genotypes)
 
+        # Phase 9: resolve the platform set ONCE and thread it through the reference-CV
+        # pass and every dense fold refit (read the platform file once, not per fold).
+        platform_variant_set, platform_info, _ = resolve_platform_variant_set(
+            platform_name, platform_manifest, platform_variants
+        )
+
         if self.verbose >= 1:
             print(f"Loaded {genotype_data.n_samples} samples for cross-validation")
 
@@ -400,6 +407,7 @@ class ProjectionEvaluator:
             platform_manifest=platform_manifest,
             platform_variants=platform_variants,
             fold_indices=fold_indices,
+            _platform_variant_set=platform_variant_set,
         )
 
         fold_metrics: List[EvaluationMetrics] = []
@@ -447,6 +455,8 @@ class ProjectionEvaluator:
                     platform_name=platform_name,
                     platform_manifest=platform_manifest,
                     platform_variants=platform_variants,
+                    _platform_variant_set=platform_variant_set,
+                    _platform_info=platform_info,
                 )
 
             fold_evaluator = ProjectionEvaluator(fold_model, verbose=0)

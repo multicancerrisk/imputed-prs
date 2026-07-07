@@ -44,11 +44,7 @@ from imputed_prs.io.genotype_source import (
     make_genotype_source,
 )
 from imputed_prs.io.pgs_catalog import download_pgs_catalog_score
-from imputed_prs.io.platform_loader import (
-    load_platform_from_manifest,
-    load_platform_from_name,
-    load_platform_variants_from_list,
-)
+from imputed_prs.io.platform_loader import resolve_platform_variant_set
 from imputed_prs.io.prs_loader import load_prs_from_dataframe, load_prs_from_file
 from imputed_prs.io.user_genotypes import (
     load_raw_user_genotypes,
@@ -207,6 +203,8 @@ class LinearProjectionPRS:
         reference_panel_id: Optional[str] = None,
         training_ancestry: Optional[str] = None,
         allow_alt_as_effect: bool = False,
+        _platform_variant_set: Optional[Set[str]] = None,
+        _platform_info: Optional[Any] = None,
     ) -> "LinearProjectionPRS":
         """Train projection models on reference genotype data.
 
@@ -275,19 +273,26 @@ class LinearProjectionPRS:
         if self.verbose >= 2:
             print(f"Loaded PRS definition with {len(prs_df)} variants")
 
-        # Step 3: Load platform variants
-        platform_info = None
+        # Step 3: Resolve platform variants. A caller (cross_validate / a fold fit)
+        # may pass a pre-resolved ``_platform_variant_set`` so the reference is read
+        # once and threaded through — skip the load, but still derive the metadata
+        # label/build from the original source args.
         if platform_name is not None:
-            platform_variant_set, platform_info = load_platform_from_name(platform_name)
             effective_platform_name = platform_name
-            if effective_genome_build is None and platform_info:
-                effective_genome_build = platform_info.genome_build
         elif platform_manifest is not None:
-            platform_variant_set, _ = load_platform_from_manifest(str(platform_manifest))
             effective_platform_name = Path(platform_manifest).stem
         else:
-            platform_variant_set = load_platform_variants_from_list(platform_variants)
             effective_platform_name = "custom"
+
+        if _platform_variant_set is not None:
+            platform_variant_set = _platform_variant_set
+            platform_info = _platform_info
+        else:
+            platform_variant_set, platform_info, _ = resolve_platform_variant_set(
+                platform_name, platform_manifest, platform_variants
+            )
+        if effective_genome_build is None and platform_info:
+            effective_genome_build = platform_info.genome_build
 
         if self.verbose >= 2:
             print(f"Loaded {len(platform_variant_set)} platform variants")
@@ -966,6 +971,7 @@ class LinearProjectionPRS:
         platform_variants,
         genome_build,
         allow_alt_as_effect,
+        _platform_variant_set=None,
     ):
         """Resolve ``(prs_df, platform_variant_set, all_needed_variants)`` for the
         reference-CV fast-path (mirrors ``fit`` Steps 2-3/5). See the imputation twin."""
@@ -982,12 +988,12 @@ class LinearProjectionPRS:
                 Path(prs_definition), allow_alt_as_effect=allow_alt_as_effect
             )
 
-        if platform_name is not None:
-            platform_variant_set, _ = load_platform_from_name(platform_name)
-        elif platform_manifest is not None:
-            platform_variant_set, _ = load_platform_from_manifest(str(platform_manifest))
+        if _platform_variant_set is not None:
+            platform_variant_set = _platform_variant_set
         else:
-            platform_variant_set = load_platform_variants_from_list(platform_variants)
+            platform_variant_set, _, _ = resolve_platform_variant_set(
+                platform_name, platform_manifest, platform_variants
+            )
 
         prs_chrpos = set()
         _chroms, _pos = hoist_columns(prs_df, "chromosome", "position")
@@ -1012,6 +1018,7 @@ class LinearProjectionPRS:
         fold_indices,
         genome_build=None,
         allow_alt_as_effect: bool = False,
+        _platform_variant_set=None,
     ):
         """One streaming pass → per-outer-fold projection region models by subtraction.
 
@@ -1030,6 +1037,7 @@ class LinearProjectionPRS:
             platform_variants,
             genome_build,
             allow_alt_as_effect,
+            _platform_variant_set=_platform_variant_set,
         )
         source = InMemoryGenotypeSource(genotype_data, variant_ids=all_needed)
         use_stream = self.backend == "streaming" or (

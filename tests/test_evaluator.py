@@ -2,6 +2,7 @@
 
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -675,3 +676,66 @@ class TestImputationEvaluatorImports:
         assert ImputationEvaluator is not None
         assert CrossValidationResult is not None
         assert SensitivityResult is not None
+
+
+# =============================================================================
+# Phase 9: the platform set is resolved once and threaded (not re-read per fold/combo)
+# =============================================================================
+
+
+class TestPlatformResolvedOnce:
+    """cross_validate / sensitivity_analysis resolve the platform variant set once and
+    thread it into every fold / combo fit — the reference is read once, not once per
+    fold or per combo. The spy patches the low-level list loader that
+    ``resolve_platform_variant_set`` calls via its module global, so a re-resolve
+    anywhere (in-process) is counted. ``n_workers=1`` keeps every fit in-process so a
+    regression that re-resolved in a fold/combo would be caught."""
+
+    def test_cross_validate_resolves_platform_once(
+        self, fitted_model, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        import imputed_prs.io.platform_loader as pl
+
+        fitted_model.n_workers = 1
+        evaluator = ImputationEvaluator(fitted_model, verbose=0)
+        with mock.patch.object(
+            pl,
+            "load_platform_variants_from_list",
+            wraps=pl.load_platform_variants_from_list,
+        ) as spy:
+            evaluator.cross_validate(
+                reference_genotypes=synthetic_vcf_file,
+                prs_definition=synthetic_prs_df,
+                platform_variants=platform_variants_partial,
+                n_folds=3,
+                random_state=0,
+            )
+        assert spy.call_count == 1, (
+            f"platform resolved {spy.call_count}x; expected once (threaded to folds)"
+        )
+
+    def test_sensitivity_analysis_resolves_platform_once(
+        self, fitted_model, synthetic_vcf_file, synthetic_prs_df, platform_variants_partial
+    ):
+        import imputed_prs.io.platform_loader as pl
+
+        fitted_model.n_workers = 1
+        evaluator = ImputationEvaluator(fitted_model, verbose=0)
+        # A 2-combo grid: without threading this loads the platform once per combo.
+        grid = {"window_size": [1_000_000], "l1_ratio": [0.1, 0.5], "alpha": [0.01]}
+        with mock.patch.object(
+            pl,
+            "load_platform_variants_from_list",
+            wraps=pl.load_platform_variants_from_list,
+        ) as spy:
+            evaluator.sensitivity_analysis(
+                reference_genotypes=synthetic_vcf_file,
+                prs_definition=synthetic_prs_df,
+                platform_variants=platform_variants_partial,
+                parameter_grid=grid,
+                cv_folds=2,
+                random_state=0,
+            )
+        assert spy.call_count == 1, (
+            f"platform resolved {spy.call_count}x; expected once (threaded to combos)"
+        )
