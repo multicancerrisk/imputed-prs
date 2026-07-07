@@ -1,0 +1,43 @@
+{
+  "config": {
+    "n_samples": 2000,
+    "n_chrom": 8,
+    "n_variants": 6320,
+    "n_imputed_models": 720,
+    "worker_counts": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "reps": 2,
+    "seed": 7
+  },
+  "wall_seconds": {
+    "1": 18.98776758299209,
+    "2": 10.641864958917722,
+    "4": 6.702369540929794,
+    "8": 3.881855582818389
+  },
+  "speedup": {
+    "1": 1.0,
+    "2": 1.784251882192945,
+    "4": 2.8329932372481497,
+    "8": 4.891415246624446
+  },
+  "efficiency": {
+    "1": 1.0,
+    "2": 0.8921259410964725,
+    "4": 0.7082483093120374,
+    "8": 0.6114269058280557
+  },
+  "amdahl_serial_fraction": 0.11633923999301392,
+  "extrapolation": {
+    "performance_cores": 6,
+    "workers_real": 6,
+    "amdahl_ceiling": 3.7933959758722975,
+    "chrom_imbalance_factor": 1.090909090909091,
+    "projected_speedup_22_autosomes": 3.4772796445496055,
+    "note": "Process fan-out is a CPU accelerator orthogonal to the GPU path. Real speedup is bounded by min(P-cores, n_chromosomes) and chromosome size imbalance; sub-chromosome sharding (out of scope, breaks bit-identity) would lift the ceiling."
+  }
+}
