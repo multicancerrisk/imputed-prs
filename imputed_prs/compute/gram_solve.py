@@ -748,16 +748,20 @@ def _solve_padded_core(
         ysum_v[i] = b.ysum; ysqsum_v[i] = b.ysqsum; n_v[i] = float(b.n)
 
     # Final model on the full valid subset.
-    coef_raw, intercept_raw, is_io = _batched_standardize_solve(
+    w_final, coef_raw, intercept_raw, is_io = _batched_standardize_solve(
         Gp, cp, zsp, zsqp, ysum_v, ysqsum_v, n_v, mask, alpha, l1_ratio
     )
     # K fold models (train-fold = full − held-out-k). Penalty scales with n_tr (invariant R1).
+    # Warm-start each fold's FISTA from the full-data solution: a fold model is a ~1/K
+    # perturbation of the final model in the (near-identical) standardized coordinates, so
+    # this converges in far fewer iterations without changing the optimum (convex).
     fcoef = zeros(B, K, P); fint = zeros(B, K)
     for k in range(K):
         n_tr = n_v - fn_m[:, k]
-        ck, ik, _ = _batched_standardize_solve(
+        _wk, ck, ik, _ = _batched_standardize_solve(
             Gp - fGp[:, k], cp - fcp[:, k], zsp - fzsp[:, k], zsqp - fzsqp[:, k],
             ysum_v - fysum_m[:, k], ysqsum_v - fysqsum_m[:, k], n_tr, mask, alpha, l1_ratio,
+            w_init=w_final,
         )
         fcoef[:, k] = ck; fint[:, k] = ik
 
@@ -808,6 +812,7 @@ def _batched_standardize_solve(
     mask: np.ndarray,
     alpha: float,
     l1_ratio: float,
+    w_init: Optional[np.ndarray] = None,
 ):
     """Batched :func:`standardize_from_moments` + :func:`enet_gram_fit` + back-transform.
 
@@ -815,8 +820,10 @@ def _batched_standardize_solve(
     inputs carry a leading batch axis ``B``; ``mask`` (B, P) marks real predictor slots.
     Padded coordinates are forced to zero: their Gram cross-terms are masked out and an
     identity is placed on the padded diagonal, so they solve to ``w_std=0`` and decouple
-    from the real block (making padding exactly parity-preserving). Returns
-    ``(coef_raw (B,P), intercept_raw (B,), is_intercept_only (B,))``.
+    from the real block (making padding exactly parity-preserving). ``w_init`` warm-starts
+    the FISTA iterate (standardized scale). Returns the standardized coefficients too, so a
+    caller can reuse them as a warm start: ``(w_std (B,P), coef_raw (B,P),
+    intercept_raw (B,), is_intercept_only (B,))``.
     """
     B, P, _ = G.shape
     ninv = 1.0 / n
@@ -839,13 +846,13 @@ def _batched_standardize_solve(
     if l1_ratio == 0.0:
         w_std = _batched_ridge(G_std, q_std, n, alpha)
     else:
-        w_std = _batched_fista(G_std, q_std, n, alpha, l1_ratio, mask)
+        w_std, _n_iters = _batched_fista(G_std, q_std, n, alpha, l1_ratio, mask, w_init=w_init)
     w_std = w_std * mask
 
     coef_raw = (w_std * inv_scale) * mask
     intercept_raw = ybar - (w_std * (mean * inv_scale)).sum(axis=1)
     is_io = np.abs(w_std).max(axis=1) <= _INTERCEPT_ONLY_ATOL
-    return coef_raw, intercept_raw, is_io
+    return w_std, coef_raw, intercept_raw, is_io
 
 
 def _batched_ridge(
@@ -872,7 +879,8 @@ def _batched_fista(
     alpha: float,
     l1_ratio: float,
     mask: np.ndarray,
-) -> np.ndarray:
+    w_init: Optional[np.ndarray] = None,
+):
     """Batched masked FISTA (accelerated proximal gradient) for the ElasticNet L1 case.
 
     Numpy float64 port of ``GpuBackend._batched_fista`` (gpu_backend.py:666). Minimizes, per
@@ -892,6 +900,11 @@ def _batched_fista(
     ``mask`` (B, P) zeroes padded coordinates every step so they stay 0 and decouple from the
     real block. Convergence is checked every iteration (numpy has no device→host sync to
     amortize, unlike the GPU's ``check_every``), so it early-stops as tightly as possible.
+
+    ``w_init`` (B, P), if given, warm-starts the iterate (masked): the K leave-one-fold-out
+    fold models are ~1/K perturbations of the full-data solution, so seeding each from the
+    final model's coefficients cuts iterations sharply. FISTA is convex, so the converged
+    optimum is unchanged; only the iteration count differs. Returns ``(w, n_iters)``.
     """
     B, P = q_std.shape
     l1_reg = alpha * l1_ratio * n            # (B,)
@@ -902,10 +915,12 @@ def _batched_fista(
     lip = _power_lipschitz(H, mask) * _LIPSCHITZ_MARGIN  # (B,)
     step = 1.0 / np.maximum(lip, 1e-12)                   # (B,)
     thr = (l1_reg * step)[:, None]                        # (B, 1) soft-threshold level
-    w = np.zeros((B, P), dtype=np.float64)
+    w = np.zeros((B, P), dtype=np.float64) if w_init is None else (w_init * mask)
     w_prev = w.copy()
     tk = 1.0
+    n_iters = 0
     for _ in range(_FISTA_MAX_ITER):
+        n_iters += 1
         tk_new = 0.5 * (1.0 + np.sqrt(1.0 + 4.0 * tk * tk))
         mom = (tk - 1.0) / tk_new
         v = (w + mom * (w - w_prev)) * mask
@@ -917,7 +932,7 @@ def _batched_fista(
         w_prev, w, tk = w, w_new, tk_new
         if converged:
             break
-    return w
+    return w, n_iters
 
 
 def _power_lipschitz(H: np.ndarray, mask: np.ndarray) -> np.ndarray:

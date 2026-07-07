@@ -16,6 +16,7 @@ from sklearn.model_selection import KFold
 from imputed_prs.compute.gram_solve import (
     _BATCH_MAX_P_ENET,
     LocalGramBlock,
+    _batched_fista,
     _select_solver,
     fit_from_local_gram,
     ridge_gram_fit,
@@ -344,6 +345,30 @@ def test_solve_blocks_batched_matches_per_target(alpha, l1_ratio):
         assert abs(a.intercept - g.intercept) < 1e-3
         assert abs(a.cv_r2 - g.cv_r2) < 5e-3
         assert abs(a.cv_mse - g.cv_mse) < 5e-3
+
+
+def test_batched_fista_warm_start_same_optimum_fewer_iters():
+    """Warm-starting FISTA near the optimum yields the same solution in fewer iterations.
+
+    This is the mechanism ``_solve_padded_core`` uses to seed each fold model from the
+    full-data solution (a ~1/K perturbation). FISTA is convex, so warm==cold; only the
+    iteration count drops.
+    """
+    rng = np.random.RandomState(0)
+    B, P = 8, 25
+    M = rng.randn(B, P, P)
+    G_std = np.einsum("bij,bkj->bik", M, M) / P  # SPD standardized Gram blocks
+    q_std = rng.randn(B, P)
+    n = np.full(B, 500.0)
+    mask = np.ones((B, P))
+    alpha, l1 = 0.01, 0.5
+
+    w_cold, i_cold = _batched_fista(G_std, q_std, n, alpha, l1, mask)
+    w_seed = w_cold + rng.randn(B, P) * 1e-3  # a near-optimal seed (like fold-from-final)
+    w_warm, i_warm = _batched_fista(G_std, q_std, n, alpha, l1, mask, w_init=w_seed)
+
+    np.testing.assert_allclose(w_warm, w_cold, atol=1e-5)  # same optimum (convex)
+    assert i_warm < i_cold  # warm start converges in fewer iterations
 
 
 def test_solve_blocks_batched_p_gate_falls_back_large_p():
