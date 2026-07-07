@@ -7,13 +7,13 @@ import pandas as pd
 from joblib import Parallel, delayed
 
 from imputed_prs.core.exceptions import ValidationError
-from imputed_prs.core.harmonizer import filter_to_local_window
 from imputed_prs.core.types import (
     ImputedVariantModel,
     SingleVariantModelResult,
     TrainingFailure,
     TrainingResult,
 )
+from imputed_prs.core.window_index import ChromosomeIndex
 from imputed_prs.models.elastic_net import fit_single_variant_model
 from imputed_prs.models.tuning import tune_single_variant_model
 
@@ -166,6 +166,7 @@ def _fit_one_variant(
     Z: np.ndarray,
     X: np.ndarray,
     platform_variant_info: pd.DataFrame,
+    chrom_index: ChromosomeIndex,
     window_size: int,
     l1_ratio: float,
     alpha: float,
@@ -186,6 +187,10 @@ def _fit_one_variant(
         Z: Platform genotype dosages (n_samples, n_platform_variants).
         X: Missing variant dosages (n_samples, n_missing_variants).
         platform_variant_info: Platform variant info DataFrame.
+        chrom_index: Prebuilt ``ChromosomeIndex`` over ``platform_variant_info``
+            (O(log n) window queries; replaces the per-call ``filter_to_local_window``
+            scan). Must be built from the same frame passed as
+            ``platform_variant_info`` so positional indices align.
         window_size: Window size in base pairs.
         l1_ratio: ElasticNet L1 ratio (used when tuning_scope != "per_variant").
         alpha: ElasticNet regularization strength (used when not "per_variant").
@@ -217,11 +222,11 @@ def _fit_one_variant(
         n_valid_samples = int(valid.sum())
         target_variance = float(np.var(target_dosages[valid])) if valid.any() else 0.0
 
-        # Filter to local window
-        window_result = filter_to_local_window(
+        # Filter to local window (Phase 9: O(log n) prebuilt index; identical result
+        # to filter_to_local_window — same WindowFilterResult, positional indices).
+        window_result = chrom_index.window(
             target_chrom=str(variant_row["chromosome"]),
             target_pos=int(variant_row["position"]),
-            variant_info=platform_variant_info,
             window_size=window_size,
             exclude_target=True,
             max_variants=max_predictors,
@@ -440,6 +445,12 @@ class ImputationModelTrainer:
 
         n_variants = len(prs_variants)
 
+        # Phase 9: build the window index once over the (call-invariant) platform
+        # frame; every _fit_one_variant does O(log n) lookups instead of an O(n)
+        # per-call chromosome re-normalization + scan. Shared read-only across the
+        # prefer="threads" pool.
+        chrom_index = ChromosomeIndex(platform_variant_info)
+
         # Prepare arguments for parallel processing
         fit_args = [
             (
@@ -448,6 +459,7 @@ class ImputationModelTrainer:
                 Z,
                 X,
                 platform_variant_info,
+                chrom_index,
                 self.window_size,
                 self.l1_ratio,
                 self.alpha,

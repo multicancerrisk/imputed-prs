@@ -15,8 +15,9 @@ from typing import Any, Callable, Dict, Hashable, List, Optional, Sequence, Tupl
 import numpy as np
 
 from imputed_prs.core.exceptions import ValidationError
-from imputed_prs.core.harmonizer import _normalize_chromosome, filter_to_local_window
+from imputed_prs.core.harmonizer import _normalize_chromosome
 from imputed_prs.core.types import GridSearchResult, OptunaSearchResult
+from imputed_prs.core.window_index import ChromosomeIndex
 from imputed_prs.models.elastic_net import fit_single_variant_model
 
 # Default hyperparameter grids
@@ -382,7 +383,7 @@ def _build_local_window_datasets(
     """Build ``(predictor, target)`` datasets for the sampled missing variants.
 
     Mirrors ``ImputationModelTrainer._fit_one_variant`` exactly: each predictor
-    matrix is ``Z[:, filter_to_local_window(...).variant_indices]`` (with
+    matrix is ``Z[:, chrom_index.window(...).variant_indices]`` (with
     ``exclude_target=True`` and ``max_variants=max_predictors``), and each target
     is ``X_missing[:, col]``. ``missing_variant_info`` must be row-aligned with the
     columns of ``X_missing``.
@@ -390,12 +391,14 @@ def _build_local_window_datasets(
     datasets: List[Tuple[np.ndarray, np.ndarray]] = []
     kept: List[int] = []
     n_samples = Z.shape[0]
+    # Phase 9: build the window index once over the platform frame (O(log n)
+    # lookups) — returns the identical WindowFilterResult to filter_to_local_window.
+    chrom_index = ChromosomeIndex(platform_variant_info)
     for col in sample_indices:
         row = missing_variant_info.iloc[col]
-        window_result = filter_to_local_window(
+        window_result = chrom_index.window(
             target_chrom=str(row["chromosome"]),
             target_pos=int(row["position"]),
-            variant_info=platform_variant_info,
             window_size=window_size,
             exclude_target=True,
             max_variants=max_predictors,
@@ -491,8 +494,9 @@ def global_hyperparameter_search(
 
     A stratified sample (by chromosome / MAF / |beta|) of at most
     ``max_tuning_variants`` missing variants is selected; for each, the predictor
-    matrix is built with the identical ``filter_to_local_window`` call the trainer
-    makes, and the grid is scored with ``fit_single_variant_model``.
+    matrix is built with the identical local-window query the trainer makes
+    (``ChromosomeIndex.window``), and the grid is scored with
+    ``fit_single_variant_model``.
 
     Args:
         Z: Platform predictor dosages. Shape: (n_samples, n_platform_variants).
