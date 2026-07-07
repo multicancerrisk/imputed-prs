@@ -523,6 +523,17 @@ class InMemoryGenotypeSource(GenotypeSource):
             yield VariantBlock(variant_info=info, dosages=dosages)
 
 
+def is_pgen_path(path) -> bool:
+    """True if ``path`` resolves to a PGEN dataset (``.pgen`` or a companion ``.pgen``).
+
+    Mirrors the detection in :func:`make_genotype_source`. PGEN is streaming-only
+    (there is no dense PGEN materializer), so ``fit`` uses this to force the streaming
+    backend for PGEN input and to reject ``backend='dense'`` with a clear error.
+    """
+    p = str(path)
+    return p.lower().endswith(".pgen") or Path(p + ".pgen").exists()
+
+
 def make_genotype_source(
     path, samples: Optional[List[str]] = None, variant_ids: Optional[Set[str]] = None
 ) -> GenotypeSource:
@@ -536,7 +547,7 @@ def make_genotype_source(
     """
     p = str(path)
     low = p.lower()
-    if low.endswith(".pgen") or Path(p + ".pgen").exists():
+    if is_pgen_path(p):
         pgen_path = p if low.endswith(".pgen") else p + ".pgen"
         return PgenGenotypeSource(pgen_path, samples=samples, variant_ids=variant_ids)
     if low.endswith((".vcf", ".vcf.gz", ".vcf.bgz", ".bcf")):

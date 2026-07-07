@@ -38,6 +38,8 @@ from imputed_prs.io.genotype_loader import load_genotypes
 from imputed_prs.io.genotype_source import (
     GenotypeSource,
     InMemoryGenotypeSource,
+    PgenGenotypeSource,
+    is_pgen_path,
     make_genotype_source,
 )
 from imputed_prs.io.pgs_catalog import download_pgs_catalog_score
@@ -268,7 +270,12 @@ class LinearImputationPRS:
         or platform_variants).
 
         Args:
-            reference_genotypes: Path to reference genotype file (VCF or PLINK format).
+            reference_genotypes: Path to a reference genotype file, a ``GenotypeData``,
+                or a streaming ``GenotypeSource``. Paths may be VCF
+                (``.vcf/.vcf.gz/.bcf``), PLINK1 (``.bed``, dense backend only), or
+                PLINK2 **PGEN** (``.pgen``). PGEN is the preferred production reader
+                (bgzipped-VCF reads are far slower) and always streams; convert a VCF
+                reference once with ``plink2 --vcf ref.vcf.gz --make-pgen --out ref``.
             prs_definition: PRS definition as PGS Catalog ID (e.g., "PGS000004"),
                 file path, or DataFrame with variant weights.
             platform_name: Name of pre-built platform (e.g., "23andme_v5").
@@ -437,6 +444,9 @@ class LinearImputationPRS:
                     source = None
             if source is not None and (
                 self.backend == "streaming"
+                # PGEN is streaming-native (no dense reader): always stream it, even
+                # for a small panel the size gate would otherwise route to dense.
+                or isinstance(source, PgenGenotypeSource)
                 or self._auto_should_stream(source, all_needed_variants)
             ):
                 return self._fit_streaming(
@@ -454,6 +464,12 @@ class LinearImputationPRS:
         if in_memory_gd is not None:
             genotype_data = in_memory_gd
         else:
+            if is_pgen_path(reference_genotypes):
+                raise ValidationError(
+                    "PGEN input requires the streaming backend (there is no dense "
+                    "PGEN reader). Use backend='auto' (the default) or "
+                    "backend='streaming', or convert the reference to VCF."
+                )
             genotype_data = load_genotypes(
                 path=reference_genotypes, variant_ids=all_needed_variants
             )
