@@ -94,6 +94,7 @@ class LinearProjectionPRS:
         alpha: float = 0.01,
         cv_folds: int = 5,
         n_jobs: int = 1,
+        n_workers: int = 1,
         random_state: Optional[int] = None,
         max_predictors: Optional[int] = None,
         max_tuning_regions: Optional[int] = 50,
@@ -119,6 +120,10 @@ class LinearProjectionPRS:
                 tuning_scope="none". Default: 0.01.
             cv_folds: Number of cross-validation folds. Default: 5.
             n_jobs: Number of parallel jobs for training. Default: 1.
+            n_workers: Process-level fan-out for the streaming backend — shards the
+                per-chromosome accumulation + local solves across a process pool
+                (Phase 7). ``-1`` = performance cores; ``1`` (default) = off. CPU-only
+                (GPU stays single-process) and reproducible. Orthogonal to ``n_jobs``.
             random_state: Random seed for reproducibility. Default: None.
             max_predictors: Maximum predictor variants per region.
                 Default: None (no limit).
@@ -157,6 +162,7 @@ class LinearProjectionPRS:
         self.alpha = alpha
         self.cv_folds = cv_folds
         self.n_jobs = n_jobs
+        self.n_workers = n_workers
         self.random_state = random_state
         self.max_predictors = max_predictors
         self.max_tuning_regions = max_tuning_regions
@@ -1043,6 +1049,7 @@ class LinearProjectionPRS:
             cv_folds=self.cv_folds,
             random_state=self.random_state,
             device="cpu",
+            n_workers=self.n_workers,
         )
 
     def _fit_streaming(
@@ -1158,7 +1165,9 @@ class LinearProjectionPRS:
             )
 
         # Single streaming pass: region models + observed fallbacks + calibration.
-        result = StreamingProjectionFitter(plan, device=self.device).run(source)
+        result = StreamingProjectionFitter(plan, device=self.device).run(
+            source, n_workers=self.n_workers
+        )
 
         calibration_params = None
         if result.has_calibration_terms:

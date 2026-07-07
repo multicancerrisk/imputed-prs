@@ -84,6 +84,7 @@ def streaming_reference_cv_impute(
     cv_folds: int = 5,
     random_state: Optional[int] = None,
     device: str = "cpu",
+    n_workers: int = 1,
 ) -> ReferenceCVModels:
     """One streaming pass → per-outer-fold **imputation** models by additive subtraction.
 
@@ -121,7 +122,9 @@ def streaming_reference_cv_impute(
     )
     outer_folds = GlobalFolds.from_partition(fold_indices)
     fitter = StreamingImputationFitter(plan, device=device)
-    fold_models, failures = fitter.run_reference_cv(source, outer_folds)
+    fold_models, failures = fitter.run_reference_cv(
+        source, outer_folds, n_workers=n_workers
+    )
     return ReferenceCVModels(
         observed_variants=_observed_variant_infos(prs_df, plan.observed_prs_ids),
         fold_indices=list(fold_indices),
@@ -143,6 +146,7 @@ def streaming_reference_cv_project(
     cv_folds: int = 5,
     random_state: Optional[int] = None,
     device: str = "cpu",
+    n_workers: int = 1,
 ) -> ReferenceCVModels:
     """One streaming pass → per-outer-fold **projection** region models by subtraction.
 
@@ -180,7 +184,9 @@ def streaming_reference_cv_project(
     )
     outer_folds = GlobalFolds.from_partition(fold_indices)
     fitter = StreamingProjectionFitter(plan, device=device)
-    fold_models, failures = fitter.run_reference_cv(source, outer_folds)
+    fold_models, failures = fitter.run_reference_cv(
+        source, outer_folds, n_workers=n_workers
+    )
     return ReferenceCVModels(
         observed_variants=_observed_variant_infos(prs_df, plan.observed_prs_ids),
         fold_indices=list(fold_indices),

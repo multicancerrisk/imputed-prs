@@ -113,6 +113,7 @@ class LinearImputationPRS:
         alpha: float = 0.01,
         cv_folds: int = 5,
         n_jobs: int = 1,
+        n_workers: int = 1,
         random_state: Optional[int] = None,
         max_predictors: Optional[int] = None,
         max_tuning_variants: Optional[int] = 50,
@@ -145,6 +146,11 @@ class LinearImputationPRS:
                 Default: 5.
             n_jobs: Number of parallel jobs for training (-1 for all CPUs).
                 Default: 1 (sequential).
+            n_workers: Process-level fan-out for the streaming backend — shards the
+                per-chromosome accumulation + local solves across a process pool
+                (Phase 7). ``-1`` = performance cores; ``1`` (default) = off. CPU-only
+                (GPU stays single-process) and reproducible (order-independent reduce).
+                Orthogonal to ``n_jobs`` (the dense oracle's inner per-variant threads).
             random_state: Random seed for reproducibility. Default: None.
             max_predictors: Maximum number of predictor variants per model.
                 If None, uses all variants in window. Default: None.
@@ -206,6 +212,7 @@ class LinearImputationPRS:
         self.alpha = alpha
         self.cv_folds = cv_folds
         self.n_jobs = n_jobs
+        self.n_workers = n_workers
         self.random_state = random_state
         self.max_predictors = max_predictors
         self.max_tuning_variants = max_tuning_variants
@@ -1106,8 +1113,9 @@ class LinearImputationPRS:
             )
 
         # Single streaming pass: imputed models + observed fallbacks + calibration.
+        # n_workers>1 shards the pass by chromosome across processes (CPU-only).
         fitter = StreamingImputationFitter(plan, device=self.device)
-        result = fitter.run(source)
+        result = fitter.run(source, n_workers=self.n_workers)
 
         calibration_params = finalize_imputation_calibration(
             result.s_true, result.s_cv, result.models
@@ -1298,6 +1306,7 @@ class LinearImputationPRS:
             cv_folds=self.cv_folds,
             random_state=self.random_state,
             device="cpu",
+            n_workers=self.n_workers,
         )
 
     def _build_variant_dispositions(
