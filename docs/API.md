@@ -187,6 +187,7 @@ def fit(
     training_ancestry: Optional[str] = None,
     evaluation_genotypes: Optional[Union[str, Path]] = None,
     allow_alt_as_effect: bool = False,
+    checkpoint_dir: Optional[Union[str, Path]] = None,
 ) -> "LinearImputationPRS"
 ```
 
@@ -206,8 +207,11 @@ def fit(
 | `training_ancestry` | `str` | Provenance — ancestry of the training cohort (e.g., `"EUR"`). Recorded in the deployable export. |
 | `evaluation_genotypes` | `str` or `Path` | Optional holdout genotypes for external evaluation. |
 | `allow_alt_as_effect` | `bool` | If `True`, permit a PRS definition that supplies an `alt` column (but no explicit `effect_allele`) to be loaded by treating ALT as the effect allele. Defaults to `False`, which raises. |
+| `checkpoint_dir` | `str` or `Path` | Opt-in resumable streaming fit (Phase 10). When set, each per-chromosome partial is persisted as it completes; a killed run re-invoked with the same `checkpoint_dir` loads the finished chromosomes and recomputes only the rest, to a **bit-identical** artifact. `None` (default) → no disk I/O. Ignored on the dense backend. |
 
 **Note:** Strand-ambiguity QC (`exclude_ambiguous`, `ambiguous_maf_threshold`) and tuning caps (`max_tuning_variants`) are set on the **constructor**, not on `fit()`.
+
+**Checkpointing (Phase 10):** `checkpoint_dir` makes a long streaming fit resumable — a crash re-run with the same directory skips already-fitted chromosomes. The key binds the reference panel, chip + PRS content (each variant's id/orientation/beta), window params, `alpha`/`l1_ratio`, and device/solve-mode, so a re-weighted, re-tuned, or different-panel fit lands in a separate directory. For a bit-identical resume, keep the fit/solver code unchanged between crash and resume (a committed change is flagged with a warning; a `schema_version` bump invalidates cleanly). The same knob is available on `ImputationEvaluator.cross_validate` / `ProjectionEvaluator.cross_validate` for resumable reference CV.
 
 **Returns:** `self` (for method chaining)
 
@@ -460,6 +464,7 @@ def fit(
     reference_panel_id: Optional[str] = None,
     training_ancestry: Optional[str] = None,
     allow_alt_as_effect: bool = False,
+    checkpoint_dir: Optional[Union[str, Path]] = None,
 ) -> "LinearProjectionPRS"
 ```
 
@@ -478,6 +483,7 @@ def fit(
 | `reference_panel_id` | `str` | Provenance — reference panel used for training (e.g., `"1000G_phase3_EUR"`). Recorded in the deployable export. |
 | `training_ancestry` | `str` | Provenance — ancestry of the training cohort (e.g., `"EUR"`). Recorded in the deployable export. |
 | `allow_alt_as_effect` | `bool` | If `True`, permit a PRS definition that supplies an `alt` column (but no explicit `effect_allele`) to be loaded by treating ALT as the effect allele. Defaults to `False`, which raises. |
+| `checkpoint_dir` | `str` or `Path` | Opt-in resumable streaming fit (Phase 10) — persists each per-chromosome partial so a killed run resumes to a **bit-identical** artifact. `None` (default) → no disk I/O. See `LinearImputationPRS.fit`. |
 
 **Note:** Unlike `LinearImputationPRS.fit()`, there is no `evaluation_genotypes` parameter. Use `ProjectionEvaluator` for external evaluation. Strand-ambiguity QC (`exclude_ambiguous`, `ambiguous_maf_threshold`) and the tuning cap (`max_tuning_regions`) are set on the **constructor**, not on `fit()`.
 
@@ -717,6 +723,7 @@ def cross_validate(
     n_folds: int = 5,
     random_state: Optional[int] = None,
     backend: Optional[str] = None,
+    checkpoint_dir: Optional[Union[str, Path]] = None,
 ) -> CrossValidationResult
 ```
 
@@ -732,6 +739,7 @@ def cross_validate(
 | `n_folds` | `int` | `5` | Number of CV folds (must be >= 2). |
 | `random_state` | `int` | `None` | Random seed for reproducibility. |
 | `backend` | `str` | `None` | `"streaming"` / `"dense"` / `"auto"`; defaults to the parent model's. |
+| `checkpoint_dir` | `str` or `Path` | `None` | Opt-in resumable reference CV (Phase 10, streaming backend). Persists each per-chromosome partial so a killed CV re-invoked with the same directory and fold partition resumes to a **bit-identical** result. `None` → no disk I/O. |
 
 **Returns:** `CrossValidationResult` with fold metrics and aggregated statistics.
 

@@ -158,6 +158,56 @@ def make_checkpoint_key(
 
 
 # ---------------------------------------------------------------------------
+# Plan → key material (shared by the plain-fit and reference-CV key builders, so a fit
+# and a CV over the same PRS share the predictor/PRS digests and differ only in mode/folds)
+# ---------------------------------------------------------------------------
+def imputation_plan_terms(plan) -> Tuple[List[str], List[PrsTerm]]:
+    """``(predictor_ids, prs_terms)`` for an imputation ``StreamPlan`` — the content to key."""
+    predictor_ids = list(plan.chip_ids)
+    prs_terms: List[PrsTerm] = [
+        ("t", vid, tv.effect_flip, tv.beta) for vid, tv in plan.targets.items()
+    ]
+    prs_terms += [
+        ("b", vid, tv.effect_flip, tv.beta) for vid, tv in plan.fallback_targets.items()
+    ]
+    prs_terms += [
+        ("o", vid, ov.effect_flip, ov.beta) for vid, ov in plan.observed.items()
+    ]
+    return predictor_ids, prs_terms
+
+
+def projection_plan_terms(plan) -> Tuple[List[str], List[PrsTerm]]:
+    """``(predictor_ids, prs_terms)`` for a projection ``ProjectionStreamPlan``.
+
+    Binds each region-member's ``(ref_id:region_index, effect_flip, beta)`` — the streamed
+    ``S_R`` accumulation terms — plus the observed / fallback terms.
+    """
+    predictor_ids = list(plan.chip_ids)
+    prs_terms: List[PrsTerm] = [
+        ("r", f"{ref_id}:{region_index}", effect_flip, beta)
+        for ref_id, members in plan.region_members.items()
+        for region_index, beta, effect_flip in members
+    ]
+    prs_terms += [
+        ("b", vid, tv.effect_flip, tv.beta) for vid, tv in plan.fallback_targets.items()
+    ]
+    prs_terms += [
+        ("o", vid, ov.effect_flip, ov.beta) for vid, ov in plan.observed.items()
+    ]
+    return predictor_ids, prs_terms
+
+
+def fold_partition_key(fold_indices: Sequence[Sequence[int]]) -> str:
+    """Digest of a reference-CV outer partition (order-independent within a fold).
+
+    Fold ``k``'s membership defines the leave-one-out split, so the digest is
+    order-independent within a fold but order-sensitive across folds.
+    """
+    parts = [_sha1(*sorted(int(i) for i in idx)) for idx in fold_indices]
+    return _sha1(*parts)
+
+
+# ---------------------------------------------------------------------------
 # Provenance
 # ---------------------------------------------------------------------------
 def _dep_versions() -> Dict[str, str]:

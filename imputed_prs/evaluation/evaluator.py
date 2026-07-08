@@ -307,6 +307,7 @@ class ImputationEvaluator:
         n_folds: int = 5,
         random_state: Optional[int] = None,
         backend: Optional[str] = None,
+        checkpoint_dir: Optional[Union[str, Path]] = None,
     ) -> CrossValidationResult:
         """Perform k-fold cross-validation.
 
@@ -321,6 +322,11 @@ class ImputationEvaluator:
             platform_variants: List of platform variant IDs.
             n_folds: Number of cross-validation folds. Must be >= 2.
             random_state: Random seed for reproducibility.
+            checkpoint_dir: Optional directory for a resumable reference-CV run
+                (Phase 10, streaming backend only). Each per-chromosome partial is
+                persisted as it completes; a killed CV re-invoked with the same
+                ``checkpoint_dir`` (and fold partition) resumes to a bit-identical
+                result. ``None`` (default) → no disk I/O.
 
         Returns:
             CrossValidationResult with fold metrics and aggregated statistics.
@@ -402,6 +408,7 @@ class ImputationEvaluator:
             platform_manifest=platform_manifest,
             platform_variants=platform_variants,
             fold_indices=fold_indices,
+            checkpoint_dir=checkpoint_dir,
             _platform_variant_set=platform_variant_set,
         )
 

@@ -243,7 +243,9 @@ class StreamingProjectionFitter:
         )
         return ProjectionStreamResult.reduce(partials, self.folds.n)
 
-    def run_reference_cv(self, source, outer_folds: GlobalFolds, *, n_workers: int = 1):
+    def run_reference_cv(
+        self, source, outer_folds: GlobalFolds, *, n_workers: int = 1, checkpoint=None
+    ):
         """Single-pass leave-one-fold-out reference CV over the panel (projection).
 
         Streams once with the buffer's folds set to ``outer_folds`` (the reference-CV
@@ -269,7 +271,12 @@ class StreamingProjectionFitter:
         self._cv_collector = {}
         try:
             partials = fan_out_chromosomes(
-                self, source, self._stream_chromosomes(), n_workers=n_workers, device="cpu"
+                self,
+                source,
+                self._stream_chromosomes(),
+                n_workers=n_workers,
+                device="cpu",
+                checkpoint=checkpoint,
             )
             fold_models, failures = reduce_cv_collectors(partials, outer_folds.n_folds)
         finally:

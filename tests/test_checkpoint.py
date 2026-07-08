@@ -38,6 +38,7 @@ from tests.test_parallel_streaming import (
     _assert_imputation_identical,
     _assert_projection_identical,
     _build_panel,
+    _fold_indices,
 )
 
 
@@ -345,6 +346,17 @@ def test_partial_crash_then_resume_is_bit_identical(tmp_path):
     _assert_imputation_identical(base, resumed)
 
 
+def test_checkpoint_with_worker_pool_writes_all_shards(tmp_path):
+    # Exercises the loky generator_unordered persist path (parent writes each partial as it
+    # yields). A cross-process spy can't observe workers, so assert shards + bit-identity.
+    panel = _build_panel()
+    with threadpool_limits(limits=1):
+        base = _fit_imp(panel)  # n_workers=1, no checkpoint
+        pooled = _fit_imp(panel, checkpoint_dir=tmp_path, n_workers=2)
+    assert get_checkpoint_info(tmp_path)["entries"][0]["n_shards"] == N_CHROM
+    _assert_imputation_identical(base, pooled)
+
+
 def test_warm_resume_projection_is_bit_identical(tmp_path):
     panel = _build_panel()
     with threadpool_limits(limits=1):
@@ -356,3 +368,69 @@ def test_warm_resume_projection_is_bit_identical(tmp_path):
             resumed = _fit_proj(panel, checkpoint_dir=tmp_path)
         assert calls["n"] == 0
     _assert_projection_identical(base, resumed)
+
+
+# --- integration: resumable reference CV -------------------------------------
+def _cv_impute(panel, checkpoint_dir=None):
+    gd, prs, plat = panel
+    d = LinearImputationPRS(
+        backend="streaming", tuning_scope="none", cv_folds=3, random_state=17, verbose=0
+    )
+    return d._reference_cv_fold_models(
+        gd, prs, platform_variants=plat, fold_indices=_fold_indices(),
+        checkpoint_dir=checkpoint_dir,
+    )
+
+
+def _cv_project(panel, checkpoint_dir=None):
+    gd, prs, plat = panel
+    d = LinearProjectionPRS(
+        backend="streaming", tuning_scope="none", cv_folds=3, random_state=17, verbose=0
+    )
+    return d._reference_cv_fold_models(
+        gd, prs, platform_variants=plat, fold_indices=_fold_indices(),
+        checkpoint_dir=checkpoint_dir,
+    )
+
+
+def test_reference_cv_imputation_resume_bit_identical(tmp_path):
+    panel = _build_panel()
+    with threadpool_limits(limits=1):
+        base = _cv_impute(panel)
+        _cv_impute(panel, checkpoint_dir=tmp_path)  # cold: writes every shard
+        assert get_checkpoint_info(tmp_path)["entries"][0]["n_shards"] == N_CHROM
+        wrapper, calls, _ = _spy(StreamingImputationFitter)
+        with mock.patch.object(StreamingImputationFitter, "_run_one_chromosome", wrapper):
+            resumed = _cv_impute(panel, checkpoint_dir=tmp_path)
+        assert calls["n"] == 0  # all folds' per-chrom partials resumed from disk
+    assert base is not None and resumed is not None
+    for k in base.fold_imputed_models:
+        ba = {m.variant_id: m for m in base.fold_imputed_models[k]}
+        rb = {m.variant_id: m for m in resumed.fold_imputed_models[k]}
+        assert set(ba) == set(rb) and ba, k
+        for vid in ba:
+            np.testing.assert_array_equal(
+                np.asarray(ba[vid].coefficients), np.asarray(rb[vid].coefficients)
+            )
+            assert ba[vid].intercept == rb[vid].intercept, (k, vid)
+
+
+def test_reference_cv_projection_resume_bit_identical(tmp_path):
+    panel = _build_panel()
+    with threadpool_limits(limits=1):
+        base = _cv_project(panel)
+        _cv_project(panel, checkpoint_dir=tmp_path)
+        assert get_checkpoint_info(tmp_path)["entries"][0]["n_shards"] == N_CHROM
+        wrapper, calls, _ = _spy(StreamingProjectionFitter)
+        with mock.patch.object(StreamingProjectionFitter, "_run_one_chromosome", wrapper):
+            resumed = _cv_project(panel, checkpoint_dir=tmp_path)
+        assert calls["n"] == 0
+    assert base is not None and resumed is not None
+    for k in base.fold_region_models:
+        ba = {m.region_id: m for m in base.fold_region_models[k]}
+        rb = {m.region_id: m for m in resumed.fold_region_models[k]}
+        assert set(ba) == set(rb) and ba, k
+        for rid in ba:
+            np.testing.assert_array_equal(
+                np.asarray(ba[rid].coefficients), np.asarray(rb[rid].coefficients)
+            )

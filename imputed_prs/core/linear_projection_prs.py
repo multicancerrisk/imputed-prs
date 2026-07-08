@@ -1045,6 +1045,7 @@ class LinearProjectionPRS:
         fold_indices,
         genome_build=None,
         allow_alt_as_effect: bool = False,
+        checkpoint_dir=None,
         _platform_variant_set=None,
     ):
         """One streaming pass → per-outer-fold projection region models by subtraction.
@@ -1085,6 +1086,7 @@ class LinearProjectionPRS:
             random_state=self.random_state,
             device="cpu",
             n_workers=self.n_workers,
+            checkpoint_dir=checkpoint_dir,
         )
 
     def _checkpoint_key(self, plan, source, ref_info, *, device, solve_mode):
@@ -1095,23 +1097,13 @@ class LinearProjectionPRS:
         ``device``/solve-mode — everything that changes the per-chromosome region models a
         checkpoint stores, so a re-weighted or re-tuned fit never reuses a stale shard.
         """
-        from imputed_prs.io.checkpoint import make_checkpoint_key
+        from imputed_prs.io.checkpoint import make_checkpoint_key, projection_plan_terms
 
-        prs_terms = []
-        for ref_id, members in plan.region_members.items():
-            for region_index, beta, effect_flip in members:
-                prs_terms.append(("r", f"{ref_id}:{region_index}", effect_flip, beta))
-        prs_terms += [
-            ("b", vid, tv.effect_flip, tv.beta)
-            for vid, tv in plan.fallback_targets.items()
-        ]
-        prs_terms += [
-            ("o", vid, ov.effect_flip, ov.beta) for vid, ov in plan.observed.items()
-        ]
+        predictor_ids, prs_terms = projection_plan_terms(plan)
         source_file = getattr(source, "path", None) or getattr(source, "_pgen_path", None)
         return make_checkpoint_key(
             sample_ids=source.sample_ids,
-            predictor_ids=list(plan.chip_ids),
+            predictor_ids=predictor_ids,
             prs_terms=prs_terms,
             window_size=self.window_size,
             max_predictors=self.max_predictors,

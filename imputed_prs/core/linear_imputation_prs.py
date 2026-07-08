@@ -1113,22 +1113,13 @@ class LinearImputationPRS:
         ``alpha``/``l1_ratio``/``device``/solve-mode. A re-weighted, re-oriented, or
         re-tuned fit lands in a different directory and never reuses a stale shard.
         """
-        from imputed_prs.io.checkpoint import make_checkpoint_key
+        from imputed_prs.io.checkpoint import imputation_plan_terms, make_checkpoint_key
 
-        prs_terms = [
-            ("t", vid, tv.effect_flip, tv.beta) for vid, tv in plan.targets.items()
-        ]
-        prs_terms += [
-            ("b", vid, tv.effect_flip, tv.beta)
-            for vid, tv in plan.fallback_targets.items()
-        ]
-        prs_terms += [
-            ("o", vid, ov.effect_flip, ov.beta) for vid, ov in plan.observed.items()
-        ]
+        predictor_ids, prs_terms = imputation_plan_terms(plan)
         source_file = getattr(source, "path", None) or getattr(source, "_pgen_path", None)
         return make_checkpoint_key(
             sample_ids=source.sample_ids,
-            predictor_ids=list(plan.chip_ids),
+            predictor_ids=predictor_ids,
             prs_terms=prs_terms,
             window_size=self.window_size,
             max_predictors=self.max_predictors,
@@ -1455,6 +1446,7 @@ class LinearImputationPRS:
         fold_indices,
         genome_build=None,
         allow_alt_as_effect: bool = False,
+        checkpoint_dir=None,
         _platform_variant_set=None,
     ):
         """One streaming pass → per-outer-fold imputation models by additive subtraction.
@@ -1500,6 +1492,7 @@ class LinearImputationPRS:
             random_state=self.random_state,
             device="cpu",
             n_workers=self.n_workers,
+            checkpoint_dir=checkpoint_dir,
         )
 
     def _build_variant_dispositions(

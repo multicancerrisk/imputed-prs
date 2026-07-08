@@ -333,6 +333,7 @@ class ProjectionEvaluator:
         n_folds: int = 5,
         random_state: Optional[int] = None,
         backend: Optional[str] = None,
+        checkpoint_dir: Optional[Union[str, Path]] = None,
     ):
         """Perform k-fold reference cross-validation for the projection model.
 
@@ -407,6 +408,7 @@ class ProjectionEvaluator:
             platform_manifest=platform_manifest,
             platform_variants=platform_variants,
             fold_indices=fold_indices,
+            checkpoint_dir=checkpoint_dir,
             _platform_variant_set=platform_variant_set,
         )
 

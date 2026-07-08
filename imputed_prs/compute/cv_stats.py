@@ -13,7 +13,8 @@ gram_solve`` (never imported *by* those, to keep the dependency acyclic).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,56 @@ from imputed_prs.core.types import (
     ProjectionRegionModel,
     VariantInfo,
 )
+
+
+def _cv_checkpoint(
+    checkpoint_dir,
+    *,
+    predictor_ids,
+    prs_terms,
+    source,
+    ref_info,
+    fold_indices,
+    solve_mode,
+    window_size,
+    max_predictors,
+    cv_folds,
+    random_state,
+    alpha,
+    l1_ratio,
+):
+    """Build the Phase-10 reference-CV ``CheckpointStore`` (mode='cv'), or ``None``.
+
+    Reference CV forces the CPU buffer, so the key's device is always ``cpu``; ``fold_key``
+    digests the outer partition so a different fold split lands in a different directory.
+    """
+    if checkpoint_dir is None:
+        return None
+    from imputed_prs.io.checkpoint import (
+        CheckpointStore,
+        fold_partition_key,
+        make_checkpoint_key,
+    )
+
+    source_file = getattr(source, "path", None) or getattr(source, "_pgen_path", None)
+    key = make_checkpoint_key(
+        sample_ids=source.sample_ids,
+        predictor_ids=predictor_ids,
+        prs_terms=prs_terms,
+        window_size=window_size,
+        max_predictors=max_predictors,
+        cv_folds=cv_folds,
+        random_state=random_state,
+        alpha=alpha,
+        l1_ratio=l1_ratio,
+        device="cpu",
+        solve_mode=solve_mode,
+        mode="cv",
+        fold_key=fold_partition_key(fold_indices),
+        source_file=source_file,
+        n_variants=len(ref_info),
+    )
+    return CheckpointStore(checkpoint_dir, key)
 
 
 @dataclass
@@ -85,6 +136,7 @@ def streaming_reference_cv_impute(
     random_state: Optional[int] = None,
     device: str = "cpu",
     n_workers: int = 1,
+    checkpoint_dir: Optional[Union[str, Path]] = None,
 ) -> ReferenceCVModels:
     """One streaming pass → per-outer-fold **imputation** models by additive subtraction.
 
@@ -122,8 +174,26 @@ def streaming_reference_cv_impute(
     )
     outer_folds = GlobalFolds.from_partition(fold_indices)
     fitter = StreamingImputationFitter(plan, device=device)
+    from imputed_prs.io.checkpoint import imputation_plan_terms
+
+    predictor_ids, prs_terms = imputation_plan_terms(plan)
+    checkpoint = _cv_checkpoint(
+        checkpoint_dir,
+        predictor_ids=predictor_ids,
+        prs_terms=prs_terms,
+        source=source,
+        ref_info=ref_info,
+        fold_indices=fold_indices,
+        solve_mode=getattr(fitter, "_solve_mode", "default"),
+        window_size=window_size,
+        max_predictors=max_predictors,
+        cv_folds=cv_folds,
+        random_state=random_state,
+        alpha=alpha,
+        l1_ratio=l1_ratio,
+    )
     fold_models, failures = fitter.run_reference_cv(
-        source, outer_folds, n_workers=n_workers
+        source, outer_folds, n_workers=n_workers, checkpoint=checkpoint
     )
     return ReferenceCVModels(
         observed_variants=_observed_variant_infos(prs_df, plan.observed_prs_ids),
@@ -147,6 +217,7 @@ def streaming_reference_cv_project(
     random_state: Optional[int] = None,
     device: str = "cpu",
     n_workers: int = 1,
+    checkpoint_dir: Optional[Union[str, Path]] = None,
 ) -> ReferenceCVModels:
     """One streaming pass → per-outer-fold **projection** region models by subtraction.
 
@@ -184,8 +255,26 @@ def streaming_reference_cv_project(
     )
     outer_folds = GlobalFolds.from_partition(fold_indices)
     fitter = StreamingProjectionFitter(plan, device=device)
+    from imputed_prs.io.checkpoint import projection_plan_terms
+
+    predictor_ids, prs_terms = projection_plan_terms(plan)
+    checkpoint = _cv_checkpoint(
+        checkpoint_dir,
+        predictor_ids=predictor_ids,
+        prs_terms=prs_terms,
+        source=source,
+        ref_info=ref_info,
+        fold_indices=fold_indices,
+        solve_mode=getattr(fitter, "_solve_mode", "default"),
+        window_size=window_size,
+        max_predictors=max_predictors,
+        cv_folds=cv_folds,
+        random_state=random_state,
+        alpha=alpha,
+        l1_ratio=l1_ratio,
+    )
     fold_models, failures = fitter.run_reference_cv(
-        source, outer_folds, n_workers=n_workers
+        source, outer_folds, n_workers=n_workers, checkpoint=checkpoint
     )
     return ReferenceCVModels(
         observed_variants=_observed_variant_infos(prs_df, plan.observed_prs_ids),
