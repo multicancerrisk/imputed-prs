@@ -61,9 +61,9 @@ Both are **GB, not the dense ~0.41 TB wall** (dense/streaming ≈ 200× by the a
 The sample dimension is contracted: no n × n_variants dosage matrix is resident
 (`collect_reference_variant_info` keeps only variant metadata; the fit holds an O(n × cap) band
 buffer). Tightening the 2–71 GB bracket — profiling the n-dependent transients and measuring at
-larger n — is a Phase-6 item.
+larger n — is a Phase-11 item.
 
-## Deferred to Phase 6 (full-scale integration)
+## Deferred to Phase 11 (full-scale integration)
 The full 22-chromosome / 2.1M-variant fit on all 3,202 samples + 10-fold reference CV is the
-Phase-6 job. (The cached all-autosome prefilter under `benchmarks/data/work/` is a partial,
+Phase-11 job. (The cached all-autosome prefilter under `benchmarks/data/work/` is a partial,
 aborted-blocker extract — 109,737 variants, fewer than chr20-22 alone — and was not used.)

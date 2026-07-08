@@ -128,11 +128,14 @@ LinearImputationPRS(
     alpha: float = 0.01,
     cv_folds: int = 5,
     n_jobs: int = 1,
+    n_workers: int = 1,
     random_state: Optional[int] = None,
     max_predictors: Optional[int] = None,
     max_tuning_variants: Optional[int] = 50,
     exclude_ambiguous: bool = False,
     ambiguous_maf_threshold: float = 0.4,
+    backend: Literal["auto", "dense", "streaming"] = "auto",
+    device: Literal["auto", "cpu", "mps", "cuda"] = "auto",
     verbose: int = 1,
 )
 ```
@@ -146,12 +149,15 @@ LinearImputationPRS(
 | `l1_ratio` | `float` | `0.5` | ElasticNet L1/L2 mixing parameter. 0=Ridge, 1=Lasso. Only used when `tuning_scope="none"`. |
 | `alpha` | `float` | `0.01` | ElasticNet regularization strength. Only used when `tuning_scope="none"`. |
 | `cv_folds` | `int` | `5` | Number of cross-validation folds for training and calibration. |
-| `n_jobs` | `int` | `1` | Number of parallel jobs for training. Use `-1` for all CPUs. |
+| `n_jobs` | `int` | `1` | Number of parallel jobs for the intra-fit sklearn thread pool. Use `-1` for all CPUs. |
+| `n_workers` | `int` | `1` | **Scaling (Phase 7).** Process-level fan-out for the streaming backend: shards the fit / reference CV by chromosome across a process pool (zero-halo → **bit-identical** artifact). `-1` = performance cores. CPU-only; orthogonal to `n_jobs`. |
 | `random_state` | `int` | `None` | Random seed for reproducibility. |
 | `max_predictors` | `int` | `None` | Maximum number of predictor variants per model. If `None`, uses all variants in window. |
 | `max_tuning_variants` | `int` | `50` | Cap on missing variants sampled for `tuning_scope="global"`. `None` tunes on all missing variants. Must be positive when set. |
 | `exclude_ambiguous` | `bool` | `False` | If `True`, drop strand-ambiguous (palindromic A/T and C/G) SNPs whose reference minor-allele frequency exceeds `ambiguous_maf_threshold`, since their strand cannot be resolved reliably. |
 | `ambiguous_maf_threshold` | `float` | `0.4` | MAF above which ambiguous SNPs are excluded when `exclude_ambiguous` is `True`. |
+| `backend` | `str` | `"auto"` | **Scaling (Phase 2).** Training path: `"dense"` (in-RAM oracle), `"streaming"` (band-limited sufficient statistics — never materializes the dosage matrix; requires `tuning_scope ∈ {"none","global"}` and `exclude_ambiguous=False`), or `"auto"` (streams when the estimated dense matrix exceeds 8 GiB; PGEN and bare `GenotypeSource` inputs always stream). See [scaling-guide.md](scaling-guide.md). |
+| `device` | `str` | `"auto"` | **Scaling (Phase 3).** Compute device for the streaming Gram kernels: `"cpu"`, `"mps"`, `"cuda"`, or `"auto"` (CUDA→MPS→CPU; CPU when torch is absent). Requires the `[gpu]` extra. Only the streaming path is device-aware; the dense path is always CPU. |
 | `verbose` | `int` | `1` | Verbosity level. 0=silent, 1=progress bar, 2=debug output. |
 
 **Example:**
@@ -175,7 +181,7 @@ Train imputation models on reference genotype data.
 ```python
 def fit(
     self,
-    reference_genotypes: Union[str, Path],
+    reference_genotypes: Union[str, Path, GenotypeData, GenotypeSource],
     prs_definition: Union[str, Path, pd.DataFrame],
     platform_name: Optional[str] = None,
     platform_manifest: Optional[Union[str, Path]] = None,
@@ -195,7 +201,7 @@ def fit(
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `reference_genotypes` | `str` or `Path` | Path to reference genotype file (VCF or PLINK format). |
+| `reference_genotypes` | `str`, `Path`, `GenotypeData`, or `GenotypeSource` | Reference genotypes: a VCF/BCF or PLINK1 `.bed` path (both backends), a PLINK2 `.pgen` path (streaming backend only — there is no dense PGEN reader; needs the `[scale]` extra), or an in-memory `GenotypeData` / streaming `GenotypeSource`. |
 | `prs_definition` | `str`, `Path`, or `DataFrame` | PRS definition as PGS Catalog ID (e.g., `"PGS000004"`), file path, or DataFrame with variant weights. |
 | `platform_name` | `str` | Name of pre-built platform (e.g., `"23andme_v5"`). Mutually exclusive with `platform_manifest` and `platform_variants`. |
 | `platform_manifest` | `str` or `Path` | Path to custom platform manifest file. |
@@ -406,11 +412,14 @@ LinearProjectionPRS(
     alpha: float = 0.01,
     cv_folds: int = 5,
     n_jobs: int = 1,
+    n_workers: int = 1,
     random_state: Optional[int] = None,
     max_predictors: Optional[int] = None,
     max_tuning_regions: Optional[int] = 50,
     exclude_ambiguous: bool = False,
     ambiguous_maf_threshold: float = 0.4,
+    backend: Literal["auto", "dense", "streaming"] = "auto",
+    device: Literal["auto", "cpu", "mps", "cuda"] = "auto",
     verbose: int = 1,
 )
 ```
@@ -424,12 +433,15 @@ LinearProjectionPRS(
 | `l1_ratio` | `float` | `0.5` | ElasticNet L1/L2 mixing parameter. 0=Ridge, 1=Lasso. Only used when `tuning_scope="none"`. |
 | `alpha` | `float` | `0.01` | ElasticNet regularization strength. Only used when `tuning_scope="none"`. |
 | `cv_folds` | `int` | `5` | Number of cross-validation folds for training and calibration. |
-| `n_jobs` | `int` | `1` | Number of parallel jobs for training. Use `-1` for all CPUs. |
+| `n_jobs` | `int` | `1` | Number of parallel jobs for the intra-fit sklearn thread pool. Use `-1` for all CPUs. |
+| `n_workers` | `int` | `1` | **Scaling (Phase 7).** Process-level fan-out for the streaming backend: shards the fit / reference CV by chromosome across a process pool (zero-halo → **bit-identical** artifact). `-1` = performance cores. CPU-only; orthogonal to `n_jobs`. |
 | `random_state` | `int` | `None` | Random seed for reproducibility. |
 | `max_predictors` | `int` | `None` | Maximum number of predictor variants per region. If `None`, uses all variants in region. |
 | `max_tuning_regions` | `int` | `50` | Cap on regions sampled for `tuning_scope="global"`. `None` tunes on all regions. Must be positive when set. |
 | `exclude_ambiguous` | `bool` | `False` | If `True`, drop strand-ambiguous (palindromic A/T and C/G) SNPs whose reference minor-allele frequency exceeds `ambiguous_maf_threshold`. |
 | `ambiguous_maf_threshold` | `float` | `0.4` | MAF above which ambiguous SNPs are excluded when `exclude_ambiguous` is `True`. |
+| `backend` | `str` | `"auto"` | **Scaling (Phase 2).** Training path: `"dense"` (in-RAM oracle), `"streaming"` (band-limited sufficient statistics; requires `tuning_scope ∈ {"none","global"}` and `exclude_ambiguous=False`), or `"auto"` (streams when the estimated dense matrix exceeds 8 GiB; PGEN and bare `GenotypeSource` inputs always stream). On uniformly dense scores projection degenerates to a low-R² mega-region — see [scaling-guide.md](scaling-guide.md). |
+| `device` | `str` | `"auto"` | **Scaling (Phase 3).** Compute device for the streaming Gram kernels: `"cpu"`, `"mps"`, `"cuda"`, or `"auto"` (CUDA→MPS→CPU; CPU when torch is absent). Requires the `[gpu]` extra. Only the streaming path is device-aware. |
 | `verbose` | `int` | `1` | Verbosity level. 0=silent, 1=progress bar, 2=debug output. |
 
 **Example:**
@@ -453,7 +465,7 @@ Train projection models on reference genotype data.
 ```python
 def fit(
     self,
-    reference_genotypes: Union[str, Path],
+    reference_genotypes: Union[str, Path, GenotypeData, GenotypeSource],
     prs_definition: Union[str, Path, pd.DataFrame],
     platform_name: Optional[str] = None,
     platform_manifest: Optional[Union[str, Path]] = None,
@@ -472,7 +484,7 @@ def fit(
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `reference_genotypes` | `str` or `Path` | Path to reference genotype file (VCF or PLINK format). |
+| `reference_genotypes` | `str`, `Path`, `GenotypeData`, or `GenotypeSource` | Reference genotypes: a VCF/BCF or PLINK1 `.bed` path (both backends), a PLINK2 `.pgen` path (streaming backend only; needs the `[scale]` extra), or an in-memory `GenotypeData` / streaming `GenotypeSource`. |
 | `prs_definition` | `str`, `Path`, or `DataFrame` | PRS definition as PGS Catalog ID (e.g., `"PGS000004"`), file path, or DataFrame with variant weights. |
 | `platform_name` | `str` | Name of pre-built platform (e.g., `"23andme_v5"`). Mutually exclusive with `platform_manifest` and `platform_variants`. |
 | `platform_manifest` | `str` or `Path` | Path to custom platform manifest file. |

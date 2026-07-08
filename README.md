@@ -35,6 +35,7 @@ Key ideas:
 - **Masking-validation harness**: mask a reference panel down to a platform, score it through the deployed path, and compare to the full PRS (`imputed_prs.evaluation.run_masking_validation`).
 - **Evaluation tools**: cross-validation, sensitivity analysis, and diagnostic plots.
 - **Hyperparameter tuning**: grid search and Bayesian optimization (via Optuna).
+- **Scales to 2M variants × 500K samples**: a streaming sufficient-statistics `backend` (never materializes the dosage matrix), optional GPU `device` (Apple MPS / NVIDIA CUDA), chromosome-sharded `n_workers` process fan-out, resumable `checkpoint_dir`, and a first-class PLINK2 PGEN reader. See [docs/scaling-guide.md](docs/scaling-guide.md).
 
 ## Installation
 
@@ -51,9 +52,18 @@ pip install imputed-prs[plotting]
 # For Bayesian hyperparameter optimization
 pip install imputed-prs[optuna]
 
+# For the PLINK2 PGEN streaming reader (large reference panels)
+pip install imputed-prs[scale]
+
+# For the GPU compute backend (Apple MPS / NVIDIA CUDA)
+pip install imputed-prs[gpu]
+
 # For development
 pip install imputed-prs[dev]
 ```
+
+The `scale` and `gpu` extras are **lazily imported** — the CPU/VCF path is fully functional
+without either. See [docs/scaling-guide.md](docs/scaling-guide.md).
 
 ### Development installation
 
@@ -124,6 +134,41 @@ model.fit(
 # View training summary
 print(model.summary)
 ```
+
+### Training at scale (streaming, GPU, parallel, resumable)
+
+For large reference panels the defaults already scale — `backend="auto"` streams once the
+estimated dense matrix exceeds 8 GiB, contracting the sample dimension into sufficient
+statistics instead of materializing it (at 2M×500K a dense copy is ~4 TB; streaming stays in
+GB). The knobs are constructor-level (`backend`, `device`, `n_workers`) plus `checkpoint_dir`
+on `fit`:
+
+```python
+from imputed_prs import LinearImputationPRS
+from imputed_prs.evaluation import ImputationEvaluator
+
+model = LinearImputationPRS(
+    backend="streaming",   # or "auto" (default) / "dense" (oracle)
+    device="auto",         # CUDA -> MPS -> CPU; CPU-only without the [gpu] extra
+    n_workers=-1,          # shard by chromosome across performance cores (bit-identical)
+)
+model.fit(
+    reference_genotypes="reference.pgen",  # PGEN streams natively ([scale] extra)
+    prs_definition="PGS000027",
+    platform_name="23andme_v5",
+    reference_panel_id="1000G_phase3", training_ancestry="ALL",
+    checkpoint_dir="ckpt/",   # resumable: a killed run resumes to a bit-identical artifact
+)
+
+# Additive single-pass reference CV (one accumulation pass replaces k refits):
+cv = ImputationEvaluator(model).cross_validate(
+    reference_genotypes="reference.pgen", prs_definition="PGS000027",
+    platform_name="23andme_v5", n_folds=5, backend="streaming",
+)
+```
+
+See **[docs/scaling-guide.md](docs/scaling-guide.md)** for the full reference (auto-select
+threshold, input formats, device selection, method choice, and validation evidence).
 
 ### Predict on user genotypes
 

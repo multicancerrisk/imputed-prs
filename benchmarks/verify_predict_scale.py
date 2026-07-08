@@ -15,10 +15,10 @@ Parts (curated results -> ``benchmarks/results/predict/*.json``):
   true-PRS; report speedup, batch-vs-oracle parity, and the O(n) 500K extrapolation.
 * ``refcv``     — reworked ``cross_validate`` with ``backend="streaming"`` and a
   ``tempfile`` guard asserting **no temp-VCF is written**; per-fold wall. Defaults to
-  chr22 + 3 folds (the locked bounded scope); the full-2M / 10-fold run is Phase 6.
+  chr22 + 3 folds (the locked bounded scope); the full-2M / 10-fold run is Phase 11.
 * ``masking``   — ``run_masking_validation`` (scoring-only) on the chr22 model, timed.
 
-Full 2M x 500K is Phase 6. Wall-clock budgets: each fit ~9 min at chr22, so ``refcv``
+Full 2M x 500K is Phase 11. Wall-clock budgets: each fit ~9 min at chr22, so ``refcv``
 (3 folds + parent) ~35 min; a config projected past ~60 min should shrink + extrapolate.
 
 Run:  .venv/bin/python -m benchmarks.verify_predict_scale --part evaluator
