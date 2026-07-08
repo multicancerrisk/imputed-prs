@@ -13,11 +13,18 @@ These unit tests pin the guarantees the fan-out wiring (Commit 2/3) relies on:
 """
 
 import json
+from unittest import mock
 
 import numpy as np
 import pytest
+from threadpoolctl import threadpool_limits
 
-from imputed_prs.compute.sufficient_stats import _ImputeChromPartial
+from imputed_prs import LinearImputationPRS, LinearProjectionPRS
+from imputed_prs.compute.projection_stream import StreamingProjectionFitter
+from imputed_prs.compute.sufficient_stats import (
+    StreamingImputationFitter,
+    _ImputeChromPartial,
+)
 from imputed_prs.core.types import ImputedVariantModel
 from imputed_prs.io import checkpoint as ckpt
 from imputed_prs.io.checkpoint import (
@@ -25,6 +32,12 @@ from imputed_prs.io.checkpoint import (
     clear_checkpoint,
     get_checkpoint_info,
     make_checkpoint_key,
+)
+from tests.test_parallel_streaming import (
+    N_CHROM,
+    _assert_imputation_identical,
+    _assert_projection_identical,
+    _build_panel,
 )
 
 
@@ -246,3 +259,100 @@ def test_info_and_clear(tmp_path):
     assert info["size_bytes"] > 0
     assert clear_checkpoint(tmp_path) == 2
     assert get_checkpoint_info(tmp_path)["n_entries"] == 0
+
+
+# --- integration: end-to-end resume through fit() ----------------------------
+# Reuses the 4-chromosome in-memory panel + bit-identity asserts from the Phase-7
+# determinism suite; BLAS pinned to one thread so a resumed fit is bit-identical to an
+# uninterrupted one (the checkpoint pins internally too — this makes base, which has no
+# checkpoint, comparable). `_run_one_chromosome` is spied to prove resumed work is skipped.
+
+
+def _fit_imp(panel, checkpoint_dir=None, n_workers=1):
+    gd, prs, plat = panel
+    m = LinearImputationPRS(
+        backend="streaming", tuning_scope="none", cv_folds=3,
+        random_state=17, n_workers=n_workers, verbose=0,
+    )
+    m.fit(reference_genotypes=gd, prs_definition=prs, platform_variants=plat,
+          genome_build="GRCh37", checkpoint_dir=checkpoint_dir)
+    return m
+
+
+def _fit_proj(panel, checkpoint_dir=None, n_workers=1):
+    gd, prs, plat = panel
+    m = LinearProjectionPRS(
+        backend="streaming", tuning_scope="none", cv_folds=3,
+        random_state=17, n_workers=n_workers, verbose=0,
+    )
+    m.fit(reference_genotypes=gd, prs_definition=prs, platform_variants=plat,
+          genome_build="GRCh37", checkpoint_dir=checkpoint_dir)
+    return m
+
+
+def _spy(cls):
+    """Wrap ``cls._run_one_chromosome`` with a call counter that calls through."""
+    orig = cls._run_one_chromosome
+    calls = {"n": 0}
+
+    def wrapper(self, source, chrom):
+        calls["n"] += 1
+        return orig(self, source, chrom)
+
+    return wrapper, calls, orig
+
+
+def test_warm_resume_skips_all_and_is_bit_identical(tmp_path):
+    panel = _build_panel()
+    with threadpool_limits(limits=1):
+        base = _fit_imp(panel)  # no checkpoint (correctness reference)
+        _fit_imp(panel, checkpoint_dir=tmp_path)  # cold run writes every shard
+        info = get_checkpoint_info(tmp_path)
+        assert info["n_entries"] == 1
+        assert info["entries"][0]["n_shards"] == N_CHROM
+        # Warm run: every chromosome resumes from disk, so no chromosome is recomputed.
+        wrapper, calls, _ = _spy(StreamingImputationFitter)
+        with mock.patch.object(StreamingImputationFitter, "_run_one_chromosome", wrapper):
+            resumed = _fit_imp(panel, checkpoint_dir=tmp_path)
+        assert calls["n"] == 0
+    # The checkpoint must not change the answer (bit-identical to the un-checkpointed fit).
+    _assert_imputation_identical(base, resumed)
+
+
+def test_partial_crash_then_resume_is_bit_identical(tmp_path):
+    panel = _build_panel()
+    with threadpool_limits(limits=1):
+        base = _fit_imp(panel)
+        # Simulate a kill after two chromosomes have been fitted + committed.
+        _, _, orig = _spy(StreamingImputationFitter)
+        state = {"n": 0}
+
+        def raising(self, source, chrom):
+            state["n"] += 1
+            if state["n"] == 3:
+                raise RuntimeError("simulated kill")
+            return orig(self, source, chrom)
+
+        with mock.patch.object(StreamingImputationFitter, "_run_one_chromosome", raising):
+            with pytest.raises(RuntimeError, match="simulated kill"):
+                _fit_imp(panel, checkpoint_dir=tmp_path)
+        assert get_checkpoint_info(tmp_path)["entries"][0]["n_shards"] == 2
+        # Resume: only the two not-yet-done chromosomes recompute.
+        wrapper, calls, _ = _spy(StreamingImputationFitter)
+        with mock.patch.object(StreamingImputationFitter, "_run_one_chromosome", wrapper):
+            resumed = _fit_imp(panel, checkpoint_dir=tmp_path)
+        assert calls["n"] == 2
+    _assert_imputation_identical(base, resumed)
+
+
+def test_warm_resume_projection_is_bit_identical(tmp_path):
+    panel = _build_panel()
+    with threadpool_limits(limits=1):
+        base = _fit_proj(panel)
+        _fit_proj(panel, checkpoint_dir=tmp_path)
+        assert get_checkpoint_info(tmp_path)["entries"][0]["n_shards"] == N_CHROM
+        wrapper, calls, _ = _spy(StreamingProjectionFitter)
+        with mock.patch.object(StreamingProjectionFitter, "_run_one_chromosome", wrapper):
+            resumed = _fit_proj(panel, checkpoint_dir=tmp_path)
+        assert calls["n"] == 0
+    _assert_projection_identical(base, resumed)

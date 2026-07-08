@@ -862,19 +862,28 @@ class StreamingImputationFitter:
         # Solver-selection override, resolved once here in the parent (pickled to workers).
         self._solve_mode = _resolve_solve_mode()
 
-    def run(self, source, *, n_workers: int = 1) -> StreamingFitResult:
+    def run(self, source, *, n_workers: int = 1, checkpoint=None) -> StreamingFitResult:
         """Stream the panel and fit every unit, optionally sharding by chromosome.
 
         ``n_workers > 1`` fans the per-chromosome accumulation + local solves across a
         process pool (Phase 7); the per-chromosome partials are reduced in canonical
         order. ``n_workers=1`` (default) runs a serial in-process map — bit-identical to
         the pre-Phase-7 loop. GPU keeps a single process (``fan_out_chromosomes`` clamps).
+
+        ``checkpoint`` (Phase 10, a ``CheckpointStore``) persists each per-chromosome partial
+        as it completes and resumes finished chromosomes from disk — the reduce is
+        order-independent, so a resumed fit is bit-identical to an uninterrupted one.
         """
         from imputed_prs.compute.parallel import fan_out_chromosomes
 
         device = getattr(self.backend, "device_name", "cpu")
         partials = fan_out_chromosomes(
-            self, source, self._stream_chromosomes(), n_workers=n_workers, device=device
+            self,
+            source,
+            self._stream_chromosomes(),
+            n_workers=n_workers,
+            device=device,
+            checkpoint=checkpoint,
         )
         return StreamingFitResult.reduce(partials, self.folds.n)
 

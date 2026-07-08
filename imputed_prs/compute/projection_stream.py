@@ -219,18 +219,27 @@ class StreamingProjectionFitter:
         for lst in self._regions_by_chrom.values():
             lst.sort(key=lambda i: (plan.regions[i].start, plan.regions[i].end))
 
-    def run(self, source, *, n_workers: int = 1) -> ProjectionStreamResult:
+    def run(self, source, *, n_workers: int = 1, checkpoint=None) -> ProjectionStreamResult:
         """Stream the panel and fit every region, optionally sharding by chromosome.
 
         ``n_workers > 1`` fans the per-chromosome accumulation + solves across a process
         pool; the per-chromosome partials are reduced in canonical order. ``n_workers=1``
         (default) runs a serial in-process map, bit-identical to the pre-Phase-7 loop.
+
+        ``checkpoint`` (Phase 10, a ``CheckpointStore``) persists each per-chromosome partial
+        as it completes and resumes finished chromosomes from disk — the reduce is
+        order-independent, so a resumed fit is bit-identical to an uninterrupted one.
         """
         from imputed_prs.compute.parallel import fan_out_chromosomes
 
         device = getattr(self.backend, "device_name", "cpu")
         partials = fan_out_chromosomes(
-            self, source, self._stream_chromosomes(), n_workers=n_workers, device=device
+            self,
+            source,
+            self._stream_chromosomes(),
+            n_workers=n_workers,
+            device=device,
+            checkpoint=checkpoint,
         )
         return ProjectionStreamResult.reduce(partials, self.folds.n)
 

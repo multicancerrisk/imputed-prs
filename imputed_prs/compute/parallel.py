@@ -104,6 +104,7 @@ def fan_out_chromosomes(
     *,
     n_workers: int = 1,
     device: str = "cpu",
+    checkpoint: Optional[object] = None,
 ) -> List[object]:
     """Map ``fitter._run_one_chromosome`` over ``chroms`` → list of per-chrom partials.
 
@@ -112,8 +113,17 @@ def fan_out_chromosomes(
     pre-Phase-7 single loop. With ``n_workers > 1`` each chromosome is one task on a
     loky process pool, BLAS pinned to one thread per worker. Return order is not relied
     upon — the caller reduces in canonical (``_chrom_sort_key``) order.
+
+    When ``checkpoint`` is a :class:`~imputed_prs.io.checkpoint.CheckpointStore` (Phase 10),
+    already-completed chromosomes are loaded from disk (their compute skipped) and every
+    fresh partial is committed the instant it completes — see
+    :func:`_fan_out_checkpointed`. ``checkpoint=None`` (the default) is the unchanged path.
     """
     chroms = list(chroms)
+    if checkpoint is not None:
+        return _fan_out_checkpointed(
+            fitter, source, chroms, n_workers=n_workers, device=device, checkpoint=checkpoint
+        )
     workers = min(resolve_n_workers(n_workers, device=device), max(1, len(chroms)))
     task = _ChromTask(fitter, source)
     if workers <= 1:
@@ -124,6 +134,64 @@ def fan_out_chromosomes(
         return Parallel(n_jobs=workers, return_as="list")(
             delayed(task)(c) for c in chroms
         )
+
+
+def _fan_out_checkpointed(fitter, source, chroms, *, n_workers, device, checkpoint):
+    """Checkpoint-aware fan-out: resume finished chromosomes, compute + persist the rest.
+
+    A completed chromosome is loaded from disk and its compute skipped; each fresh partial
+    is committed the instant it completes, so a kill loses at most the in-flight chromosomes.
+    Returns loaded + fresh in arbitrary order — the caller's reduce sorts by
+    ``_chrom_sort_key``, so the merged artifact is bit-identical to an uninterrupted run.
+
+    Bit-identity across a resume requires a stable BLAS reduction regime: the loky pool
+    already pins one thread per worker, so the serial path is pinned to one thread too (via
+    ``threadpool_limits``) — a chromosome's partial is then identical whether it was written
+    under ``n_workers>1`` or recomputed serially. The pool path uses
+    ``return_as="generator_unordered"`` so the parent persists whichever finishes first
+    (least work lost on interrupt; no head-of-line buffering of finished partials in RAM).
+    """
+    verbose = getattr(checkpoint, "verbose", 0)
+    total = len(chroms)
+    loaded: List[object] = []
+    todo: List[str] = []
+    for c in chroms:
+        p = checkpoint.load(c)
+        if p is not None:
+            loaded.append(p)
+            if verbose >= 1:
+                print(f"Checkpoint: resumed chr{c} ({len(loaded)}/{total})")
+        else:
+            todo.append(c)
+    if not todo:
+        return loaded
+
+    task = _ChromTask(fitter, source)
+    workers = min(resolve_n_workers(n_workers, device=device), max(1, len(todo)))
+    fresh: List[object] = []
+
+    def _persist(partial):
+        checkpoint.save(partial.chrom, partial)
+        fresh.append(partial)
+        if verbose >= 1:
+            done = len(loaded) + len(fresh)
+            print(f"Checkpoint: fitted+saved chr{partial.chrom} ({done}/{total})")
+
+    if workers <= 1:
+        from threadpoolctl import threadpool_limits
+
+        with threadpool_limits(limits=1):
+            for c in todo:
+                _persist(task(c))
+    else:
+        from joblib import Parallel, delayed, parallel_config
+
+        with parallel_config(backend="loky", inner_max_num_threads=1):
+            for partial in Parallel(n_jobs=workers, return_as="generator_unordered")(
+                delayed(task)(c) for c in todo
+            ):
+                _persist(partial)
+    return loaded + fresh
 
 
 def parallel_map(worker_fn, items: Sequence[object], *, n_workers: int = 1) -> List[object]:

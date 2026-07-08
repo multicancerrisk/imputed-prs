@@ -261,6 +261,7 @@ class LinearImputationPRS:
         training_ancestry: Optional[str] = None,
         evaluation_genotypes: Optional[Union[str, Path]] = None,
         allow_alt_as_effect: bool = False,
+        checkpoint_dir: Optional[Union[str, Path]] = None,
         _platform_variant_set: Optional[Set[str]] = None,
         _platform_info: Optional[Any] = None,
         _block_memo: Optional[Dict] = None,
@@ -294,6 +295,11 @@ class LinearImputationPRS:
             allow_alt_as_effect: If True, permit a PRS definition that supplies an
                 ``alt`` column (but no explicit ``effect_allele``) to be loaded by
                 treating ALT as the effect allele. Defaults to False, which raises.
+            checkpoint_dir: Optional directory for a resumable streaming fit (Phase 10).
+                When set, each per-chromosome partial is persisted as it completes; a
+                killed run re-invoked with the same ``checkpoint_dir`` loads the finished
+                chromosomes and recomputes only the rest, to a bit-identical artifact.
+                ``None`` (default) → no disk I/O. Ignored on the dense backend.
 
         Returns:
             self (for method chaining).
@@ -313,6 +319,10 @@ class LinearImputationPRS:
         # None (the default) → no disk I/O. Consumed only on the collect seam (calibration
         # is never cached — it needs the resident dosage band; see _fit_streaming).
         self._cache_dir = _cache_dir
+        # Phase 10 opt-in disk checkpoint: when set, the streaming fit persists each
+        # per-chromosome partial as it completes so a killed run resumes by loading the
+        # finished chromosomes and recomputing only the rest (bit-identical). None → no I/O.
+        self._checkpoint_dir = checkpoint_dir
 
         # Step 1: Input validation - exactly one platform source must be provided
         platform_sources = [
@@ -1094,6 +1104,71 @@ class LinearImputationPRS:
         if self.verbose >= 1 and entry is not None:
             print(f"Stats cache store: {key.digest} ({len(collected)} blocks)")
 
+    def _checkpoint_key(self, plan, source, ref_info, *, alpha, l1_ratio, device, solve_mode):
+        """Build the :class:`CheckpointKey` identifying this streaming fit (Phase 10).
+
+        A checkpoint persists per-chromosome models + calibration derived from the PRS
+        betas, so — unlike the alpha/l1-independent stats-cache key — the digest binds each
+        target/fallback/observed term's ``(id, effect_flip, beta)`` plus
+        ``alpha``/``l1_ratio``/``device``/solve-mode. A re-weighted, re-oriented, or
+        re-tuned fit lands in a different directory and never reuses a stale shard.
+        """
+        from imputed_prs.io.checkpoint import make_checkpoint_key
+
+        prs_terms = [
+            ("t", vid, tv.effect_flip, tv.beta) for vid, tv in plan.targets.items()
+        ]
+        prs_terms += [
+            ("b", vid, tv.effect_flip, tv.beta)
+            for vid, tv in plan.fallback_targets.items()
+        ]
+        prs_terms += [
+            ("o", vid, ov.effect_flip, ov.beta) for vid, ov in plan.observed.items()
+        ]
+        source_file = getattr(source, "path", None) or getattr(source, "_pgen_path", None)
+        return make_checkpoint_key(
+            sample_ids=source.sample_ids,
+            predictor_ids=list(plan.chip_ids),
+            prs_terms=prs_terms,
+            window_size=self.window_size,
+            max_predictors=self.max_predictors,
+            cv_folds=self.cv_folds,
+            random_state=self.random_state,
+            alpha=alpha,
+            l1_ratio=l1_ratio,
+            device=device,
+            solve_mode=solve_mode,
+            mode="fit",
+            source_file=source_file,
+            n_variants=len(ref_info),
+        )
+
+    def _make_checkpoint(self, fitter, plan, source, ref_info):
+        """Build the Phase-10 ``CheckpointStore`` for this streaming fit, or ``None``.
+
+        Returns ``None`` (checkpointing inert) unless ``checkpoint_dir`` was passed to
+        ``fit``. The key uses the fitter's resolved compute device and solve-mode, so a
+        checkpoint written on one device/solver never resumes on another.
+        """
+        ckpt_dir = getattr(self, "_checkpoint_dir", None)
+        if ckpt_dir is None:
+            return None
+        from imputed_prs.io.checkpoint import CheckpointStore
+
+        device = getattr(fitter.backend, "device_name", "cpu")
+        key = self._checkpoint_key(
+            plan,
+            source,
+            ref_info,
+            alpha=plan.alpha,
+            l1_ratio=plan.l1_ratio,
+            device=device,
+            solve_mode=fitter._solve_mode,
+        )
+        if self.verbose >= 1:
+            print(f"Checkpoint: {ckpt_dir} (key {key.digest})")
+        return CheckpointStore(ckpt_dir, key, verbose=self.verbose)
+
     def _fit_streaming(
         self,
         source,
@@ -1228,7 +1303,10 @@ class LinearImputationPRS:
             )
             calibration_params = None
         else:
-            result = fitter.run(source, n_workers=self.n_workers)
+            checkpoint = self._make_checkpoint(fitter, plan, source, ref_info)
+            result = fitter.run(
+                source, n_workers=self.n_workers, checkpoint=checkpoint
+            )
             calibration_params = finalize_imputation_calibration(
                 result.s_true, result.s_cv, result.models
             )
