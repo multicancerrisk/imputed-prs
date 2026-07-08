@@ -1,0 +1,49 @@
+name: CI
+
+# First CI gate (Phase 11). Enforces the golden allele-orientation / export round-trip
+# hard gate plus the full offline test suite — including the hermetic mini-1000G scale
+# canary (tests/test_scale_integration.py) — on every push and PR, without the 14 GB
+# reference panel or torch.
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests (Python 3.12)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          # 3.12 has broad cp312 manylinux wheels for the C-extension deps
+          # (cyvcf2, pandas-plink, pgenlib); newer runtimes trigger slow source builds.
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package (core + dev; scale best-effort)
+        run: |
+          python -m pip install --upgrade pip
+          # Core + dev must succeed (cyvcf2 is a core dependency, needed by the golden
+          # round-trip and streaming-parity tests).
+          pip install -e ".[dev]"
+          # PGEN reader is optional; if no wheel is available the PGEN tests importorskip.
+          # torch/[gpu] is deliberately NOT installed — GH runners have no MPS, and the
+          # gpu-marked tests self-skip via importorskip("torch").
+          pip install "pgenlib>=0.94" || echo "pgenlib unavailable on this runner — PGEN tests will skip"
+
+      - name: Golden gate (fail fast)
+        # The hard gate: allele-orientation table + export->load->predict at atol=1e-12.
+        run: pytest -q tests/test_golden.py
+
+      - name: Full offline suite
+        # Excludes: gpu (no torch), slow (memory-heavy harness cell), integration + network
+        # (live PGS-Catalog HTTP). The unmarked mini-1000G scale test rides this selection.
+        run: pytest -q -m "not gpu and not slow and not integration and not network" tests/
