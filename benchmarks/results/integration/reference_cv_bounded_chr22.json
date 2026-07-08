@@ -1,0 +1,80 @@
+{
+  "region": "22:16000000-18000000",
+  "n_prs_variants": 1125,
+  "n_folds": 3,
+  "n_samples": 3202,
+  "methods": {
+    "imputation": {
+      "parent_fit_seconds": 17.14692991715856,
+      "additive": {
+        "backend": "streaming",
+        "seconds": 8.88517487491481,
+        "mean_r2": 0.7930569863061963,
+        "mean_correlation": 0.8905201106440183
+      },
+      "refit_oracle": {
+        "backend": "dense",
+        "seconds": 166.9621126661077,
+        "mean_r2": 0.7930569863061967,
+        "mean_correlation": 0.8905201106440185
+      },
+      "abs_mean_r2_diff": 4.440892098500626e-16,
+      "parity_ok": true,
+      "no_temp_vcf": true,
+      "measured_speedup_x": 18.79108909127785,
+      "kfold_extrapolation": {
+        "3": {
+          "refit_predicted_seconds": 51.44078975147568,
+          "additive_predicted_seconds": 17.14692991715856,
+          "predicted_speedup_x": 3.0
+        },
+        "5": {
+          "refit_predicted_seconds": 85.7346495857928,
+          "additive_predicted_seconds": 17.14692991715856,
+          "predicted_speedup_x": 5.0
+        },
+        "10": {
+          "refit_predicted_seconds": 171.4692991715856,
+          "additive_predicted_seconds": 17.14692991715856,
+          "predicted_speedup_x": 10.0
+        }
+      }
+    },
+    "projection": {
+      "parent_fit_seconds": 3.681096082786098,
+      "additive": {
+        "backend": "streaming",
+        "seconds": 1.0122152499388903,
+        "mean_r2": 0.24110947595554555,
+        "mean_correlation": 0.490862279602115
+      },
+      "refit_oracle": {
+        "backend": "dense",
+        "seconds": 22.5695340000093,
+        "mean_r2": 0.24110947595554555,
+        "mean_correlation": 0.490862279602115
+      },
+      "abs_mean_r2_diff": 0.0,
+      "parity_ok": true,
+      "no_temp_vcf": true,
+      "measured_speedup_x": 22.29716851368508,
+      "kfold_extrapolation": {
+        "3": {
+          "refit_predicted_seconds": 11.043288248358294,
+          "additive_predicted_seconds": 3.681096082786098,
+          "predicted_speedup_x": 3.0
+        },
+        "5": {
+          "refit_predicted_seconds": 18.40548041393049,
+          "additive_predicted_seconds": 3.681096082786098,
+          "predicted_speedup_x": 5.0
+        },
+        "10": {
+          "refit_predicted_seconds": 36.81096082786098,
+          "additive_predicted_seconds": 3.681096082786098,
+          "predicted_speedup_x": 10.0
+        }
+      }
+    }
+  }
+}

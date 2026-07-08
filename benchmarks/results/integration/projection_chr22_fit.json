@@ -1,0 +1,92 @@
+{
+  "label": "integ_projection_chr22_streaming",
+  "outcome": "completed",
+  "ok": true,
+  "reference": "/Users/jeya/Documents/projects/imputed-prs/benchmarks/data/work/pos/22.vcf.gz",
+  "n_prs_variants_on_chroms": 27854,
+  "wall_seconds": 108.3607140420936,
+  "peak_rss_bytes": 11119149056,
+  "peak_rss_gb": 11.119149056,
+  "peak_rss_authoritative": true,
+  "n_units": 1,
+  "summary": {
+    "n_observed_variants": 3134,
+    "n_observed_with_fallback": 3117,
+    "n_missing_variants": 24597,
+    "n_definition_variants": 27854,
+    "n_dropped": 123,
+    "dropped_by_reason": {
+      "allele_mismatch": 4,
+      "not_in_reference": 119
+    },
+    "n_training_failed": 0,
+    "training_failures_by_type": {},
+    "coverage": 0.9955841171824513,
+    "n_regions": 1,
+    "n_intercept_only_regions": 1,
+    "training_summary": {
+      "mean_r2": -0.0016555480951649937,
+      "median_r2": -0.0016555480951649937,
+      "std_r2": 0.0,
+      "min_r2": -0.0016555480951649937,
+      "max_r2": -0.0016555480951649937,
+      "n_high_quality": 0,
+      "n_medium_quality": 0,
+      "n_low_quality": 1,
+      "mean_n_predictors": 8396.0,
+      "mean_n_prs_variants_per_region": 24597.0
+    },
+    "calibration": {
+      "scaling_factor": 5.268018929730447,
+      "scaling_factor_se": 0.10078970371099552,
+      "calibration_intercept": -2.1642433945017414,
+      "calibration_r2": 0.46054241968954845,
+      "sd_cv_predicted": 0.0013665472225761676,
+      "sd_true": 0.010608088920357181,
+      "sd_scaled": 0.007198996636901818,
+      "attenuation_factor": 0.12882124507400483,
+      "n_calibration": 3202,
+      "raw_empirical_residual_sd": 0.009732598015676427,
+      "calibrated_empirical_residual_sd": 0.007791405390818856,
+      "diagonal_model_se_lower_bound": 0.009731216872565215
+    },
+    "prs_id": null,
+    "platform_name": "custom",
+    "genome_build": "GRCh38",
+    "model_name": null,
+    "window_size": 1000000,
+    "cv_folds": 5
+  },
+  "calibration": {
+    "scaling_factor": 5.268018929730447,
+    "scaling_factor_se": 0.10078970371099552,
+    "calibration_intercept": -2.1642433945017414,
+    "calibration_r2": 0.46054241968954845,
+    "sd_cv_predicted": 0.0013665472225761676,
+    "sd_true": 0.010608088920357181,
+    "sd_scaled": 0.007198996636901818,
+    "attenuation_factor": 0.12882124507400483,
+    "n_calibration": 3202,
+    "raw_empirical_residual_sd": 0.009732598015676427,
+    "calibrated_empirical_residual_sd": 0.007791405390818856,
+    "diagonal_model_se_lower_bound": 0.009731216872565215
+  },
+  "r2_summary": {
+    "n": 0,
+    "mean": null,
+    "median": null,
+    "std": null,
+    "min": null,
+    "max": null
+  },
+  "phases": [
+    {
+      "name": "fit",
+      "wall_seconds": 107.61947158304974,
+      "tm_current_bytes": null,
+      "tm_delta_bytes": null
+    }
+  ],
+  "error": null,
+  "device": "cpu"
+}

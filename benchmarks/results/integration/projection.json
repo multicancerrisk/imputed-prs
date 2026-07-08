@@ -1,0 +1,71 @@
+{
+  "method": "imputation",
+  "workload": "chr22 PGS000027 (~27854 variants)",
+  "points": [
+    {
+      "label": "ram_impu_chr22_s500",
+      "n_samples": 500,
+      "n_variants": 27854,
+      "peak_rss_bytes": 3327442944,
+      "peak_rss_gb": 3.327442944,
+      "wall_seconds": 853.5082712920848
+    },
+    {
+      "label": "ram_impu_chr22_s1000",
+      "n_samples": 1000,
+      "n_variants": 27854,
+      "peak_rss_bytes": 3359932416,
+      "peak_rss_gb": 3.359932416,
+      "wall_seconds": 747.6360213330481
+    },
+    {
+      "label": "ram_impu_chr22_s2000",
+      "n_samples": 2000,
+      "n_variants": 27854,
+      "peak_rss_bytes": 3512369152,
+      "peak_rss_gb": 3.512369152,
+      "wall_seconds": 613.7578242500313
+    },
+    {
+      "label": "impute_pgs027_chr22_streaming",
+      "n_samples": 3202,
+      "n_variants": 27854,
+      "peak_rss_bytes": 3681533952,
+      "peak_rss_gb": 3.681533952,
+      "wall_seconds": 566.6921901251189
+    }
+  ],
+  "n_points": 4,
+  "n_distinct_n": 4,
+  "empirical_fit_500k": {
+    "model": "peak_rss = a + b*n_samples",
+    "a_bytes": 3243482010.189274,
+    "b_bytes_per_sample": 135385.02286524978,
+    "r2": 0.9918025921496881,
+    "predicted_500k_gb": 70.93599344281417,
+    "caveat": "measured n<=3202: the band buffer is tiny vs fixed overhead, so the slope is noisy; the analytical model is the principled estimate."
+  },
+  "analytical_500k_chr22": {
+    "band_proxy": 512,
+    "streaming_total_gb": 2.072,
+    "dense_total_gb": 334.248,
+    "dense_over_streaming_ratio": 161.3166023166023
+  },
+  "full_scale_anchor_500k_x_2m": {
+    "streaming_total_gb": 2.072,
+    "dense_one_copy_tb": 4.0,
+    "dense_total_tb": 24.0,
+    "dense_breakdown": {
+      "dense_one_copy": 4000000000000.0,
+      "dense_concurrent_copies": 16000000000000.0,
+      "cv_predictions": 8000000000000.0,
+      "total": 24000000000000.0
+    },
+    "note": "the plan's headline: at 500K\u00d72M one dense float32 copy is ~4 TB (peak ~24 TB across working copies + cv_predictions); the streaming band-buffer path stays in GB (sample dimension contracted)."
+  },
+  "pool": {
+    "integration_results": 0,
+    "streaming_results": 15
+  },
+  "methodology_note": "make_report (Phase-0 blocker-grid multilinear (s,v) model) is NOT used here: a chr22-only run has one variant-axis point, so that model is degenerate and mixes dense+streaming. This is the streaming 1D-in-n peak fit + analytical byte model, per results/streaming/."
+}
