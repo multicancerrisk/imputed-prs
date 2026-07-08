@@ -47,5 +47,8 @@ benchmarks/results/streaming/raw/
 !benchmarks/results/predict/
 benchmarks/results/predict/raw/
 !benchmarks/results/parallel/
+!benchmarks/results/integration/
+benchmarks/results/integration/raw/
+benchmarks/results/integration/artifacts/
 !benchmarks/results/.gitignore
 benchmarks/data/

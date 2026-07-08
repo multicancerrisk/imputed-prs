@@ -165,7 +165,11 @@ def _fit_and_extract(model, method: str, spec, registry: PhaseRegistry) -> Dict[
     if spec.params.get("export_dir"):
         with phase("export", registry, trace=spec.tracemalloc):
             try:
-                paths = model.export(spec.params["export_dir"])
+                # export_formats (optional) trims the export to e.g. ["json"] — a full
+                # dense-score HDF5+JSON export is multi-GB and inflates peak RSS.
+                paths = model.export(
+                    spec.params["export_dir"], formats=spec.params.get("export_formats")
+                )
                 payload["export_ok"] = True
                 payload["export_paths"] = {k: str(v) for k, v in dict(paths).items()}
             except Exception as exc:  # never lose the oracle over an export hiccup
