@@ -279,6 +279,9 @@ def test_resolve_worker_count(monkeypatch):
     import imputed_prs.compute.parallel as par
 
     monkeypatch.setattr(par, "_performance_cores", lambda: 6)
+    # Pin the logical-CPU count so the min(perf_cores, ncpu) clamp doesn't mask the intent
+    # on hosts/runners with fewer than 6 cores (e.g. the 4-core CI runner).
+    monkeypatch.setattr(par.os, "cpu_count", lambda: 8)
     assert resolve_n_workers(1) == 1
     assert resolve_n_workers(None) == 1
     assert resolve_n_workers(-1) == 6  # performance cores
